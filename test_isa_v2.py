@@ -327,7 +327,9 @@ def test_ptr16():
 
 def test_esc_and_trap():
 
-    for sub in (0x30, 0x31, 0x50, 0x5F, 0x63, 0x6F, 0x71, 0x7F):
+
+
+    for sub in (0x36, 0x37, 0x59, 0x63, 0x6F, 0x71, 0x7F, 0x88, 0x8F, 0xA0, 0xFF):
         err, snap = expect_err(bytes([0x70, sub]), r0=7)
         assert err, f"reserved subcode {sub:#04x} did not raise"
         assert snap["r"][0] == 7 and snap["PC"] == 0, ("reserved subcode was not atomic", sub)

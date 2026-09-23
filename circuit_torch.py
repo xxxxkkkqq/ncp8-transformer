@@ -38,7 +38,12 @@ DIV, MOD, CMP = 49, 50, 51
 NOT, NEG, ROL, ROR = 52, 53, 54, 55
 ADD_HLDE, SUB_HLDE, XCHG, EXT = 56, 57, 58, 59
 STC, LDC = 60, 61
-K = 62
+
+MOVW_HL_DE, MOVW_DE_HL, MOVW_HL_SP, MOVW_DE_SP, MOVW_SP_HL, MOVW_SP_DE = 62, 63, 64, 65, 66, 67
+PUSHW_HL, PUSHW_DE, POPW_HL, POPW_DE = 68, 69, 70, 71
+STW_HLDE, STW_DEHL, LDW_DEHL, LDW_HLDE = 72, 73, 74, 75
+LDX, STX, ADD_SP, MULH = 76, 77, 78, 79
+K = 80
 
 
 def _rom2():
@@ -60,6 +65,19 @@ def _rom2():
     for r in range(4):
         put(0x80 | r, STC, r, r)
         put(0x84 | r, LDC, r, r)
+
+    for k, sub in enumerate((0x30, 0x31, 0x32, 0x33, 0x34, 0x35)):
+        put(sub, MOVW_HL_DE + k)
+    for k, sub in enumerate((0x38, 0x39, 0x3A, 0x3B)):
+        put(sub, PUSHW_HL + k)
+    for k, sub in enumerate((0x3C, 0x3D, 0x3E, 0x3F)):
+        put(sub, STW_HLDE + k)
+    for r in range(4):
+        put(0x50 | r, LDX, r, r, l=1)
+        put(0x54 | r, STX, r, r, l=1)
+    put(0x58, ADD_SP, 0, 0, l=1)
+    for f in range(16):
+        put(0x90 + f, MULH, (f >> 2) & 3, f & 3)
     t = lambda xs: torch.tensor(xs, dtype=torch.int32)
     return t(alu), t(s0), t(s1), t(lx)
 
@@ -230,6 +248,16 @@ class TorchCircuit:
         eof = (self.ipos >= self.inlen).to(i32)
 
 
+
+
+
+        sx = imm0 - ((imm0 >> 7) & 1) * 256
+        fr = (self.HL + sx) & 0xFFFF
+        dfr = self._g(self.DATA, fr)
+        dhl1 = self._g(self.DATA, self.HL + 1)
+        dde1 = self._g(self.DATA, self.DE + 1)
+
+
         t_add = a + b; v_add = t_add & 255; c_add = t_add >> 8
         t_adc = a + b + self.C; v_adc = t_adc & 255; c_adc = t_adc >> 8
         v_sub = (a - b) & 255; c_sub = (a < b).to(i32)
@@ -262,6 +290,12 @@ class TorchCircuit:
         sc_ok = code_ok * (self.HL >= wlo).to(i32) * (self.HL < whi).to(i32)
         ldc_v = self._g(self.CODE, self.HL)
 
+        v_mulh = ((a * b) >> 8) & 255
+        v_popw = dsp | (dsp1 << 8)
+        v_ldw_de = dl | (dhl1 << 8)
+        v_ldw_hl = der | (dde1 << 8)
+        v_sp_add = (self.SP + sx) & 0xFFFF
+
 
         RHL_EN = oh(MOV_R_HL) + oh(MOV_HL_R)
         rows_R_val = (
@@ -277,6 +311,7 @@ class TorchCircuit:
             + oh(DIV) * v_div + oh(MOD) * v_mod
             + oh(NOT) * v_not + oh(NEG) * v_neg + oh(ROL) * v_rol + oh(ROR) * v_ror
             + oh(LDC) * ldc_v
+            + oh(LDX) * dfr + oh(MULH) * v_mulh
         )
         rows_R_en = (
             oh(ADD) + oh(SUB) + oh(ADC) + oh(SBB) + oh(MOV)
@@ -286,6 +321,7 @@ class TorchCircuit:
             + oh(GETPC) + oh(GETSP) + oh(GETF)
             + oh(AND) + oh(OR) + oh(XOR) + oh(MUL) + oh(DIV) + oh(MOD)
             + oh(NOT) + oh(NEG) + oh(ROL) + oh(ROR) + oh(LDC)
+            + oh(LDX) + oh(MULH)
         )
 
         rows_HL = self.HL + oh(INC_HL) - oh(DEC_HL) + oh(OUTM)
@@ -294,17 +330,30 @@ class TorchCircuit:
         rows_HL = w(oh(ADD_HLDE), v_hladd, rows_HL)
         rows_HL = w(oh(SUB_HLDE), v_hlsub, rows_HL)
         rows_HL = w(oh(XCHG), self.DE, rows_HL)
+        rows_HL = w(oh(MOVW_HL_DE), self.DE, rows_HL)
+        rows_HL = w(oh(MOVW_HL_SP), self.SP, rows_HL)
+        rows_HL = w(oh(POPW_HL), v_popw, rows_HL)
+        rows_HL = w(oh(LDW_HLDE), v_ldw_hl, rows_HL)
 
         rows_DE = self.DE + oh(INC_DE) + oh(OUTDE)
         rows_DE = w(oh(LDI_DE), t16, rows_DE)
         rows_DE = w(oh(ADDI_DE), self.DE + rv, rows_DE)
         rows_DE = w(oh(XCHG), self.HL, rows_DE)
+        rows_DE = w(oh(MOVW_DE_HL), self.HL, rows_DE)
+        rows_DE = w(oh(MOVW_DE_SP), self.SP, rows_DE)
+        rows_DE = w(oh(POPW_DE), v_popw, rows_DE)
+        rows_DE = w(oh(LDW_DEHL), v_ldw_de, rows_DE)
 
         rows_SP = w(oh(PUSH), self.SP - 1,
                    w(oh(POP), self.SP + 1,
                      w(oh(CALL), self.SP - 2,
                        w(oh(EXT), self.SP - 2,
                          w(oh(RET), self.SP + 2, self.SP)))))
+        rows_SP = w(oh(PUSHW_HL) + oh(PUSHW_DE), self.SP - 2, rows_SP)
+        rows_SP = w(oh(POPW_HL) + oh(POPW_DE), self.SP + 2, rows_SP)
+        rows_SP = w(oh(MOVW_SP_HL), self.HL, rows_SP)
+        rows_SP = w(oh(MOVW_SP_DE), self.DE, rows_SP)
+        rows_SP = w(oh(ADD_SP), v_sp_add, rows_SP)
 
         rows_C = self.C + oh(ADD) * (c_add - self.C) + oh(SUB) * (c_sub - self.C) \
             + oh(ADC) * (c_adc - self.C) + oh(SBB) * (c_sbb - self.C) \
@@ -332,7 +381,8 @@ class TorchCircuit:
             + oh(DIV) * ((v_div == 0).to(i32) - self.Z) + oh(MOD) * ((v_mod == 0).to(i32) - self.Z) \
             + oh(NOT) * ((v_not == 0).to(i32) - self.Z) + oh(NEG) * ((v_neg == 0).to(i32) - self.Z) \
             + oh(ROL) * ((v_rol == 0).to(i32) - self.Z) + oh(ROR) * ((v_ror == 0).to(i32) - self.Z) \
-            + oh(CMP) * ((a == b).to(i32) - self.Z)
+            + oh(CMP) * ((a == b).to(i32) - self.Z) \
+            + oh(MULH) * ((v_mulh == 0).to(i32) - self.Z)
 
         fall = self.PC + ln_e
         retv = (dsp << 8) | dsp1
@@ -361,15 +411,31 @@ class TorchCircuit:
         hl_ok = (self.HL < DATA_SIZE).to(i32); de_ok = (self.DE < DATA_SIZE).to(i32)
         sp_lo = (self.SP > 0).to(i32); sp_lo2 = (self.SP >= 2).to(i32); sp_hi = (self.SP < DATA_SIZE).to(i32)
         sp_hi1 = ((self.SP + 1) < DATA_SIZE).to(i32)
+
+
+        hl_ok2 = ((self.HL + 1) < DATA_SIZE).to(i32)
+        de_ok2 = ((self.DE + 1) < DATA_SIZE).to(i32)
+        fr_ok = (fr < DATA_SIZE).to(i32)
+        sp_hi2 = ((self.SP + 2) <= DATA_SIZE).to(i32)
+        hl_sp_ok = (self.HL <= DATA_SIZE).to(i32)
+        de_sp_ok = (self.DE <= DATA_SIZE).to(i32)
+        sp_add_ok = (v_sp_add <= DATA_SIZE).to(i32)
         rd_rows = (oh(MOV_R_HL) + oh(MOV_HL_R)) * (1 - hl_ok) \
             + (oh(MOV_R_DE) + oh(MOV_DE_R)) * (1 - de_ok) \
-            + oh(OUTM) * (1 - hl_ok) + oh(OUTDE) * (1 - de_ok)
+            + oh(OUTM) * (1 - hl_ok) + oh(OUTDE) * (1 - de_ok) \
+            + (oh(STW_HLDE) + oh(LDW_DEHL)) * (1 - hl_ok2) \
+            + (oh(STW_DEHL) + oh(LDW_HLDE)) * (1 - de_ok2) \
+            + (oh(LDX) + oh(STX)) * (1 - fr_ok)
         st_rows = (oh(POP) * (1 - sp_hi) + oh(RET) * (1 - sp_hi1)
                    + oh(PUSH) * (1 - sp_lo) + oh(CALL) * (1 - sp_lo2)
-                   + oh(EXT) * (1 - sp_lo2))
+                   + oh(EXT) * (1 - sp_lo2)
+                   + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (1 - sp_lo2)
+                   + (oh(POPW_HL) + oh(POPW_DE)) * (1 - sp_hi2))
         v2_err = (oh(DIV) * (b == 0).to(i32) + oh(MOD) * (b == 0).to(i32) + oh(EXT) * (1 - ext_ok)
                   + oh(LDC) * (1 - code_ok) + oh(STC) * (1 - sc_ok))
-        err = (ind * (oh(BAD) + (1 - fetch_ok_rows) + rd_rows + st_rows + v2_err)).sum() + (1 - fetch_ok)
+        v3_err = (oh(MOVW_SP_HL) * (1 - hl_sp_ok) + oh(MOVW_SP_DE) * (1 - de_sp_ok)
+                  + oh(ADD_SP) * (1 - sp_add_ok))
+        err = (ind * (oh(BAD) + (1 - fetch_ok_rows) + rd_rows + st_rows + v2_err + v3_err)).sum() + (1 - fetch_ok)
 
 
         sel = lambda rows: (ind * rows).sum()
@@ -380,15 +446,27 @@ class TorchCircuit:
 
         a1 = sel(oh(MOV_HL_R) * self.HL + oh(MOV_DE_R) * self.DE
                  + oh(PUSH) * (self.SP - 1) + oh(CALL) * (self.SP - 1)
-                 + oh(EXT) * (self.SP - 1))
+                 + oh(EXT) * (self.SP - 1)
+                 + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (self.SP - 1)
+                 + oh(STW_HLDE) * self.HL + oh(STW_DEHL) * self.DE
+                 + oh(STX) * fr)
         v1 = sel(oh(MOV_HL_R) * rr + oh(MOV_DE_R) * rr + oh(PUSH) * rr
-                 + oh(CALL) * ((self.PC + 3) & 255) + oh(EXT) * ((self.PC + 3) & 255))
-        e1 = sel(oh(MOV_HL_R) + oh(MOV_DE_R) + oh(PUSH) + oh(CALL) + oh(EXT)) * ok
+                 + oh(CALL) * ((self.PC + 3) & 255) + oh(EXT) * ((self.PC + 3) & 255)
+                 + oh(PUSHW_HL) * ((self.HL >> 8) & 255) + oh(PUSHW_DE) * ((self.DE >> 8) & 255)
+                 + oh(STW_HLDE) * (self.DE & 255) + oh(STW_DEHL) * (self.HL & 255)
+                 + oh(STX) * rr)
+        e1 = sel(oh(MOV_HL_R) + oh(MOV_DE_R) + oh(PUSH) + oh(CALL) + oh(EXT)
+                 + oh(PUSHW_HL) + oh(PUSHW_DE) + oh(STW_HLDE) + oh(STW_DEHL) + oh(STX)) * ok
         oh1 = ((self.RD == a1).to(i32)) * e1
         self.DATA = oh1 * v1 + (1 - oh1) * self.DATA
-        a2 = sel(oh(CALL) * (self.SP - 2) + oh(EXT) * (self.SP - 2))
-        v2 = sel(oh(CALL) * ((self.PC + 3) >> 8) + oh(EXT) * ((self.PC + 3) >> 8))
-        e2 = sel(oh(CALL) + oh(EXT)) * ok
+        a2 = sel(oh(CALL) * (self.SP - 2) + oh(EXT) * (self.SP - 2)
+                 + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (self.SP - 2)
+                 + oh(STW_HLDE) * (self.HL + 1) + oh(STW_DEHL) * (self.DE + 1))
+        v2 = sel(oh(CALL) * ((self.PC + 3) >> 8) + oh(EXT) * ((self.PC + 3) >> 8)
+                 + oh(PUSHW_HL) * (self.HL & 255) + oh(PUSHW_DE) * (self.DE & 255)
+                 + oh(STW_HLDE) * ((self.DE >> 8) & 255) + oh(STW_DEHL) * ((self.HL >> 8) & 255))
+        e2 = sel(oh(CALL) + oh(EXT) + oh(PUSHW_HL) + oh(PUSHW_DE)
+                 + oh(STW_HLDE) + oh(STW_DEHL)) * ok
         oh2 = ((self.RD == a2).to(i32)) * e2
         self.DATA = oh2 * v2 + (1 - oh2) * self.DATA
 
