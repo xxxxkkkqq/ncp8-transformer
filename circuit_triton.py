@@ -4,6 +4,16 @@ Third implementation of the same ISA semantics: the whole fetch-decode-execute
 cycle runs inside a single kernel. Public interface is kept compatible with the
 tensor implementation so that both can be driven by the same equivalence tests.
 
+Two execution paths share the same per-tick body:
+  * TritonCircuit.step(): one launch per tick, driven by the host;
+  * TritonBatch: a resident batched executor that keeps B machines in device
+    buffers (CODE [B,4096], DATA [B,4096], INPUTS [B,max_in], OUTBUF [B,out_cap],
+    state [B,14]) and runs the tick loop inside the kernel, so a whole program run
+    costs one launch for the whole batch. The per-machine status drives the loop:
+    a machine that has halted or errored stops advancing while the rest of the
+    batch keeps running. run_batch() is the one-shot form and
+    TritonCircuit.run_resident() is the B = 1 form.
+
 Error contract: a violating tick writes status = 3 only; all other state and the
 tick counter stay unchanged.
 
@@ -12,6 +22,7 @@ State tensor layout: [r0,r1,r2,r3, HL, DE, PC, SP, C, Z, ipos, oplen, tick, stat
 import torch
 import triton
 import triton.language as tl
+from typing import NamedTuple
 
 DATA_SIZE = 4096
 CODE_SIZE = 4096
@@ -75,7 +86,18 @@ def _dec_esc(sub):
 
 
 @triton.jit
-def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
+def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
+
+
+
+
+
+
+
+
+
+
+
     r0 = tl.load(S + 0); r1 = tl.load(S + 1); r2 = tl.load(S + 2); r3 = tl.load(S + 3)
     HL = tl.load(S + 4); DE = tl.load(S + 5); PC = tl.load(S + 6); SP = tl.load(S + 7)
     C = tl.load(S + 8); Z = tl.load(S + 9); IPO = tl.load(S + 10); OL = tl.load(S + 11)
@@ -419,14 +441,19 @@ def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
     else:
         err = 1
 
+    OT = tl.load(S + 12)
+    NT = OT + 1
     if err == 1:
+
         tl.store(S + 13, 3)
+        RST = 3
+        RTK = OT
     else:
         nOL = OL + OEN
         tl.store(S + 0, nR0); tl.store(S + 1, nR1); tl.store(S + 2, nR2); tl.store(S + 3, nR3)
         tl.store(S + 4, nHL); tl.store(S + 5, nDE); tl.store(S + 6, nPC); tl.store(S + 7, nSP)
         tl.store(S + 8, nC); tl.store(S + 9, nZ); tl.store(S + 10, nIPO); tl.store(S + 11, nOL)
-        tl.store(S + 12, tl.load(S + 12) + 1)
+        tl.store(S + 12, NT)
         tl.store(S + 13, NST)
         if OEN == 1:
             tl.store(OUTBUF + OL, OVAL)
@@ -436,6 +463,252 @@ def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
             tl.store(DATA + A2, V2)
         if E3 == 1:
             tl.store(CODE + A3, V3)
+        RST = NST
+        RTK = NT
+    return RST, RTK
+
+
+@triton.jit
+def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
+
+    _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS)
+
+
+@triton.jit
+def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BUDGETS,
+                        STEP_LIMIT, APPLY_OVERRUN,
+                        CS: tl.constexpr, DS: tl.constexpr, INS: tl.constexpr,
+                        OCS: tl.constexpr):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    pid = tl.program_id(0)
+    CP = CODE + pid * CS
+    DP = DATA + pid * DS
+    IP = INPUTS + pid * INS
+    OP = OUTBUF + pid * OCS
+    ST = STATES + pid * 14
+    CL = tl.load(CODELENS + pid)
+    IL = tl.load(INLENS + pid)
+    BD = tl.load(BUDGETS + pid)
+    st = tl.load(ST + 13)
+    tk = tl.load(ST + 12)
+    n = 0
+    while (st == 0) & (tk < BD) & ((STEP_LIMIT <= 0) | (n < STEP_LIMIT)):
+        st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, DS)
+        n += 1
+    if (APPLY_OVERRUN == 1) & (st == 0):
+        tl.store(ST + 13, 2)
+
+
+class BatchResult(NamedTuple):
+
+
+
+
+
+
+
+    outs: list
+    status: list
+    ticks: list
+    oplens: list
+
+
+class TritonBatch:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def __init__(self, n, device="cuda", out_cap=OUT_CAP, max_in=1, tick_budget=200_000,
+                 num_warps=1):
+        if n < 1:
+            raise ValueError("batch size must be >= 1")
+        self.dev = torch.device(device)
+        self.n = n
+        self.out_cap = int(out_cap)
+        self.max_in = max(1, int(max_in))
+        self.num_warps = num_warps
+        i32 = torch.int32
+        self.CODE = torch.zeros((n, CODE_SIZE), dtype=i32, device=self.dev)
+        self.DATA = torch.zeros((n, DATA_SIZE), dtype=i32, device=self.dev)
+        self.INPUTS = torch.zeros((n, self.max_in), dtype=i32, device=self.dev)
+        self.OUTBUF = torch.zeros((n, self.out_cap), dtype=i32, device=self.dev)
+        self.STATE = torch.zeros((n, 14), dtype=i32, device=self.dev)
+        self.STATE[:, 7] = DATA_SIZE
+        self.CODELENS = torch.zeros(n, dtype=i32, device=self.dev)
+        self.INLENS = torch.zeros(n, dtype=i32, device=self.dev)
+        self.BUDGETS = torch.full((n,), int(tick_budget), dtype=i32, device=self.dev)
+
+    def set_program(self, i, code, data=None, inputs=None):
+
+
+
+
+
+        cb = bytes(code)
+        if len(cb) > CODE_SIZE:
+            raise ValueError("code exceeds CODE_SIZE")
+        self.CODE[i] = 0
+        if cb:
+            self.CODE[i, :len(cb)] = torch.tensor(list(cb), dtype=torch.int32, device=self.dev)
+        self.CODELENS[i] = len(cb)
+        db = bytes(data) if data else b""
+        if len(db) > DATA_SIZE:
+            raise ValueError("data image exceeds DATA_SIZE")
+        self.DATA[i] = 0
+        if db:
+            self.DATA[i, :len(db)] = torch.tensor(list(db), dtype=torch.int32, device=self.dev)
+        ib = bytes(inputs) if inputs else b""
+        if len(ib) > self.max_in:
+            raise ValueError("input stream exceeds the batch input capacity")
+        self.INPUTS[i] = 0
+        if ib:
+            self.INPUTS[i, :len(ib)] = torch.tensor(list(ib), dtype=torch.int32, device=self.dev)
+        self.INLENS[i] = len(ib)
+        self.STATE[i] = 0
+        self.STATE[i, 7] = DATA_SIZE
+
+    def set_state(self, i, r=(0, 0, 0, 0), HL=0, DE=0, PC=0, SP=DATA_SIZE,
+                  C=0, Z=0, ipos=0, oplen=0, tick=0, status=0):
+
+        self.STATE[i, 0:4] = torch.tensor(list(r), dtype=torch.int32, device=self.dev)
+        self.STATE[i, 4] = HL
+        self.STATE[i, 5] = DE
+        self.STATE[i, 6] = PC
+        self.STATE[i, 7] = SP
+        self.STATE[i, 8] = C
+        self.STATE[i, 9] = Z
+        self.STATE[i, 10] = ipos
+        self.STATE[i, 11] = oplen
+        self.STATE[i, 12] = tick
+        self.STATE[i, 13] = status
+
+    def set_budget(self, i, budget):
+
+        self.BUDGETS[i] = int(budget)
+
+    def run(self):
+
+
+
+
+
+
+        self._launch(0, 1)
+        return self.results()
+
+    def step(self, steps=1):
+
+
+
+
+
+        self._launch(int(steps), 0)
+        return self.results()
+
+    def _launch(self, step_limit, apply_overrun):
+        ncp_resident_kernel[(self.n,)](
+            self.CODE, self.DATA, self.INPUTS, self.OUTBUF, self.STATE,
+            self.CODELENS, self.INLENS, self.BUDGETS, step_limit, apply_overrun,
+            CS=CODE_SIZE, DS=DATA_SIZE, INS=self.max_in, OCS=self.out_cap,
+            num_warps=self.num_warps)
+
+    def results(self):
+
+        status = [int(v) for v in self.STATE[:, 13].cpu().tolist()]
+        ticks = [int(v) for v in self.STATE[:, 12].cpu().tolist()]
+        oplens = [int(v) for v in self.STATE[:, 11].cpu().tolist()]
+        for i, o in enumerate(oplens):
+            if o > self.out_cap:
+                raise RuntimeError(
+                    f"machine {i} emitted {o} bytes, above the {self.out_cap}-byte "
+                    "per-machine output capacity of this batch")
+        flat = []
+        if self.n:
+            flat = torch.cat([self.OUTBUF[i, :o] for i, o in enumerate(oplens)]).cpu().tolist()
+        outs = []
+        off = 0
+        for o in oplens:
+            outs.append(bytes(flat[off:off + o]))
+            off += o
+        return BatchResult(outs, status, ticks, oplens)
+
+    def out(self, i):
+
+        n = int(self.STATE[i, 11].item())
+        if n > self.out_cap:
+            raise RuntimeError(f"machine {i} emitted {n} bytes, above the output capacity")
+        return bytes(self.OUTBUF[i, :n].cpu().tolist())
+
+    def snapshot(self, i):
+
+        s = self.STATE[i].cpu().tolist()
+        return dict(r=s[0:4], HL=s[4], DE=s[5], SP=s[7], PC=s[6], C=s[8], Z=s[9],
+                    ipos=s[10], oplen=s[11], tick=s[12], status=s[13])
+
+    def data(self, i):
+
+        return self.DATA[i].cpu().tolist()
+
+    def code(self, i):
+
+        return self.CODE[i].cpu().tolist()
+
+
+def run_batch(codes, datas=None, inputs=None, budgets=None, states=None,
+              tick_budget=200_000, device="cuda", out_cap=OUT_CAP, num_warps=1):
+
+
+
+
+
+
+
+
+
+    n = len(codes)
+    max_in = 1
+    if inputs:
+        max_in = max(1, max((len(v) for v in inputs), default=1))
+    b = TritonBatch(n, device=device, out_cap=out_cap, max_in=max_in,
+                    tick_budget=tick_budget, num_warps=num_warps)
+    for i in range(n):
+        b.set_program(i, codes[i],
+                      datas[i] if datas else None,
+                      inputs[i] if inputs else None)
+        if budgets is not None:
+            b.set_budget(i, budgets[i])
+    if states is not None:
+        rows = torch.tensor([list(s) for s in states], dtype=torch.int32, device=b.dev)
+        if rows.shape != (n, 14):
+            raise ValueError("states must be n rows of 14 values")
+        b.STATE.copy_(rows)
+    return b.run()
 
 
 class TritonCircuit:
@@ -490,8 +763,33 @@ class TritonCircuit:
         return bytes(self.OUTBUF[:n].cpu().tolist())
 
     def run(self):
+
         while int(self.status.item()) == 0 and int(self.tick.item()) < self.tb:
             self.step()
         if int(self.status.item()) == 0:
             self.S[13] = 2
+        return self.out()
+
+    def run_resident(self):
+
+
+
+
+
+
+
+        b = TritonBatch(1, device=self.dev, out_cap=self.OUTBUF.numel(),
+                        max_in=max(1, int(self.INP.numel())))
+        b.CODE[0].copy_(self.CODE)
+        b.CODELENS[0] = self.codelen
+        b.DATA[0].copy_(self.DATA)
+        b.INPUTS[0, :self.INP.numel()].copy_(self.INP)
+        b.INLENS[0] = self.inlen
+        b.BUDGETS[0] = self.tb
+        b.STATE[0].copy_(self.S)
+        b.run()
+        self.CODE.copy_(b.CODE[0])
+        self.DATA.copy_(b.DATA[0])
+        self.OUTBUF.copy_(b.OUTBUF[0])
+        self.S.copy_(b.STATE[0])
         return self.out()
