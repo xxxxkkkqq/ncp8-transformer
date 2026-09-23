@@ -172,107 +172,6 @@ def run_sumrec(n: int):
     return got, n * (n + 1) // 2, sim
 
 
-if __name__ == "__main__":
-    import random
-    random.seed(0)
-    ok = 0
-    for trial in range(200):
-        nbits = random.randint(1, 40) * 8
-        a = random.getrandbits(nbits)
-        b = random.getrandbits(nbits)
-        got, want, _ = run_long_add(a, b)
-        assert got == want, (trial, a, b, got, want)
-        ok += 1
-    print(f"long_add: {ok} random long additions byte-exact ")
-
-    for k in range(47):
-        got, want, _ = run_fib(k)
-        assert got == want, (k, got, want)
-    print("fibonacci: F(0..46) all byte-exact")
-
-    for n in [0, 1, 2, 7, 23, 100, 200, 255]:
-        got, want, sim = run_sumrec(n)
-        assert got == want, (n, got, want)
-        assert sim.snapshot()["SP"] == 4096, f"n={n} stack not restored: {sim.snapshot()}"
-    print("sumrec: recursion bounds/depth/stack balance all match")
-
-    for _ in range(200):
-        a = random.getrandbits(16)
-        b = [random.randrange(256) for _ in range(4)]
-        got, sim = run_frame_mul(a, b)
-        want = frame_mul_model(a, b)
-        assert got == want, (hex(a), b, hex(got), hex(want))
-        assert sim.snapshot()["SP"] == 4096, f"frame not unwound: {sim.snapshot()}"
-    print("frame_mul: 200 random (a, b) pairs, 16x16->32 widening product + local array, "
-          "frame unwound and result byte-exact against the Python model")
-
-
-
-
-MUL = asm("""
-  LDI HL, 0
-  MOV r0, [HL]
-  INC HL
-  MOV r1, [HL]
-  LDI r2, 0
-  LDI r3, 0
-loop:
-  TST r0
-  JZ done
-  ADD r2, r1
-  ADCI r3, 0
-  SUBI r0, 1
-  JMP loop
-done:
-  OUT r3
-  OUT r2
-  HALT
-""")
-
-
-def run_mul(a, b):
-    data = bytearray(2); data[0] = a; data[1] = b
-    sim = NCP8(MUL, data=data)
-    out = sim.run()
-    assert sim.status == "HALT", sim.status
-    got = (out[0] << 8) | out[1]
-    return got, a * b
-
-
-
-
-NESTED = asm("""
-  LDI HL, 0
-  MOV r0, [HL]
-  CALL outer
-  OUT r0
-  HALT
-outer:
-  CALL inner
-  ADDI r0, 5
-  RET
-inner:
-  SHL r0
-  RET
-""")
-
-
-def run_nested(n):
-    data = bytearray(1); data[0] = n
-    sim = NCP8(NESTED, data=data)
-    out = sim.run()
-    assert sim.status == "HALT", sim.status
-    return out[0], n * 2 + 5
-
-
-
-
-OVERFLOW = asm("""
-recurse:
-  CALL recurse
-""")
-
-
 
 
 
@@ -428,3 +327,104 @@ def run_frame_mul(a, b):
     assert sim.status == "HALT", sim.status
     assert len(out) == 4, out
     return out[0] | (out[1] << 8) | (out[2] << 16) | (out[3] << 24), sim
+
+
+if __name__ == "__main__":
+    import random
+    random.seed(0)
+    ok = 0
+    for trial in range(200):
+        nbits = random.randint(1, 40) * 8
+        a = random.getrandbits(nbits)
+        b = random.getrandbits(nbits)
+        got, want, _ = run_long_add(a, b)
+        assert got == want, (trial, a, b, got, want)
+        ok += 1
+    print(f"long_add: {ok} random long additions byte-exact ")
+
+    for k in range(47):
+        got, want, _ = run_fib(k)
+        assert got == want, (k, got, want)
+    print("fibonacci: F(0..46) all byte-exact")
+
+    for n in [0, 1, 2, 7, 23, 100, 200, 255]:
+        got, want, sim = run_sumrec(n)
+        assert got == want, (n, got, want)
+        assert sim.snapshot()["SP"] == 4096, f"n={n} stack not restored: {sim.snapshot()}"
+    print("sumrec: recursion bounds/depth/stack balance all match")
+
+    for _ in range(200):
+        a = random.getrandbits(16)
+        b = [random.randrange(256) for _ in range(4)]
+        got, sim = run_frame_mul(a, b)
+        want = frame_mul_model(a, b)
+        assert got == want, (hex(a), b, hex(got), hex(want))
+        assert sim.snapshot()["SP"] == 4096, f"frame not unwound: {sim.snapshot()}"
+    print("frame_mul: 200 random (a, b) pairs, 16x16->32 widening product + local array, "
+          "frame unwound and result byte-exact against the Python model")
+
+
+
+
+MUL = asm("""
+  LDI HL, 0
+  MOV r0, [HL]
+  INC HL
+  MOV r1, [HL]
+  LDI r2, 0
+  LDI r3, 0
+loop:
+  TST r0
+  JZ done
+  ADD r2, r1
+  ADCI r3, 0
+  SUBI r0, 1
+  JMP loop
+done:
+  OUT r3
+  OUT r2
+  HALT
+""")
+
+
+def run_mul(a, b):
+    data = bytearray(2); data[0] = a; data[1] = b
+    sim = NCP8(MUL, data=data)
+    out = sim.run()
+    assert sim.status == "HALT", sim.status
+    got = (out[0] << 8) | out[1]
+    return got, a * b
+
+
+
+
+NESTED = asm("""
+  LDI HL, 0
+  MOV r0, [HL]
+  CALL outer
+  OUT r0
+  HALT
+outer:
+  CALL inner
+  ADDI r0, 5
+  RET
+inner:
+  SHL r0
+  RET
+""")
+
+
+def run_nested(n):
+    data = bytearray(1); data[0] = n
+    sim = NCP8(NESTED, data=data)
+    out = sim.run()
+    assert sim.status == "HALT", sim.status
+    return out[0], n * 2 + 5
+
+
+
+
+OVERFLOW = asm("""
+recurse:
+  CALL recurse
+""")
