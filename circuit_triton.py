@@ -18,14 +18,60 @@ CODE_SIZE = 4096
 OUT_CAP = 8192
 
 
+
+
+ESC_DIV = tl.constexpr(0x100)
+ESC_MOD = tl.constexpr(0x101)
+ESC_CMP = tl.constexpr(0x102)
+ESC_NOT = tl.constexpr(0x103)
+ESC_NEG = tl.constexpr(0x104)
+ESC_ROL = tl.constexpr(0x105)
+ESC_ROR = tl.constexpr(0x106)
+ESC_ADD_HLDE = tl.constexpr(0x107)
+ESC_SUB_HLDE = tl.constexpr(0x108)
+ESC_XCHG = tl.constexpr(0x109)
+ESC_EXT = tl.constexpr(0x10A)
+ESC_STC = tl.constexpr(0x10B)
+ESC_LDC = tl.constexpr(0x10C)
+ESC_BAD = tl.constexpr(0x10D)
+
+
 @triton.jit
 def _get4(v0, v1, v2, v3, idx):
     return tl.where(idx == 0, v0, tl.where(idx == 1, v1, tl.where(idx == 2, v2, v3)))
 
 
 @triton.jit
-def _set4(s, d, v):
-    return tl.where(s == d, v, s)
+def _wr(r0, r1, r2, r3, d, v):
+
+    return (tl.where(d == 0, v, r0), tl.where(d == 1, v, r1),
+            tl.where(d == 2, v, r2), tl.where(d == 3, v, r3))
+
+
+@triton.jit
+def _dec_esc(sub):
+
+
+
+
+
+
+
+
+
+    if sub <= 0x2F:
+        eop = ESC_DIV + (sub >> 4); d = (sub >> 2) & 3; s = sub & 3; lx = 0
+    elif sub >= 0x40 and sub <= 0x4F:
+        eop = ESC_NOT + ((sub >> 2) & 3); d = sub & 3; s = sub & 3; lx = 0
+    elif sub >= 0x60 and sub <= 0x62:
+        eop = ESC_ADD_HLDE + (sub - 0x60); d = 0; s = 0; lx = 0
+    elif sub == 0x70:
+        eop = ESC_EXT; d = 0; s = 0; lx = 1
+    elif sub >= 0x80 and sub <= 0x87:
+        eop = ESC_STC + ((sub >> 2) & 1); d = sub & 3; s = sub & 3; lx = 0
+    else:
+        eop = ESC_BAD; d = 0; s = 0; lx = 0
+    return eop, d, s, lx
 
 
 @triton.jit
@@ -43,55 +89,75 @@ def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
     OVAL = 0; OEN = 0
     A1 = 0; V1 = 0; E1 = 0
     A2 = 0; V2 = 0; E2 = 0
+    A3 = 0; V3 = 0; E3 = 0
     err = 0
+
+
+
+    eop = 0xFFFF
+    ed = 0; es = 0; elen = 1
 
     if PC < CODELEN:
         op = tl.load(CODE + PC)
-        if op <= 0x1F:
-            if op == 0x00:
+        eop = op
+        ed = op & 3
+        es = op & 3
+        if op == 0x70:
+
+
+            if PC + 2 > CODELEN:
+                err = 1
+            else:
+                sub = tl.load(CODE + PC + 1)
+                eop, ed, es, elx = _dec_esc(sub)
+                elen = 2 + elx
+                nPC = PC + elen
+
+        if eop <= 0x1F:
+            if eop == 0x00:
                 NST = 1
-            elif op == 0x01:
+            elif eop == 0x01:
                 pass
-            elif op == 0x02:
+            elif eop == 0x02:
                 nHL = (HL + 1) & 0xFFFF
-            elif op == 0x03:
+            elif eop == 0x03:
                 nHL = (HL - 1) & 0xFFFF
-            elif op == 0x04:
+            elif eop == 0x04:
                 nDE = (DE + 1) & 0xFFFF
-            elif op == 0x05:
+            elif eop == 0x05:
                 nC = 0
-            elif op == 0x06:
+            elif eop == 0x06:
                 if HL >= DS:
                     err = 1
                 else:
                     OVAL = tl.load(DATA + HL); OEN = 1; nHL = (HL + 1) & 0xFFFF
-            elif op == 0x07:
+            elif eop == 0x07:
                 if DE >= DS:
                     err = 1
                 else:
                     OVAL = tl.load(DATA + DE); OEN = 1; nDE = (DE + 1) & 0xFFFF
-            elif op == 0x08:
+            elif eop == 0x08:
                 if SP + 1 >= DS:
                     err = 1
                 else:
                     nPC = (tl.load(DATA + SP) << 8) | tl.load(DATA + SP + 1)
                     nSP = SP + 2
-            elif op >= 0x09 and op <= 0x0D:
+            elif eop >= 0x09 and eop <= 0x0D:
                 if PC + 3 > CODELEN:
                     err = 1
                 else:
                     t = tl.load(CODE + PC + 1) | (tl.load(CODE + PC + 2) << 8)
-                    if op == 0x09:
+                    if eop == 0x09:
                         nPC = t
-                    elif op == 0x0A:
+                    elif eop == 0x0A:
                         nPC = t if Z == 1 else PC + 3
-                    elif op == 0x0B:
+                    elif eop == 0x0B:
                         nPC = t if Z == 0 else PC + 3
-                    elif op == 0x0C:
+                    elif eop == 0x0C:
                         nPC = t if C == 1 else PC + 3
                     else:
                         nPC = t if C == 0 else PC + 3
-            elif op == 0x0E:
+            elif eop == 0x0E:
                 if SP < 2 or PC + 3 > CODELEN:
                     err = 1
                 else:
@@ -100,52 +166,65 @@ def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                     A1 = SP - 1; V1 = ret & 0xFF; E1 = 1
                     A2 = SP - 2; V2 = (ret >> 8) & 0xFF; E2 = 1
                     nSP = SP - 2; nPC = t
-            elif op == 0x0F or op == 0x10:
+            elif eop == 0x0F or eop == 0x10:
                 if PC + 3 > CODELEN:
                     err = 1
                 else:
                     t = tl.load(CODE + PC + 1) | (tl.load(CODE + PC + 2) << 8)
                     nPC = PC + 3
-                    if op == 0x0F:
+                    if eop == 0x0F:
                         nHL = t
                     else:
                         nDE = t
-            elif op == 0x11 or op == 0x12:
+            elif eop == 0x11 or eop == 0x12:
                 if PC + 2 > CODELEN:
                     err = 1
                 else:
                     rs = _get4(r0, r1, r2, r3, tl.load(CODE + PC + 1) & 3)
                     nPC = PC + 2
-                    if op == 0x11:
+                    if eop == 0x11:
                         nHL = (HL + rs) & 0xFFFF
                     else:
                         nDE = (DE + rs) & 0xFFFF
-            elif op == 0x13:
+            elif eop == 0x13:
                 nPC = HL & 0xFFFF
-            elif op >= 0x14 and op <= 0x1F:
-                d = op & 3
-                if op < 0x18:
+            elif eop >= 0x14 and eop <= 0x1F:
+                d = eop & 3
+                if eop < 0x18:
                     v = PC
-                elif op < 0x1C:
+                elif eop < 0x1C:
                     v = SP & 255
                 else:
                     v = Z + 2 * C
-                if d == 0:
-                    nR0 = v
-                elif d == 1:
-                    nR1 = v
-                elif d == 2:
-                    nR2 = v
-                else:
-                    nR3 = v
+                nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
             else:
                 err = 1
-        elif op >= 0x80 and op <= 0xCF:
-            f = op & 0xF
+        elif eop >= 0x20 and eop <= 0x5F:
+
+            f = eop & 0xF
             d = (f >> 2) & 3
             a = _get4(r0, r1, r2, r3, d)
             b = _get4(r0, r1, r2, r3, f & 3)
-            k = op >> 4
+            k = eop >> 4
+            v = a
+            if k == 2:
+                v = a & b; nZ = (v == 0).to(tl.int32)
+            elif k == 3:
+                v = a | b; nZ = (v == 0).to(tl.int32)
+            elif k == 4:
+                v = a ^ b; nZ = (v == 0).to(tl.int32)
+            elif k == 5:
+                t = a * b; v = t & 255
+                nC = (t > 255).to(tl.int32); nZ = (v == 0).to(tl.int32)
+            else:
+                err = 1
+            nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
+        elif eop >= 0x80 and eop <= 0xCF:
+            f = eop & 0xF
+            d = (f >> 2) & 3
+            a = _get4(r0, r1, r2, r3, d)
+            b = _get4(r0, r1, r2, r3, f & 3)
+            k = eop >> 4
             v = a
             if k == 8:
                 t = a + b; v = t & 255; nC = t >> 8; nZ = (v == 0).to(tl.int32)
@@ -159,47 +238,32 @@ def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                 v = b
             else:
                 err = 1
-            if d == 0:
-                nR0 = v
-            elif d == 1:
-                nR1 = v
-            elif d == 2:
-                nR2 = v
-            elif d == 3:
-                nR3 = v
-        elif op >= 0xD0 and op <= 0xDF:
+            nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
+        elif eop >= 0xD0 and eop <= 0xDF:
             if PC + 2 > CODELEN:
                 err = 1
             else:
                 i8 = tl.load(CODE + PC + 1)
-                rr = _get4(r0, r1, r2, r3, op & 3)
+                rr = _get4(r0, r1, r2, r3, eop & 3)
                 nPC = PC + 2
-                if op <= 0xD3:
+                if eop <= 0xD3:
                     v = i8
-                elif op <= 0xD7:
+                elif eop <= 0xD7:
                     t = rr + i8; v = t & 255; nC = t >> 8; nZ = (v == 0).to(tl.int32)
-                elif op <= 0xDB:
+                elif eop <= 0xDB:
                     v = (rr - i8) & 255; nC = (rr < i8).to(tl.int32); nZ = (v == 0).to(tl.int32)
                 else:
                     t = rr + i8 + C; v = t & 255; nC = t >> 8; nZ = (v == 0).to(tl.int32)
-                d = op & 3
-                if d == 0:
-                    nR0 = v
-                elif d == 1:
-                    nR1 = v
-                elif d == 2:
-                    nR2 = v
-                else:
-                    nR3 = v
-        elif op >= 0x60 and op <= 0x6F:
-            d = op & 3
+                nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, eop & 3, v)
+        elif eop >= 0x60 and eop <= 0x6F:
+            d = eop & 3
             rr = _get4(r0, r1, r2, r3, d)
             v = rr
-            if op < 0x64:
+            if eop < 0x64:
                 nC = rr >> 7; v = (rr << 1) & 255; nZ = (v == 0).to(tl.int32)
-            elif op < 0x68:
+            elif eop < 0x68:
                 nC = rr & 1; v = rr >> 1; nZ = (v == 0).to(tl.int32)
-            elif op < 0x6C:
+            elif eop < 0x6C:
                 nZ = (rr == 0).to(tl.int32)
                 v = rr
             else:
@@ -211,65 +275,145 @@ def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                     nPC = PC + 3
                     if v != 0:
                         nPC = t
-            if d == 0:
-                nR0 = v
-            elif d == 1:
-                nR1 = v
-            elif d == 2:
-                nR2 = v
-            else:
-                nR3 = v
-        elif op >= 0xE0 and op <= 0xFF:
-            d = op & 3
+            nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
+        elif eop >= 0xE0 and eop <= 0xFF:
+            d = eop & 3
             rr = _get4(r0, r1, r2, r3, d)
             v = rr
-            touched = 1
-            if op < 0xE4:
+            if eop < 0xE4:
                 if HL >= DS:
                     err = 1
                 else:
                     v = tl.load(DATA + HL)
-            elif op < 0xE8:
+            elif eop < 0xE8:
                 if HL >= DS:
                     err = 1
                 else:
                     A1 = HL; V1 = rr; E1 = 1
-            elif op < 0xEC:
+            elif eop < 0xEC:
                 if DE >= DS:
                     err = 1
                 else:
                     v = tl.load(DATA + DE)
-            elif op < 0xF0:
+            elif eop < 0xF0:
                 if DE >= DS:
                     err = 1
                 else:
                     A1 = DE; V1 = rr; E1 = 1
-            elif op < 0xF4:
+            elif eop < 0xF4:
                 if SP <= 0:
                     err = 1
                 else:
                     A1 = SP - 1; V1 = rr; E1 = 1; nSP = SP - 1
-            elif op < 0xF8:
+            elif eop < 0xF8:
                 if SP >= DS:
                     err = 1
                 else:
                     v = tl.load(DATA + SP); nSP = SP + 1
-            elif op < 0xFC:
+            elif eop < 0xFC:
                 OVAL = rr; OEN = 1
-                touched = 0
             else:
                 if IPO < INLEN:
                     v = tl.load(INPUTS + IPO); nIPO = IPO + 1
                 else:
                     v = 0; nC = 1
-            if d == 0:
-                nR0 = v
-            elif d == 1:
-                nR1 = v
-            elif d == 2:
-                nR2 = v
+            nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
+        elif eop >= 0x100:
+
+            if eop == ESC_DIV or eop == ESC_MOD:
+                a = _get4(r0, r1, r2, r3, ed)
+                b = _get4(r0, r1, r2, r3, es)
+                if b == 0:
+                    err = 1
+                else:
+                    if eop == ESC_DIV:
+                        v = a // b
+                    else:
+                        v = a % b
+                    nZ = (v == 0).to(tl.int32)
+                    nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
+            elif eop == ESC_CMP:
+
+                a = _get4(r0, r1, r2, r3, ed)
+                b = _get4(r0, r1, r2, r3, es)
+                nZ = (a == b).to(tl.int32)
+                nC = (a < b).to(tl.int32)
+            elif eop == ESC_NOT:
+                rr = _get4(r0, r1, r2, r3, ed)
+                v = (~rr) & 255
+                nZ = (v == 0).to(tl.int32)
+                nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
+            elif eop == ESC_NEG:
+                rr = _get4(r0, r1, r2, r3, ed)
+                v = (-rr) & 255
+                nC = (rr != 0).to(tl.int32)
+                nZ = (v == 0).to(tl.int32)
+                nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
+            elif eop == ESC_ROL:
+
+                rr = _get4(r0, r1, r2, r3, ed)
+                nC = rr >> 7
+                v = ((rr << 1) | C) & 255
+                nZ = (v == 0).to(tl.int32)
+                nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
+            elif eop == ESC_ROR:
+                rr = _get4(r0, r1, r2, r3, ed)
+                nC = rr & 1
+                v = (rr >> 1) | (C << 7)
+                nZ = (v == 0).to(tl.int32)
+                nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
+            elif eop == ESC_ADD_HLDE:
+                t = HL + DE
+                nC = t >> 16
+                nHL = t & 0xFFFF
+            elif eop == ESC_SUB_HLDE:
+                nC = (HL < DE).to(tl.int32)
+                nHL = (HL - DE) & 0xFFFF
+            elif eop == ESC_XCHG:
+                nHL = DE
+                nDE = HL
+            elif eop == ESC_EXT:
+
+
+
+                if PC + 3 > CODELEN:
+                    err = 1
+                else:
+                    k = tl.load(CODE + PC + 2)
+                    if k >= 16:
+                        err = 1
+                    else:
+                        tgt = tl.load(CODE + 0x0F00 + 2 * k) \
+                            | (tl.load(CODE + 0x0F00 + 2 * k + 1) << 8)
+                        if tgt == 0 or SP < 2:
+                            err = 1
+                        else:
+                            ret = PC + 3
+                            A1 = SP - 1; V1 = ret & 0xFF; E1 = 1
+                            A2 = SP - 2; V2 = (ret >> 8) & 0xFF; E2 = 1
+                            nSP = SP - 2; nPC = tgt
+            elif eop == ESC_STC:
+
+
+
+                if HL >= CODELEN:
+                    err = 1
+                else:
+                    wlo = tl.load(CODE + 0x0F20)
+                    whi = tl.load(CODE + 0x0F21)
+                    if HL < wlo or HL >= whi:
+                        err = 1
+                    else:
+                        A3 = HL; V3 = _get4(r0, r1, r2, r3, ed); E3 = 1
+            elif eop == ESC_LDC:
+
+                if HL >= CODELEN:
+                    err = 1
+                else:
+                    v = tl.load(CODE + HL)
+                    nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
             else:
-                nR3 = v
+                err = 1
         else:
             err = 1
     else:
@@ -290,6 +434,8 @@ def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
             tl.store(DATA + A1, V1)
         if E2 == 1:
             tl.store(DATA + A2, V2)
+        if E3 == 1:
+            tl.store(CODE + A3, V3)
 
 
 class TritonCircuit:

@@ -66,7 +66,8 @@ def one_step_agreement(Machine, op, seed):
 
 
 
-TRITON_V2_PENDING = frozenset(range(0x20, 0x60)) | {0x70}
+
+TRITON_V2_PENDING = frozenset()
 
 
 def test_all_opcodes(Machine, name, skip=frozenset()):
