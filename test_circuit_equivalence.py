@@ -39,6 +39,7 @@ def one_step_agreement(Machine, op, seed):
     c.load_state(R, HL, DE, SP, C0, Z0, g.tick)
 
     pre_g = golden_view(g); pre_data = list(g.data)
+    pre_code, pre_out = bytes(g.code), bytes(g.out)
     g_err = False
     try:
         g.step()
@@ -47,6 +48,16 @@ def one_step_agreement(Machine, op, seed):
     c.step()
 
     if g_err:
+
+
+
+
+
+        assert golden_view(g) == pre_g, (op, seed, "reference error tick was not atomic",
+                                         pre_g, golden_view(g))
+        assert list(g.data) == pre_data, (op, seed, "reference modified DATA before raising")
+        assert bytes(g.code) == pre_code, (op, seed, "reference modified CODE before raising")
+        assert bytes(g.out) == pre_out, (op, seed, "reference wrote output before raising")
         cv = c.snapshot()
         assert cv["status"] == 3, (op, seed, "expect ERR", cv)
         for k in pre_g:
@@ -54,6 +65,7 @@ def one_step_agreement(Machine, op, seed):
                 continue
             assert pre_g[k] == cv[k], (op, seed, k, pre_g[k], cv[k])
         assert list(c.DATA.cpu().tolist()) == pre_data, (op, seed, "DATA was modified")
+        assert bytes(c.CODE.cpu().tolist()[:len(code)]) == pre_code, (op, seed, "CODE")
         assert c.out() == bytes(g.out), (op, seed, "out")
         return "err"
     else:
@@ -64,22 +76,23 @@ def one_step_agreement(Machine, op, seed):
         return "ok"
 
 
+def test_all_opcodes(Machine, name):
 
 
 
-TRITON_V2_PENDING = frozenset()
 
 
-def test_all_opcodes(Machine, name, skip=frozenset()):
+
+
     import torch
     total = {"ok": 0, "err": 0}
-    ops = [op for op in range(256) if op not in skip]
+    ops = list(range(256))
     for op in ops:
         for seed in range(6):
             total[one_step_agreement(Machine, op, seed)] += 1
     torch.cuda.synchronize()
-    note = f", skipping {len(skip)} opcodes (ISA v2 not implemented yet, tracked) " if skip else ""
-    print(f"[{name}] all-opcode single step: {len(ops)*6} cases match (ok {total['ok']} + error {total['err']}) {note} ")
+    assert len(ops) * 6 == 1536, len(ops)
+    print(f"[{name}] all-opcode single step: {len(ops)*6} cases match (ok {total['ok']} + error {total['err']})  ")
 
 
 def lockstep(g, c):
@@ -124,6 +137,6 @@ def test_programs(Machine, name):
 if __name__ == "__main__":
     test_all_opcodes(TorchCircuit, "torch")
     test_programs(TorchCircuit, "torch")
-    test_all_opcodes(TritonCircuit, "triton", skip=TRITON_V2_PENDING)
+    test_all_opcodes(TritonCircuit, "triton")
     test_programs(TritonCircuit, "triton")
     print("\ndual-circuit equivalence: all passed")

@@ -62,18 +62,16 @@ def golden_step(g):
 
 
 
-    pre = golden_view(g)
-    pre_sp = g.SP
-    pre_byte = g.data[pre_sp - 1] if 0 < pre_sp <= 4096 else None
+    pre, pre_data = golden_view(g), list(g.data)
+    pre_code, pre_out = bytes(g.code), bytes(g.out)
     try:
         g.step()
         return False
     except MachineError:
-        g.r = pre["r"]
-        g.HL, g.DE, g.PC, g.SP = pre["HL"], pre["DE"], pre["PC"], pre["SP"]
-        g.C, g.Z, g.ipos, g.tick = pre["C"], pre["Z"], pre["ipos"], pre["tick"]
-        if pre_byte is not None:
-            g.data[pre_sp - 1] = pre_byte
+        assert golden_view(g) == pre, ("reference error tick was not atomic", pre, golden_view(g))
+        assert list(g.data) == pre_data, "reference modified DATA before raising"
+        assert bytes(g.code) == pre_code, "reference modified CODE before raising"
+        assert bytes(g.out) == pre_out, "reference wrote output before raising"
         return True
 
 

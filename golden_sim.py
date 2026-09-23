@@ -62,20 +62,39 @@ class NCP8:
         self.PC += n
         return b
 
-    def _push(self, byte):
-        if self.SP <= 0:
+    def _stack_room(self, n):
+
+
+
+
+
+
+        if self.SP < n:
             raise MachineError("stack underflow")
+
+    def _stack_have(self, n):
+
+
+
+
+
+        if self.SP + n > DATA_SIZE:
+            raise MachineError("stack overflow")
+
+    def _push(self, byte):
+        self._stack_room(1)
         self.SP -= 1
         self.data[self.SP] = byte & 0xFF
 
     def _pop(self):
-        if self.SP >= DATA_SIZE:
-            raise MachineError("stack overflow")
+        self._stack_have(1)
         v = self.data[self.SP]
         self.SP += 1
         return v
 
     def step(self):
+
+
 
 
         pc0 = self.PC
@@ -110,6 +129,7 @@ class NCP8:
                 self._mem(self.DE); self.out.append(self.data[self.DE])
                 self.DE = (self.DE + 1) & 0xFFFF; m = "OUTDE"
             elif op == 0x08:
+                self._stack_have(2)
                 hi = self._pop(); lo = self._pop(); self.PC = hi << 8 | lo; m = "RET"
             elif 0x09 <= op <= 0x0D:
                 lo, hi = self._fetch(2); t = hi << 8 | lo
@@ -120,6 +140,7 @@ class NCP8:
                 elif op == 0x0D: m = "JNC";  self.PC = t if not self.C else self.PC
             elif op == 0x0E:
                 lo, hi = self._fetch(2); t = hi << 8 | lo; ret = self.PC
+                self._stack_room(2)
                 self._push(ret & 0xFF); self._push(ret >> 8); self.PC = t; m = "CALL"
             elif op == 0x0F:
                 lo, hi = self._fetch(2); self.HL = hi << 8 | lo; m = f"LDI HL, {self.HL}"
@@ -233,6 +254,7 @@ class NCP8:
                     tgt = (self.code[a + 1] << 8) | self.code[a]
                 if tgt == 0:
                     raise MachineError(f"EXT handler {k} unregistered @ {pc0:#04x}")
+                self._stack_room(2)
                 self._push(self.PC & 0xFF); self._push((self.PC >> 8) & 0xFF)
                 self.PC = tgt; m = f"EXT {k}"
             else:
@@ -295,6 +317,21 @@ class NCP8:
 
 
 
+class AssemblyError(MachineError):
+
+
+
+
+
+
+
+
+    def __init__(self, msg, line=None):
+        self.msg = msg
+        self.line = line
+        super().__init__(f"line {line}: {msg}" if line is not None else msg)
+
+
 def _r(s):
     assert s in ("r0", "r1", "r2", "r3"), s
     return int(s[1])
@@ -303,27 +340,74 @@ def _r(s):
 def asm(src: str) -> bytes:
     pat = re.compile(r"^(\w+):$")
     items = []
-    for raw in src.splitlines():
+    for lineno, raw in enumerate(src.splitlines(), 1):
         line = raw.split(";", 1)[0].strip()
         if not line:
             continue
         mm = pat.match(line)
         if mm:
-            items.append(("label", mm.group(1)))
+            items.append(("label", mm.group(1), lineno, line))
             continue
         name, _, args = line.partition(" ")
         args = [a.strip() for a in args.split(",")] if args.strip() else []
-        items.append(("inst", name.strip(), args))
+        items.append(("inst", name.strip(), args, lineno, line))
 
-    def enc(name, args, labels):
-        def _addr(x):
+    def enc(name, args, labels, lineno, text, strict):
+        def _bad(msg):
+            raise AssemblyError(msg, lineno)
 
-            if x in labels:
-                return labels[x]
+        def _value(x):
+
+
+
+
+
+            s = str(x)
+            if s in labels:
+                return labels[s]
             try:
-                return int(str(x), 0)
+                return int(s, 0)
             except ValueError:
+                pass
+            if re.fullmatch(r"[A-Za-z_]\w*", s):
+                _bad(f"undefined symbol {s!r} in {text!r}")
+            _bad(f"unsupported operand expression {s!r} in {text!r}")
+
+        def _addr(x, mnemonic):
+
+            if not strict:
+
+
+
+
                 return 0
+            v = _value(x)
+            if not 0 <= v <= 0xFFFF:
+                _bad(f"{mnemonic} address {v} is out of range 0..65535 in {text!r}")
+            return v
+
+        def _imm8(x, mnemonic):
+
+
+
+
+
+
+
+            if not strict:
+                return 0
+            s = str(x)
+            if s in labels:
+                _bad(f"{mnemonic} needs a numeric 8-bit immediate, {s!r} is a label in {text!r}")
+            try:
+                v = int(s, 0)
+            except ValueError:
+                if re.fullmatch(r"[A-Za-z_]\w*", s):
+                    _bad(f"undefined symbol {s!r} in {text!r}")
+                _bad(f"unsupported operand expression {s!r} in {text!r}")
+            if not 0 <= v <= 0xFF:
+                _bad(f"{mnemonic} immediate {v} is out of range 0..255 in {text!r}")
+            return v
 
         simple = {"HALT": 0x00, "NOP": 0x01, "INC HL": 0x02, "DEC HL": 0x03,
                   "INC DE": 0x04, "CLC": 0x05, "OUTM": 0x06, "OUTDE": 0x07, "RET": 0x08,
@@ -333,7 +417,7 @@ def asm(src: str) -> bytes:
             rest = args[1:]
             if base in (0x0F, 0x10):
 
-                v = _addr(rest[0])
+                v = _addr(rest[0], name)
                 return bytes([base, v & 0xFF, v >> 8])
             if base in (0x11, 0x12):
                 return bytes([base, _r(rest[0])])
@@ -348,19 +432,19 @@ def asm(src: str) -> bytes:
         jump = {"JMP": 0x09, "JZ": 0x0A, "JNZ": 0x0B, "JC": 0x0C, "JNC": 0x0D, "CALL": 0x0E}
         if name in jump:
 
-            a = _addr(args[0])
+            a = _addr(args[0], name)
             return bytes([jump[name], a & 0xFF, a >> 8])
         if name == "DJNZ":
-            a = _addr(args[1])
+            a = _addr(args[1], name)
             return bytes([0x6C | _r(args[0]), a & 0xFF, a >> 8])
         if name == "LDI":
-            return bytes([0xD0 | _r(args[0]), int(str(args[1]), 0)])
+            return bytes([0xD0 | _r(args[0]), _imm8(args[1], name)])
         if name == "ADDI":
-            return bytes([0xD4 | _r(args[0]), int(str(args[1]), 0)])
+            return bytes([0xD4 | _r(args[0]), _imm8(args[1], name)])
         if name == "SUBI":
-            return bytes([0xD8 | _r(args[0]), int(str(args[1]), 0)])
+            return bytes([0xD8 | _r(args[0]), _imm8(args[1], name)])
         if name == "ADCI":
-            return bytes([0xDC | _r(args[0]), int(str(args[1]), 0)])
+            return bytes([0xDC | _r(args[0]), _imm8(args[1], name)])
         if name in ("ADD", "SUB") and args and args[0] == "HL":
             return bytes([0x70, {"ADD": 0x60, "SUB": 0x61}[name]])
         if name == "XCHG":
@@ -370,7 +454,7 @@ def asm(src: str) -> bytes:
         if name == "LDC":
             return bytes([0x70, 0x84 | _r(args[0])])
         if name == "EXT":
-            return bytes([0x70, 0x70, int(str(args[0]), 0) & 0xFF])
+            return bytes([0x70, 0x70, _imm8(args[0], name)])
         rr2 = {"AND": 0x20, "OR": 0x30, "XOR": 0x40, "MUL": 0x50}
         if name in rr2:
             return bytes([rr2[name] | (_r(args[0]) << 2) | _r(args[1])])
@@ -394,17 +478,18 @@ def asm(src: str) -> bytes:
                  "SHL": 0x60, "SHR": 0x64, "TST": 0x68}
         if name in unary:
             return bytes([unary[name] | _r(args[0])])
-        raise MachineError(f"unknowninstruction: {name} {args}")
+        raise AssemblyError(f"unknown instruction {name!r} in {text!r}", lineno)
 
     labels, addr = {}, 0
     for it in items:
         if it[0] == "label":
             labels[it[1]] = addr
         else:
-            addr += len(enc(it[1], it[2], labels))
+            addr += len(enc(it[1], it[2], labels, it[3], it[4], strict=False))
     out = bytearray()
     for it in items:
         if it[0] != "label":
-            out += enc(it[1], it[2], labels)
-    assert len(out) <= CODE_SIZE
+            out += enc(it[1], it[2], labels, it[3], it[4], strict=True)
+    if len(out) > CODE_SIZE:
+        raise AssemblyError(f"assembled code is {len(out)} bytes, above CODE_SIZE {CODE_SIZE}")
     return bytes(out)

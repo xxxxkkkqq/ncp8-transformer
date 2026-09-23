@@ -57,6 +57,151 @@ def one_op(src, r0=None, r1=None):
     return g
 
 
+
+
+
+
+MUL32 = asm("""
+  LDI HL, 4
+  LDI r0, 0
+  MOV [HL], r0
+  INC HL
+  MOV [HL], r0
+  INC HL
+  MOV [HL], r0
+  INC HL
+  MOV [HL], r0
+  INC HL
+  MOV [HL], r0
+  INC HL
+  MOV [HL], r0
+  LDI HL, 0
+  MOV r0, [HL]
+  LDI HL, 20
+  MOV [HL], r0
+  LDI HL, 2
+  MOV r0, [HL]
+  LDI HL, 21
+  MOV [HL], r0
+  CALL mk_prod
+  LDI r0, 0
+  LDI HL, 27
+  MOV [HL], r0
+  CALL acc_prod
+  LDI HL, 1
+  MOV r0, [HL]
+  LDI HL, 20
+  MOV [HL], r0
+  LDI HL, 2
+  MOV r0, [HL]
+  LDI HL, 21
+  MOV [HL], r0
+  CALL mk_prod
+  LDI r0, 1
+  LDI HL, 27
+  MOV [HL], r0
+  CALL acc_prod
+  LDI HL, 0
+  MOV r0, [HL]
+  LDI HL, 20
+  MOV [HL], r0
+  LDI HL, 3
+  MOV r0, [HL]
+  LDI HL, 21
+  MOV [HL], r0
+  CALL mk_prod
+  LDI r0, 1
+  LDI HL, 27
+  MOV [HL], r0
+  CALL acc_prod
+  LDI HL, 1
+  MOV r0, [HL]
+  LDI HL, 20
+  MOV [HL], r0
+  LDI HL, 3
+  MOV r0, [HL]
+  LDI HL, 21
+  MOV [HL], r0
+  CALL mk_prod
+  LDI r0, 2
+  LDI HL, 27
+  MOV [HL], r0
+  CALL acc_prod
+  HALT
+mk_prod:
+  LDI HL, 22
+  LDI r0, 0
+  MOV [HL], r0
+  INC HL
+  MOV [HL], r0
+  LDI HL, 24
+  LDI DE, 21
+  MOV r0, [DE]
+  MOV [HL], r0
+  INC HL
+  LDI r0, 0
+  MOV [HL], r0
+  LDI HL, 20
+  MOV r0, [HL]
+  LDI r1, 8
+bits:
+  MOV r2, r0
+  SHR r2
+  JNC noadd
+  CLC
+  LDI HL, 22
+  LDI DE, 24
+  MOV r2, [HL]
+  MOV r3, [DE]
+  ADC r2, r3
+  MOV [HL], r2
+  INC HL
+  INC DE
+  MOV r2, [HL]
+  MOV r3, [DE]
+  ADC r2, r3
+  MOV [HL], r2
+noadd:
+  SHR r0
+  LDI HL, 24
+  MOV r2, [HL]
+  SHL r2
+  MOV [HL], r2
+  INC HL
+  MOV r2, [HL]
+  ROL r2
+  MOV [HL], r2
+  DJNZ r1, bits
+  RET
+acc_prod:
+  LDI HL, 4
+  LDI DE, 27
+  MOV r0, [DE]
+  ADDI HL, r0
+  LDI DE, 22
+  CLC
+  MOV r0, [HL]
+  MOV r1, [DE]
+  ADC r0, r1
+  MOV [HL], r0
+  INC HL
+  INC DE
+  MOV r0, [HL]
+  MOV r1, [DE]
+  ADC r0, r1
+  MOV [HL], r0
+  INC HL
+  MOV r0, [HL]
+  ADCI r0, 0
+  MOV [HL], r0
+  INC HL
+  MOV r0, [HL]
+  ADCI r0, 0
+  MOV [HL], r0
+  RET
+""")
+
+
 def test_bitwise():
     rng = random.Random(7)
     for _ in range(400):
@@ -86,29 +231,20 @@ def test_mul():
         assert g.C == int(a * b > 255), ("MUL C must be the high byte != 0", a, b)
         assert g.Z == int((a * b) & 0xFF == 0), ("MUL Z", a, b)
 
-    prog = """
-    ; r0r1 = A(lo,hi), r2r3 = B(lo,hi) -> DATA[0..3] = 32-bit product
-    MUL r0, r2
-    MOV [HL], r0          ; low byte of the product
-    MUL r1, r2
-    MOV r3, r0            ; r3 scratch hi(A)*lo(B)
-    MUL r0, r2
-    MOV [HL], r0
-    HALT
-    """
+
+
+
     for _ in range(60):
         A, B = rng.randrange(65536), rng.randrange(65536)
-        g = NCP8(asm(prog))
-        g.r[0], g.r[1], g.r[2] = A & 255, A >> 8, B & 255
+        g = NCP8(MUL32)
+        g.data[0], g.data[1] = A & 255, A >> 8
+        g.data[2], g.data[3] = B & 255, B >> 8
         while g.status == "RUNNING": g.step()
-
-        assert g.data[0] == (A * B) & 255 or True
-
-    for _ in range(200):
-        A, B = rng.randrange(256), rng.randrange(256)
-        g = one_op("MUL r0, r1\nHALT", A, B)
-        assert g.r[0] == (A * B) % 256
-    print("  MUL (low byte + C as high byte + Z)")
+        assert g.status == "HALT", g.status
+        assert bytes(g.data[4:10]) == (A * B).to_bytes(6, "little"), \
+            (A, B, bytes(g.data[4:10]).hex(), hex(A * B))
+    print("  MUL contract (low byte + C as the high-byte-nonzero flag + Z), "
+          "16x16 -> 32 shift/ADC chain byte-exact")
 
 
 def test_div_mod():

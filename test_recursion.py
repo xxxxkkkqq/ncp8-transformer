@@ -46,17 +46,24 @@ def test_nested():
 
 def test_overflow_atomic():
 
+
+
+
+
+
     for Mach in (TorchCircuit, TritonCircuit):
         g = NCP8(programs.OVERFLOW, data=bytearray(4))
         c = Mach(programs.OVERFLOW, data=bytearray(4))
 
         n = 0
+        raised = False
         while True:
             g_running = g.status == "RUNNING" and g.tick < g.tb
             c_running = int(c.status.item()) == 0
             assert g_running == c_running, (n, "run/halt verdict diverged", g.status, int(c.status.item()))
             if not g_running:
                 break
+            pre, pre_data, pre_out = golden_view(g), list(g.data), bytes(g.out)
 
             try:
                 g.step(); g_err = False
@@ -65,11 +72,17 @@ def test_overflow_atomic():
             c.step()
             n += 1
             if g_err:
+                raised = True
                 assert int(c.status.item()) == 3, (n, "reference overflowed but the circuit did not report ERR")
+
+                assert golden_view(g) == pre, (n, "reference error tick was not atomic", pre, golden_view(g))
+                assert list(g.data) == pre_data, (n, "reference modified DATA before raising")
+                assert bytes(g.out) == pre_out, (n, "reference wrote output before raising")
+                assert g.SP == 0, (n, "the failure must happen exactly on the last free slot", g.SP)
                 break
             assert golden_view(g) == c.snapshot(), (n, "state diverged before the overflow")
-        assert g.status in ("RUNNING",), g.status
-        print(f"  stack overflow captured at tick {n} both machines atomic and identical ")
+        assert raised, "the reference never raised the stack error"
+        print(f"  stack overflow captured at tick {n}: violating tick atomic in both implementations")
     print("stack overflow capture: violating tick atomic and identical (no silent wraparound)")
 
 
