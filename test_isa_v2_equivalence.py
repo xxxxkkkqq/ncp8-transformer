@@ -30,7 +30,7 @@ def _code_esc(sub, vec=0, tail=(0xAA, 0x55)):
 
 def _golden_view(g):
     return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
-                ipos=g.ipos, tick=g.tick,
+                ipos=g.ipos, oplen=len(g.out), tick=g.tick,
                 status={"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}[g.status])
 
 
@@ -47,6 +47,7 @@ def one_esc_step(Machine, sub, seed, vec=0):
     c = Machine(code, data=data_g)
     c.load_state(R, HL, DE, SP, C0, Z0, 0)
     pre, pre_data = _golden_view(g), list(g.data)
+    pre_code, pre_out = bytes(g.code), bytes(g.out)
     g_err = False
     try:
         g.step()
@@ -55,12 +56,21 @@ def one_esc_step(Machine, sub, seed, vec=0):
     c.step()
     cv = c.snapshot()
     if g_err:
+
+
+
+        assert _golden_view(g) == pre, (sub, seed, "reference error tick was not atomic",
+                                        pre, _golden_view(g))
+        assert list(g.data) == pre_data, (sub, seed, "reference modified DATA before raising")
+        assert bytes(g.code) == pre_code, (sub, seed, "reference modified CODE before raising")
+        assert bytes(g.out) == pre_out, (sub, seed, "reference wrote output before raising")
         assert cv["status"] == 3, (sub, seed, "expected ERR", cv)
         for k in pre:
             if k == "status":
                 continue
             assert pre[k] == cv[k], (sub, seed, "error path not atomic", k, pre[k], cv[k])
         assert list(c.DATA.cpu().tolist()) == pre_data, (sub, seed, "DATA was modified")
+        assert bytes(c.CODE.cpu().tolist()[:len(code)]) == pre_code, (sub, seed, "CODE was modified")
         return "err"
     gv = _golden_view(g)
     assert all(gv[k] == cv[k] for k in gv), (sub, seed, gv, cv)
@@ -83,16 +93,33 @@ def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=N
     g = NCP8(code, data=data, inputs=inputs, tick_budget=max_tick)
     c = Machine(code, data=data, inputs=inputs, tick_budget=max_tick)
     n = 0
+    raised = False
     while g.status == "RUNNING" and n < max_tick:
-        gs = _golden_view(g); cv = c.snapshot()
-        assert all(cv[k] == gs[k] for k in ("r", "HL", "DE", "SP", "PC", "C", "Z", "ipos", "tick")), (name, n, gs, cv)
+        gs, gdata, gout, gcode = _golden_view(g), list(g.data), bytes(g.out), bytes(g.code)
+        cv = c.snapshot()
+        assert all(cv[k] == gs[k] for k in gs), (name, n, gs, cv)
         try:
             g.step()
         except MachineError:
+            raised = True
             c.step()
-            assert c.snapshot()["status"] == 3 and c.snapshot()["tick"] == gs["tick"], (name, "error tick mismatch")
+            assert c.snapshot()["status"] == 3, (name, "circuit did not report ERR on the error tick")
+
+
+            assert _golden_view(g) == gs, (name, "reference error tick was not atomic", gs, _golden_view(g))
+            assert list(g.data) == gdata, (name, "reference modified DATA before raising")
+            assert bytes(g.out) == gout, (name, "reference wrote output before raising")
+            assert bytes(g.code) == gcode, (name, "reference modified CODE before raising")
+            assert c.snapshot()["tick"] == gs["tick"], (name, "error tick mismatch")
             break
         c.step(); n += 1
+    if not raised:
+
+
+        gs = _golden_view(g); cv = c.snapshot()
+        assert all(cv[k] == gs[k] for k in gs), (name, "final state mismatch", gs, cv)
+        assert list(g.data) == c.DATA.cpu().tolist(), (name, "final DATA mismatch")
+        assert bytes(c.CODE.cpu().tolist()[:len(code)]) == bytes(g.code), (name, "final CODE mismatch")
     assert c.out() == bytes(g.out), (name, "output mismatch", c.out(), bytes(g.out))
     if expect is not None:
         assert bytes(g.out) == expect, (name, "expected output mismatch", bytes(g.out).hex(), expect.hex())
