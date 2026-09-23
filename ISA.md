@@ -61,10 +61,11 @@ Fields do not overlap. `f = (r << 2) | s` with `r`, `s` in 0-3.
 | 0x20+f | AND r,s | `r &= s` | Z |
 | 0x30+f | OR r,s | `r \|= s` | Z |
 | 0x40+f | XOR r,s | `r ^= s` | Z |
-| 0x50+f | MUL r,s | `r = (r * s) & 0xFF`, `C = (r * s > 255)` | C,Z |
+| 0x50+f | MUL r,s | `r = (r * s) & 0xFF`, `C = 1 if (r * s) > 255` | C,Z |
 
-`MUL` reports the high byte in `C`, so multi-byte products can be built with the
-`ADC` chain in the same way as multi-byte addition.
+`MUL` leaves the low byte in `r` and sets `C` to a single "the high byte is
+non-zero" bit; the high byte itself is not retained, so a widening product is
+built with the shift/rotate family and the `ADC` chain rather than from `C`.
 
 ### 4.3 Single-register operations (0x60-0x6F)
 
