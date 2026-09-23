@@ -62,11 +62,11 @@ are available:
 
 ## Status
 
-* The reference simulator and the tensor circuit implement the full instruction
-  set including the escape space, the trap and the self-modification window.
-* The Triton kernel currently implements the pre-extension instruction set; the
-  opcodes it does not yet cover are listed explicitly in
-  `test_circuit_equivalence.py` and skipped there rather than silently accepted.
+All three implementations cover the full instruction set, including the escape
+space, the user-defined-instruction trap and the self-modification window. No
+opcode is skipped anywhere: the equivalence suite enumerates all 256 opcodes
+against each circuit, and the 256 escape subcodes plus their program-level
+lockstep are enumerated separately for each implementation.
 
 ## License
 
