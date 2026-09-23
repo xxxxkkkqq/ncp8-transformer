@@ -13,6 +13,7 @@ import random
 
 from golden_sim import NCP8, MachineError, asm
 from circuit_torch import TorchCircuit
+from circuit_triton import TritonCircuit
 
 VEC = 0x0F00
 
@@ -33,7 +34,7 @@ def _golden_view(g):
                 status={"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}[g.status])
 
 
-def one_esc_step(sub, seed, vec=0):
+def one_esc_step(Machine, sub, seed, vec=0):
     rng = random.Random(seed * 977 + sub)
     code = _code_esc(sub, vec)
     data_g = bytearray(rng.randrange(256) for _ in range(4096))
@@ -43,7 +44,7 @@ def one_esc_step(sub, seed, vec=0):
     C0, Z0 = rng.randrange(2), rng.randrange(2)
     g = NCP8(code, data=data_g)
     g.r, g.HL, g.DE, g.SP, g.C, g.Z = list(R), HL, DE, SP, C0, Z0
-    c = TorchCircuit(code, data=data_g)
+    c = Machine(code, data=data_g)
     c.load_state(R, HL, DE, SP, C0, Z0, 0)
     pre, pre_data = _golden_view(g), list(g.data)
     g_err = False
@@ -58,7 +59,7 @@ def one_esc_step(sub, seed, vec=0):
         for k in pre:
             if k == "status":
                 continue
-            assert pre[k] == cv[k], (sub, seed, "error path was not atomic", k, pre[k], cv[k])
+            assert pre[k] == cv[k], (sub, seed, "error path not atomic", k, pre[k], cv[k])
         assert list(c.DATA.cpu().tolist()) == pre_data, (sub, seed, "DATA was modified")
         return "err"
     gv = _golden_view(g)
@@ -67,20 +68,20 @@ def one_esc_step(sub, seed, vec=0):
     return "ok"
 
 
-def test_esc_subcodes():
+def test_esc_subcodes(Machine, name):
     import torch
     tot = {"ok": 0, "err": 0}
     for sub in range(256):
         for vec in (0, 0x1234):
             for seed in range(4):
-                tot[one_esc_step(sub, seed, vec)] += 1
+                tot[one_esc_step(Machine, sub, seed, vec)] += 1
     torch.cuda.synchronize()
-    print(f"[torch] escape all-subcode single step: 2048 cases match (ok {tot['ok']} + error {tot['err']}) ")
+    print(f"[{name}] escape subcode single step: 2048 cases match (ok {tot['ok']} + error {tot['err']})")
 
 
-def _lockstep(name, code, data=b"", inputs=b"", max_tick=4000, expect=None):
+def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=None):
     g = NCP8(code, data=data, inputs=inputs, tick_budget=max_tick)
-    c = TorchCircuit(code, data=data, inputs=inputs, tick_budget=max_tick)
+    c = Machine(code, data=data, inputs=inputs, tick_budget=max_tick)
     n = 0
     while g.status == "RUNNING" and n < max_tick:
         gs = _golden_view(g); cv = c.snapshot()
@@ -108,7 +109,10 @@ def _with_vec(code, table):
 WLO, WHI = 0x0F20, 0x0F21
 
 
-def test_selfmod_lockstep():
+def test_selfmod_lockstep(Machine, name):
+
+
+
 
 
     src = """    JMP main
@@ -131,31 +135,32 @@ main:
         return bytes(b)
 
 
-    n = _lockstep("self-modification takes effect", build(0x00, 0x08), expect=bytes([42]))
-    print(f"[torch] controlled self-modification lockstep {n} tick (patch the immediate of sub 7 -> 42, output matches expectation) ")
 
-    n = _lockstep("out of window", build(0x10, 0x18))
-    n = _lockstep("zero-width window", build(0x00, 0x00))
-    print("[torch] out-of-window / zero-width window: both implementations atomic ERR at the same tick")
+    n = _lockstep(Machine, "self-modification takes effect", build(0x00, 0x08), expect=bytes([42]))
+    print(f"[{name}] controlled self-modification lockstep {n} ticks (immediate 7 -> 42 patched, output matches)")
+
+    n = _lockstep(Machine, "out of window", build(0x10, 0x18))
+    n = _lockstep(Machine, "zero-width window", build(0x00, 0x00))
+    print(f"[{name}] out-of-window / zero-width window: both implementations atomic ERR at the same tick")
 
     code = asm("LDI HL, 0\nLDC r0, [HL]\nOUT r0\nLDI HL, 4\nLDC r0, [HL]\nOUT r0\nHALT")
-    n = _lockstep("LDC self-read", code, expect=bytes([code[0], code[4]]))
-    print(f"[torch] LDC self-read lockstep {n} tick (read-back bytes match the truth) ")
+    n = _lockstep(Machine, "LDC self-read", code, expect=bytes([code[0], code[4]]))
+    print(f"[{name}] LDC self-read lockstep {n} ticks (read-back bytes match the truth)")
 
 
-def test_programs():
+def test_programs(Machine, name):
 
     main = bytes([0x70, 0x70, 0x00, 0xD0 | 3, 0x7E, 0x00])
     h0 = bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x08])
     h1 = bytes([0xD4 | 0, 5, 0x08])
     code = bytearray(bytes(main).ljust(0x20, b"\x00")) + h0 + h1
     code = _with_vec(bytes(code), {0: 0x20, 1: 0x20 + len(h0)})
-    n = _lockstep("EXT nested call", code)
+    n = _lockstep(Machine, "EXT nested", code)
     g = NCP8(code)
     while g.status == "RUNNING":
         g.step()
     assert g.r[0] == 6 and g.r[3] == 0x7E and g.SP == 4096 and g.status == "HALT", g.snapshot()
-    print(f"[torch] EXT trap lockstep {n} tick (nested call r0=6 / stack restored / HALT) ")
+    print(f"[{name}] EXT trap lockstep {n} ticks (nested call r0=6 / stack restored / HALT)")
 
 
     prog = """
@@ -189,23 +194,25 @@ zero:
     HALT
     """
 
-    n = _lockstep("extended arithmetic", asm(prog), expect=bytes([0xB9, 0x25, 0x00, 0x03, 0x01]))
-    print(f"[torch] v2 arithmetic program lockstep {n} tick (MUL/DIV/MOD/bitwise/rotate/CMP expected output matches) ")
+    n = _lockstep(Machine, "extended arithmetic", asm(prog), expect=bytes([0xB9, 0x25, 0x00, 0x03, 0x01]))
+    print(f"[{name}] extended arithmetic program lockstep {n} ticks (MUL/DIV/MOD/bitwise/rotate/CMP output matches)")
 
 
-    n = _lockstep("pointer family", asm("LDI HL, 100\nLDI DE, 7\nADD HL, DE\nSUB HL, DE\nXCHG\nOUTDE\nHALT"),
+    n = _lockstep(Machine, "pointer family", asm("LDI HL, 100\nLDI DE, 7\nADD HL, DE\nSUB HL, DE\nXCHG\nOUTDE\nHALT"),
                   data=bytes(range(256)), expect=bytes([100]))
-    print(f"[torch] 16 pointer familylockstep {n} tick (ADD/SUB HL,DE + XCHG) ")
+    print(f"[{name}] 16-bit pointer family lockstep {n} ticks (ADD/SUB HL,DE + XCHG)")
 
 
-    n = _lockstep("divide-by-zero atomic", asm("LDI r0, 9\nLDI r1, 0\nDIV r0, r1\nOUT r0\nHALT"))
-    n = _lockstep("modulo-by-zero atomic", asm("LDI r0, 9\nLDI r1, 0\nMOD r0, r1\nHALT"))
-    print(f"[torch] divide by zero/modulo by zero: both implementations at the same tick atomic ERR (state before that bit-exact) ")
+
+    n = _lockstep(Machine, "divide-by-zero atomic", asm("LDI r0, 9\nLDI r1, 0\nDIV r0, r1\nOUT r0\nHALT"))
+    n = _lockstep(Machine, "modulo-by-zero atomic", asm("LDI r0, 9\nLDI r1, 0\nMOD r0, r1\nHALT"))
+    print(f"[{name}] divide-by-zero / modulo-by-zero: both implementations atomic ERR at the same tick")
 
 
 if __name__ == "__main__":
     print("ISA v2.0 equivalence acceptance (subcode space + program lockstep):")
-    test_esc_subcodes()
-    test_programs()
-    test_selfmod_lockstep()
+    for Machine, name in ((TorchCircuit, "torch"), (TritonCircuit, "triton")):
+        test_esc_subcodes(Machine, name)
+        test_programs(Machine, name)
+        test_selfmod_lockstep(Machine, name)
     print("ISA v2.0 equivalence: all passed")
