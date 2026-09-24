@@ -12,6 +12,7 @@ changes) and instruction-length/PC bookkeeping around the escape prefix.
 import random
 
 from golden_sim import NCP8, MachineError, asm
+from test_state_contract import assert_widths
 
 CODE_SIZE = 4096
 HANDLER_VEC = 0x0F00
@@ -21,8 +22,7 @@ def run_code(code, data=None, inputs=b"", r0=None, budget=5000):
     g = NCP8(code, data=data, inputs=inputs, tick_budget=budget)
     if r0 is not None:
         g.r[0] = r0 & 0xFF
-    while g.status == "RUNNING":
-        g.step()
+    drive(g)
     return g
 
 
@@ -40,6 +40,14 @@ def expect_err(code, data=None, r0=None, r1=None):
         return True, g.snapshot()
 
 
+def drive(g):
+
+    while g.status == "RUNNING":
+        g.step()
+        assert_widths(g.snapshot(), ("isa_v2", g.tick))
+    return g
+
+
 def place_vector(code, k, addr):
 
     b = bytearray(code.ljust(HANDLER_VEC + 2 * (k + 1), b"\x00"))
@@ -52,8 +60,7 @@ def one_op(src, r0=None, r1=None):
     g = NCP8(asm(src))
     if r0 is not None: g.r[0] = r0 & 0xFF
     if r1 is not None: g.r[1] = r1 & 0xFF
-    while g.status == "RUNNING":
-        g.step()
+    drive(g)
     return g
 
 
@@ -217,7 +224,7 @@ def test_bitwise():
         assert g.r[2] == g.r[0], ("DeMorgan", a, b)
 
     g = NCP8(asm("CLC\nLDI r0, 1\nSUBI r0, 5\nAND r0, r0\nHALT"))
-    while g.status == "RUNNING": g.step()
+    drive(g)
     assert g.C == 1, "AND must not clear C"
     print("  bitwise (AND/OR/XOR/NOT + De Morgan + C untouched)")
 
@@ -239,7 +246,7 @@ def test_mul():
         g = NCP8(MUL32)
         g.data[0], g.data[1] = A & 255, A >> 8
         g.data[2], g.data[3] = B & 255, B >> 8
-        while g.status == "RUNNING": g.step()
+        drive(g)
         assert g.status == "HALT", g.status
         assert bytes(g.data[4:10]) == (A * B).to_bytes(6, "little"), \
             (A, B, bytes(g.data[4:10]).hex(), hex(A * B))
@@ -279,25 +286,25 @@ def test_cmp_rot_neg():
 
         code = asm("\n".join(["ROL r0"] * 9 + ["HALT"]))
         g = NCP8(code); g.r[0] = a; g.C = c
-        while g.status == "RUNNING": g.step()
+        drive(g)
         assert g.r[0] == a and g.C == c, ("ROL x9", a, c)
         code = asm("\n".join(["ROR r0"] * 9 + ["HALT"]))
         g = NCP8(code); g.r[0] = a; g.C = c
-        while g.status == "RUNNING": g.step()
+        drive(g)
         assert g.r[0] == a and g.C == c, ("ROR x9", a, c)
 
         x = (c << 8) | a
         xl = ((x << 1) | (x >> 8)) & 0x1FF
         g = NCP8(asm("ROL r0\nHALT")); g.r[0] = a; g.C = c
-        while g.status == "RUNNING": g.step()
+        drive(g)
         assert ((g.C << 8) | g.r[0]) == xl, ("ROL 9bit", a, c)
         xr = ((x >> 1) | ((x & 1) << 8)) & 0x1FF
         g = NCP8(asm("ROR r0\nHALT")); g.r[0] = a; g.C = c
-        while g.status == "RUNNING": g.step()
+        drive(g)
         assert ((g.C << 8) | g.r[0]) == xr, ("ROR 9bit", a, c)
 
         g = NCP8(asm("ROL r0\nROR r0\nHALT")); g.r[0] = a; g.C = c
-        while g.status == "RUNNING": g.step()
+        drive(g)
         assert g.r[0] == a and g.C == c, ("ROL/ROR are inverse", a, c)
 
         g = one_op("NEG r0\nNEG r0\nHALT", a)
@@ -314,13 +321,13 @@ def test_ptr16():
     for _ in range(400):
         hl, de = rng.randrange(65536), rng.randrange(65536)
         g = NCP8(asm("ADD HL, DE\nHALT")); g.HL, g.DE = hl, de
-        while g.status == "RUNNING": g.step()
+        drive(g)
         assert g.HL == (hl + de) & 0xFFFF and g.C == int(hl + de > 0xFFFF), ("ADD HL,DE", hl, de)
         g = NCP8(asm("SUB HL, DE\nHALT")); g.HL, g.DE = hl, de
-        while g.status == "RUNNING": g.step()
+        drive(g)
         assert g.HL == (hl - de) & 0xFFFF and g.C == int(hl < de), ("SUB HL,DE", hl, de)
         g = NCP8(asm("XCHG\nHALT")); g.HL, g.DE = hl, de
-        while g.status == "RUNNING": g.step()
+        drive(g)
         assert (g.HL, g.DE) == (de, hl), "XCHG"
     print("  16-bit pointers (ADD/SUB HL,DE with carry + XCHG)")
 
@@ -349,7 +356,7 @@ def test_esc_and_trap():
     code = bytearray(main.ljust(handler_addr, b"\x00")) + handler
     code = place_vector(bytes(code), 0, handler_addr)
     g = NCP8(code); g.r[0] = 41
-    while g.status == "RUNNING": g.step()
+    drive(g)
     assert g.r[0] == 42 and g.status == "HALT", ("EXT call failed", g.snapshot(), g.trace)
     assert g.SP == 4096, "stack not restored after EXT (return address bookkeeping)"
 
@@ -359,7 +366,7 @@ def test_esc_and_trap():
     code2 = place_vector(bytes(code2), 0, handler_addr)
     code2 = place_vector(bytes(code2), 1, handler_addr + len(h0))
     g = NCP8(code2); g.r[0] = 0
-    while g.status == "RUNNING": g.step()
+    drive(g)
     assert g.r[0] == 2 and g.SP == 4096, ("EXT nested call", g.r[0], g.SP)
     print("  escape prefix + user-instruction trap (reserved subcode atomic ERR / unregistered ERR / call-return-nested bookkeeping)")
 
@@ -371,7 +378,7 @@ def test_pc_bookkeeping():
     code = bytearray(bytes(code).ljust(0x10, b"\x00")) + h
     code = place_vector(bytes(code), 0, 0x10)
     g = NCP8(bytes(code))
-    while g.status == "RUNNING": g.step()
+    drive(g)
     assert g.r[3] == 0xAB and g.r[0] == 1, ("PC bookkeeping wrong after EXT", g.snapshot())
     print("  escape PC bookkeeping (2-byte prefix, 3-byte trap; return lands correctly)")
 
@@ -403,16 +410,14 @@ main:
 
 
     g = NCP8(build(0x00, 0x08))
-    while g.status == "RUNNING":
-        g.step()
+    drive(g)
     assert bytes(g.out) == bytes([42]), ("self-modification had no effect", bytes(g.out))
 
     for wlo, whi in ((0x10, 0x18), (0x00, 0x00)):
         g2 = NCP8(build(wlo, whi))
         err = False
         try:
-            while g2.status == "RUNNING":
-                g2.step()
+            drive(g2)
         except MachineError:
             err = True
         assert err, f"window[{wlo:#x},{whi:#x}) did not raise"
@@ -421,24 +426,21 @@ main:
     g3 = NCP8(code_bad)
     err, snap = False, None
     try:
-        while g3.status == "RUNNING":
-            g3.step()
+        drive(g3)
     except MachineError:
         err, snap = True, g3.snapshot()
     assert err and snap["PC"] == stc_pc and snap["r"][0] == 42, ("out-of-window write was not atomic", stc_pc, snap)
 
     code = asm("LDI HL, 0\nLDC r0, [HL]\nOUT r0\nLDI HL, 1\nLDC r0, [HL]\nOUT r0\nHALT")
     g4 = NCP8(code)
-    while g4.status == "RUNNING":
-        g4.step()
+    drive(g4)
     assert bytes(g4.out) == bytes([code[0], code[1]]), ("LDC code read mismatch", bytes(g4.out), code[:2])
 
     for src2 in ("LDI HL, 4000\nLDC r0, [HL]\nHALT", "LDI HL, 4000\nSTC [HL], r0\nHALT"):
         g5 = NCP8(asm(src2))
         err = False
         try:
-            while g5.status == "RUNNING":
-                g5.step()
+            drive(g5)
         except MachineError:
             err = True
         assert err, f"out of rangedid not raise: {src2}"

@@ -33,6 +33,7 @@ import torch
 import programs
 from circuit_triton import CODE_SIZE, DATA_SIZE, TritonBatch, TritonCircuit, run_batch
 from golden_sim import NCP8, MachineError, asm
+from test_state_contract import assert_widths
 
 STATUS = {"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}
 VEC = 0x0F00
@@ -46,12 +47,13 @@ def golden_view(g):
 
 
 def golden_machine(code, data=b"", inputs=b"", row=None, budget=200_000):
+
     g = NCP8(code, data=data, inputs=inputs, tick_budget=budget)
     if row is not None:
-        g.r = list(row[0:4])
-        g.HL, g.DE, g.PC, g.SP = row[4], row[5], row[6], row[7]
-        g.C, g.Z, g.ipos, g.tick = row[8], row[9], row[10], row[12]
+        g.load_state(row[0:4], row[4], row[5], row[7], row[8], row[9], row[12], PC=row[6])
+        g.ipos = row[10]
         assert row[11] == 0 and row[13] == 0, "a fresh machine starts with no output"
+        assert_widths(golden_view(g), ("golden machine", row))
     return g
 
 
@@ -67,6 +69,7 @@ def golden_step(g):
     pre_code, pre_out = bytes(g.code), bytes(g.out)
     try:
         g.step()
+        assert_widths(golden_view(g), ("reference post-tick", pre["tick"]))
         return False
     except MachineError:
         assert golden_view(g) == pre, ("reference error tick was not atomic", pre, golden_view(g))
@@ -96,8 +99,13 @@ def golden_run(code, data=b"", inputs=b"", row=None, budget=200_000):
 def golden_advance(g, steps):
 
 
+
+
+
+
+
     for _ in range(steps):
-        if g.status != "RUNNING" or g.tick >= g.tb:
+        if g.status != "RUNNING":
             break
         if golden_step(g):
             g.status = "ERR"
@@ -114,7 +122,10 @@ def row_of(r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos=0, oplen=0, tick=0, status
 
 
 def push_row(batch, i, row):
-    batch.STATE[i] = torch.tensor(row, dtype=torch.int32, device=batch.dev)
+
+    batch.set_state(i, r=row[0:4], HL=row[4], DE=row[5], PC=row[6], SP=row[7],
+                    C=row[8], Z=row[9], ipos=row[10], oplen=row[11], tick=row[12],
+                    status=row[13])
 
 
 
@@ -283,6 +294,7 @@ def check_solo_step(batch, code, data, inputs, row, kind):
     raised = golden_step(g)
     batch.step(1)
     got = batch.snapshot(0)
+    assert_widths(got, ("batch solo", kind))
     if raised:
         assert got["status"] == 3, (kind, "expected ERR", got)
         for k in pre:
@@ -347,6 +359,7 @@ def test_opcode_enumeration_packed(width=64):
             pre, pre_data = golden_view(g), list(g.data)
             raised = golden_step(g)
             got = batch.snapshot(i)
+            assert_widths(got, ("packed", base + i))
             if raised:
                 assert got["status"] == 3, (base + i, "expected ERR", got)
                 for k in pre:
@@ -390,6 +403,7 @@ def compare_batch(tag, batch, specs, res=None):
         g = golden_run(code, data, inputs, row, budget)
         want_status = STATUS[g.status]
         got_status, got_tick = res.status[i], res.ticks[i]
+        assert_widths(batch.snapshot(i), (tag, kind, i, "batch snapshot"))
         assert res.outs[i] == bytes(g.out), (tag, kind, i, "out", res.outs[i], bytes(g.out))
         assert got_status == want_status, (tag, kind, i, "status", got_status, want_status)
         assert got_tick == g.tick, (tag, kind, i, "tick", got_tick, g.tick)
@@ -513,6 +527,7 @@ def test_varied_finish_and_incremental():
         for i, g in enumerate(refs):
             golden_advance(g, chunk)
             got = batch.snapshot(i)
+            assert_widths(got, ("step", chunk, i, "batch snapshot"))
             assert golden_view(g) == got, ("step", chunk, i, golden_view(g), got)
             assert batch.data(i) == list(g.data), ("step DATA", chunk, i)
             if got["status"] == 0:
@@ -588,6 +603,7 @@ def test_resident_vs_per_tick():
         old = TritonCircuit(code, data=data, inputs=inp, tick_budget=budget)
         old_out = old.run()
         snap = old.snapshot()
+        assert_widths(snap, ("per-tick path", i))
         assert res.outs[i] == old_out, (i, "resident output differs from the per-tick path")
         assert res.status[i] == snap["status"], (i, res.status[i], snap["status"])
         assert res.ticks[i] == snap["tick"], (i, res.ticks[i], snap["tick"])
@@ -621,6 +637,7 @@ def test_one_shot_run_batch():
                     budgets=[b for _, _, b in cases], states=rows)
     for i, (code, data, budget) in enumerate(cases):
         g = golden_run(code, data, b"", rows[i], budget)
+        assert_widths(golden_view(g), ("run_batch reference", i))
         assert res.outs[i] == bytes(g.out), (i, res.outs[i], bytes(g.out))
         assert res.status[i] == STATUS[g.status], (i, res.status[i], g.status)
         assert res.ticks[i] == g.tick, (i, res.ticks[i], g.tick)

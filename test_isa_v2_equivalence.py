@@ -23,18 +23,22 @@ import re
 from golden_sim import NCP8, MachineError, asm
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
+from test_state_contract import assert_widths
 
 VEC = 0x0F00
 
+PC_SITES = (0, 256)
 
-def _code_esc(sub, vec=0, tail=(0xAA, 0x55)):
 
-    b = bytearray(0x0F20)
-    b[0], b[1], b[2], b[3] = 0x70, sub, tail[0], tail[1]
+def _code_esc(sub, vec=0, pc=0, tail=(0xAA, 0x55)):
+
+    b = bytearray(max(0x0F20, pc + 4))
+    b[pc], b[pc + 1], b[pc + 2], b[pc + 3] = 0x70, sub, tail[0], tail[1]
     if vec:
         for k in range(16):
             b[VEC + 2 * k: VEC + 2 * k + 2] = (vec & 0xFFFF).to_bytes(2, "little")
     return bytes(b)
+
 
 
 def _golden_view(g):
@@ -53,20 +57,22 @@ def _ptr(rng, boundary):
     return rng.randrange(4094)
 
 
-def one_esc_step(Machine, sub, seed, vec=0):
+def one_esc_step(Machine, sub, seed, vec=0, pc=0):
+
     rng = random.Random(seed * 977 + sub)
-    code = _code_esc(sub, vec)
+    code = _code_esc(sub, vec, pc)
     data_g = bytearray(rng.randrange(256) for _ in range(4096))
     R = [rng.randrange(256) for _ in range(4)]
     HL, DE = _ptr(rng, seed % 4 == 3), _ptr(rng, seed % 4 == 3)
     SP = rng.choice([0, 1, 2, 3, rng.randrange(16, 4093), 4095, 4096])
     C0, Z0 = rng.randrange(2), rng.randrange(2)
     g = NCP8(code, data=data_g)
-    g.r, g.HL, g.DE, g.SP, g.C, g.Z = list(R), HL, DE, SP, C0, Z0
+    g.load_state(R, HL, DE, SP, C0, Z0, 0, PC=pc)
     c = Machine(code, data=data_g)
-    c.load_state(R, HL, DE, SP, C0, Z0, 0)
+    c.load_state(R, HL, DE, SP, C0, Z0, 0, PC=pc)
     pre, pre_data = _golden_view(g), list(g.data)
     pre_code, pre_out = bytes(g.code), bytes(g.out)
+    assert_widths(pre, (Machine.__name__, "pre-tick"))
     g_err = False
     try:
         g.step()
@@ -74,25 +80,27 @@ def one_esc_step(Machine, sub, seed, vec=0):
         g_err = True
     c.step()
     cv = c.snapshot()
+    assert_widths(cv, (Machine.__name__, "post-tick", sub, seed, pc))
     if g_err:
 
 
 
-        assert _golden_view(g) == pre, (sub, seed, "reference error tick was not atomic",
+        assert _golden_view(g) == pre, (sub, seed, pc, "reference error tick was not atomic",
                                         pre, _golden_view(g))
         assert list(g.data) == pre_data, (sub, seed, "reference modified DATA before raising")
         assert bytes(g.code) == pre_code, (sub, seed, "reference modified CODE before raising")
         assert bytes(g.out) == pre_out, (sub, seed, "reference wrote output before raising")
-        assert cv["status"] == 3, (sub, seed, "expected ERR", cv)
+        assert cv["status"] == 3, (sub, seed, pc, "expected ERR", cv)
         for k in pre:
             if k == "status":
                 continue
-            assert pre[k] == cv[k], (sub, seed, "error path not atomic", k, pre[k], cv[k])
+            assert pre[k] == cv[k], (sub, seed, pc, "error path not atomic", k, pre[k], cv[k])
         assert list(c.DATA.cpu().tolist()) == pre_data, (sub, seed, "DATA was modified")
         assert bytes(c.CODE.cpu().tolist()[:len(code)]) == pre_code, (sub, seed, "CODE was modified")
         return "err"
     gv = _golden_view(g)
-    assert all(gv[k] == cv[k] for k in gv), (sub, seed, gv, cv)
+    assert_widths(gv, (Machine.__name__, "reference post-tick", sub, seed, pc))
+    assert all(gv[k] == cv[k] for k in gv), (sub, seed, pc, gv, cv)
     assert list(g.data) == list(c.DATA.cpu().tolist()), (sub, seed, "DATA")
     return "ok"
 
@@ -135,18 +143,21 @@ def test_esc_subcodes(Machine, name):
     for sub in range(256):
         for vec in (0, 0x1234):
             for seed in range(4):
-                verdict = one_esc_step(Machine, sub, seed, vec)
-                tot[verdict] += 1
-                if verdict == "ok":
-                    legal.add(sub)
+                for site in PC_SITES:
+                    verdict = one_esc_step(Machine, sub, seed, vec, pc=site + 3 * sub)
+                    tot[verdict] += 1
+                    if verdict == "ok":
+                        legal.add(sub)
     torch.cuda.synchronize()
+    n = 256 * 2 * 4 * len(PC_SITES)
+    assert sum(tot.values()) == n, (tot, n)
 
 
     missing = sorted(set(NEW_SUBCODES) - legal)
     assert not missing, ("v3.0 subcodes with no legal single-step case",
                          [hex(s) for s in missing])
-    print(f"[{name}] escape subcode single step: 2048 cases match (ok {tot['ok']} + error {tot['err']}); "
-          f"all {len(NEW_SUBCODES)} v3.0 subcodes have a legal case")
+    print(f"[{name}] escape subcode single step: {n} cases match (ok {tot['ok']} + error {tot['err']}); "
+          f"all {len(NEW_SUBCODES)} v3.0 subcodes have a legal case; executed at PC in {PC_SITES}")
 
 
 def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=None, trace_out=None):
@@ -157,6 +168,8 @@ def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=N
     while g.status == "RUNNING" and n < max_tick:
         gs, gdata, gout, gcode = _golden_view(g), list(g.data), bytes(g.out), bytes(g.code)
         cv = c.snapshot()
+        assert_widths(gs, (name, "reference tick", n))
+        assert_widths(cv, (name, "circuit tick", n))
         assert all(cv[k] == gs[k] for k in gs), (name, n, gs, cv)
         try:
             g.step()
@@ -173,10 +186,13 @@ def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=N
             assert c.snapshot()["tick"] == gs["tick"], (name, "error tick mismatch")
             break
         c.step(); n += 1
+        assert_widths(c.snapshot(), (name, "circuit after tick", n))
     if not raised:
 
 
         gs = _golden_view(g); cv = c.snapshot()
+        assert_widths(gs, (name, "reference final"))
+        assert_widths(cv, (name, "circuit final"))
         assert all(cv[k] == gs[k] for k in gs), (name, "final state mismatch", gs, cv)
         assert list(g.data) == c.DATA.cpu().tolist(), (name, "final DATA mismatch")
         assert bytes(c.CODE.cpu().tolist()[:len(code)]) == bytes(g.code), (name, "final CODE mismatch")

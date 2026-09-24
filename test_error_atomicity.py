@@ -23,6 +23,7 @@ from __future__ import annotations
 from golden_sim import NCP8, MachineError, asm
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
+from test_state_contract import assert_widths
 
 DATA_SIZE = 4096
 VEC = 0x0F00
@@ -63,9 +64,7 @@ def ref_view(g):
 def run_reference(code, sp, hl, de):
 
     g = NCP8(code, data=DATA_IMAGE, inputs=INPUTS)
-    g.r = list(INIT_R)
-    g.HL, g.DE, g.SP = hl, de, sp
-    g.C, g.Z, g.tick = INIT_C, INIT_Z, TICK0
+    g.load_state(INIT_R, hl, de, sp, INIT_C, INIT_Z, TICK0)
     try:
         g.step()
         raised = False
@@ -105,6 +104,7 @@ def check_case(name, code, sp, hl, de, expect_err, expect_commit=None):
     ref_pre = dict(r=list(INIT_R), HL=hl, DE=de, SP=sp, PC=0, C=INIT_C, Z=INIT_Z,
                    ipos=0, oplen=0, tick=TICK0, status=0)
     for label, (raised, post, data, code_img, out) in runs:
+        assert_widths(post, (name, label, "post-state"))
         if expect_err:
             assert raised, (name, label, "the violating tick did not report an error")
             if label == "reference":

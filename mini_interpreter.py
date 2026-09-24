@@ -11,6 +11,7 @@ from golden_sim import NCP8, asm
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
 from test_circuit_equivalence import golden_view
+from test_state_contract import assert_widths
 
 S_MPC, S_A, S_F, S_C = 0, 1, 2, 3
 PROG_BASE = 8
@@ -333,6 +334,7 @@ def run_test():
         want = mini_sim(prog, mem)
         g = NCP8(INTERP, data=build_state(prog, mem))
         got = g.run()
+        assert_widths(g.snapshot(), "mini interpreter sum")
         assert bytes(got) == want, (trial, vals, bytes(got), want)
     print("interpreter sum: 5 random arrays, interpreter output == Python mini reference byte-exact")
 
@@ -343,11 +345,13 @@ def run_test():
     assert want == bytes([44]), want
     g = NCP8(INTERP, data=build_state(carry_prog, {}))
     got = bytes(g.run())
+    assert_widths(g.snapshot(), "mini interpreter carry")
     assert got == want, (got, want)
     nocarry = mini_asm([(1, 10), (2, 20), (7,), (13,), (12, "E"), (1, 99), (13,), "E:", (0,)])
     want2 = mini_sim(nocarry, {})
     g = NCP8(INTERP, data=build_state(nocarry, {}))
     assert bytes(g.run()) == want2, (want2,)
+    assert_widths(g.snapshot(), "mini interpreter no-carry")
     print("interpreter carry branch: JC depends on mini flags, both paths match the reference")
 
 

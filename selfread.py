@@ -9,6 +9,7 @@ never participates in computation.
 from golden_sim import NCP8, asm
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
+from test_state_contract import assert_widths
 
 
 def golden_trace_field(g, mnemonic_prefix, field):
@@ -24,6 +25,7 @@ def run_and_capture(code, data=b""):
     while g.status == "RUNNING":
         pre = (g.PC, list(g.r), g.SP, g.C, g.Z)
         g.step()
+        assert_widths(g.snapshot(), ("l4 run_and_capture", g.tick))
         if len(g.trace) > len(steps):
             steps.append(pre)
     return bytes(g.out), steps
@@ -90,6 +92,7 @@ def test_sp_proof():
         is_getsp = (op & 0xFC) == 0x18
         pre_sp = g.SP & 255
         g.step()
+        assert_widths(g.snapshot(), ("l4 sp replay", g.tick))
         if is_getsp:
             got.append(pre_sp)
     out = bytes(g.out)
@@ -126,6 +129,7 @@ def test_flag_proof():
         is_getf = (op & 0xFC) == 0x1C
         pre = g.Z | (g.C << 1)
         g.step()
+        assert_widths(g.snapshot(), ("l4 flag replay", g.tick))
         if is_getf:
             got.append(pre)
     out = bytes(g.out)

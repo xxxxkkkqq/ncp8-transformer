@@ -6,7 +6,12 @@ state (registers r0-r3, pointers HL/DE, stack pointer, PC, carry/zero flags,
 input/output streams, tick counter, status) and the exact per-tick transition.
 
 Status codes: 0 = running, 1 = halted, 2 = tick budget exhausted, 3 = error.
-An error tick has no side effects: no register, memory, flag or PC update.
+An error tick has no side effects: no register, memory, flag or PC update, and
+step() rolls back on any exception, not only on a machine error. Stepping a
+machine whose status is not running is a no-op that changes nothing at all and is
+not an error. The tick budget and the output capacity (OUT_CAP bytes) are machine
+state and are applied inside step(). check_state()/load_state() refuse a state
+whose fields are outside their declared widths.
 
 Opcode layout (fields do not overlap):
   0x00-0x1F  no-operand / a16 / i16 / self-read families
@@ -22,19 +27,57 @@ import re
 
 DATA_SIZE = 4096
 CODE_SIZE = 4096
+OUT_CAP = 8192
+
+
+R_BITS = 8
+PTR_BITS = 16
 
 
 class MachineError(Exception):
     pass
 
 
+def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, where=""):
+
+
+
+
+
+
+
+    def outside(field, value, lo, hi):
+        raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
+
+    for i, v in enumerate(list(R)):
+        if not 0 <= v < (1 << R_BITS):
+            outside(f"r[{i}]", v, 0, (1 << R_BITS) - 1)
+    for field, v in (("HL", HL), ("DE", DE), ("PC", PC)):
+        if not 0 <= v < (1 << PTR_BITS):
+            outside(field, v, 0, (1 << PTR_BITS) - 1)
+    if not 0 <= SP <= DATA_SIZE:
+        outside("SP", SP, 0, DATA_SIZE)
+    for field, v in (("C", C), ("Z", Z)):
+        if v not in (0, 1):
+            outside(field, v, 0, 1)
+    if not 0 <= oplen <= OUT_CAP:
+        outside("oplen", oplen, 0, OUT_CAP)
+    for field, v in (("ipos", ipos), ("tick", tick)):
+        if v < 0:
+            outside(field, v, 0, "unbounded")
+    if status not in (0, 1, 2, 3):
+        outside("status", status, 0, 3)
+
+
 class NCP8:
     def __init__(self, code, data=None, inputs=b"", tick_budget=200_000):
-        assert len(code) <= CODE_SIZE
+        if len(code) > CODE_SIZE:
+            raise ValueError(f"code image is {len(code)} bytes, above CODE_SIZE {CODE_SIZE}")
         self.code = bytes(code)
         self.data = bytearray(DATA_SIZE)
         if data:
-            assert len(data) <= DATA_SIZE
+            if len(data) > DATA_SIZE:
+                raise ValueError(f"data image is {len(data)} bytes, above DATA_SIZE {DATA_SIZE}")
             self.data[: len(data)] = data
         self.r = [0, 0, 0, 0]
         self.HL = 0
@@ -46,10 +89,18 @@ class NCP8:
         self.inputs = bytes(inputs)
         self.ipos = 0
         self.out = bytearray()
+        self.out_cap = OUT_CAP
         self.tick = 0
         self.tb = tick_budget
         self.status = "RUNNING"
         self.trace: list[str] = []
+
+    def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0):
+
+        check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC)
+        self.r = list(R)
+        self.HL, self.DE, self.SP, self.C, self.Z = HL, DE, SP, C, Z
+        self.tick, self.PC = tick, PC
 
     def _mem(self, addr):
         if not 0 <= addr < DATA_SIZE:
@@ -81,7 +132,9 @@ class NCP8:
 
 
 
-        if self.SP < n:
+
+
+        if not (0 <= self.SP - n and self.SP <= DATA_SIZE):
             raise MachineError("stack underflow")
 
     def _stack_have(self, n):
@@ -90,8 +143,18 @@ class NCP8:
 
 
 
-        if self.SP + n > DATA_SIZE:
+        if not (0 <= self.SP and self.SP + n <= DATA_SIZE):
             raise MachineError("stack overflow")
+
+    def _emit(self, v):
+
+
+
+
+
+        if len(self.out) >= self.out_cap:
+            raise MachineError(f"output capacity {self.out_cap} exhausted")
+        self.out.append(v & 0xFF)
 
     def _push(self, byte):
         self._stack_room(1)
@@ -109,16 +172,19 @@ class NCP8:
 
 
 
+
         pc0 = self.PC
         try:
             self._step_inner()
-        except MachineError:
+        except BaseException:
             self.PC = pc0
             raise
 
     def _step_inner(self):
+
         if self.status != "RUNNING":
-            raise MachineError("machine already stopped")
+            return
+
         if self.tick >= self.tb:
             self.status = "OVERRUN"
             return
@@ -135,10 +201,10 @@ class NCP8:
             elif op == 0x04: self.DE = (self.DE + 1) & 0xFFFF; m = "INC DE"
             elif op == 0x05: self.C = 0; m = "CLC"
             elif op == 0x06:
-                self._mem(self.HL); self.out.append(self.data[self.HL])
+                self._mem(self.HL); self._emit(self.data[self.HL])
                 self.HL = (self.HL + 1) & 0xFFFF; m = "OUTM"
             elif op == 0x07:
-                self._mem(self.DE); self.out.append(self.data[self.DE])
+                self._mem(self.DE); self._emit(self.data[self.DE])
                 self.DE = (self.DE + 1) & 0xFFFF; m = "OUTDE"
             elif op == 0x08:
                 self._stack_have(2)
@@ -371,7 +437,7 @@ class NCP8:
             elif fam == 0xEC: self._mem(self.DE); self.data[self.DE] = self.r[r]; m = f"MOV [DE], r{r}"
             elif fam == 0xF0: self._push(self.r[r]); m = f"PUSH r{r}"
             elif fam == 0xF4: self.r[r] = self._pop(); m = f"POP r{r}"
-            elif fam == 0xF8: self.out.append(self.r[r]); m = f"OUT r{r}"
+            elif fam == 0xF8: self._emit(self.r[r]); m = f"OUT r{r}"
             elif fam == 0xFC:
                 if self.ipos < len(self.inputs):
                     self.r[r] = self.inputs[self.ipos]; self.ipos += 1
@@ -410,7 +476,9 @@ class NCP8:
 
 
 
-class AssemblyError(MachineError):
+class AssemblyError(Exception):
+
+
 
 
 
@@ -423,11 +491,6 @@ class AssemblyError(MachineError):
         self.msg = msg
         self.line = line
         super().__init__(f"line {line}: {msg}" if line is not None else msg)
-
-
-def _r(s):
-    assert s in ("r0", "r1", "r2", "r3"), s
-    return int(s[1])
 
 
 def asm(src: str) -> bytes:
@@ -448,6 +511,17 @@ def asm(src: str) -> bytes:
     def enc(name, args, labels, lineno, text, strict):
         def _bad(msg):
             raise AssemblyError(msg, lineno)
+
+        def _reg(x):
+
+
+
+
+
+
+            if not isinstance(x, str) or x not in ("r0", "r1", "r2", "r3"):
+                _bad(f"invalid register operand {x!r} in {text!r}")
+            return int(x[1])
 
         def _value(x):
 
@@ -566,7 +640,7 @@ def asm(src: str) -> bytes:
                 v = _addr(rest[0], name)
                 return bytes([base, v & 0xFF, v >> 8])
             if base in (0x11, 0x12):
-                return bytes([base, _r(rest[0])])
+                return bytes([base, _reg(rest[0])])
             return bytes([base])
         if name in simple:
             return bytes([simple[name]])
@@ -574,7 +648,7 @@ def asm(src: str) -> bytes:
             return bytes([0x13])
         if name in ("GETPC", "GETSP", "GETF"):
             base = {"GETPC": 0x14, "GETSP": 0x18, "GETF": 0x1C}[name]
-            return bytes([base | _r(args[0])])
+            return bytes([base | _reg(args[0])])
         jump = {"JMP": 0x09, "JZ": 0x0A, "JNZ": 0x0B, "JC": 0x0C, "JNC": 0x0D, "CALL": 0x0E}
         if name in jump:
 
@@ -582,15 +656,15 @@ def asm(src: str) -> bytes:
             return bytes([jump[name], a & 0xFF, a >> 8])
         if name == "DJNZ":
             a = _addr(args[1], name)
-            return bytes([0x6C | _r(args[0]), a & 0xFF, a >> 8])
+            return bytes([0x6C | _reg(args[0]), a & 0xFF, a >> 8])
         if name == "LDI":
-            return bytes([0xD0 | _r(args[0]), _imm8(args[1], name)])
+            return bytes([0xD0 | _reg(args[0]), _imm8(args[1], name)])
         if name == "ADDI":
-            return bytes([0xD4 | _r(args[0]), _imm8(args[1], name)])
+            return bytes([0xD4 | _reg(args[0]), _imm8(args[1], name)])
         if name == "SUBI":
-            return bytes([0xD8 | _r(args[0]), _imm8(args[1], name)])
+            return bytes([0xD8 | _reg(args[0]), _imm8(args[1], name)])
         if name == "ADCI":
-            return bytes([0xDC | _r(args[0]), _imm8(args[1], name)])
+            return bytes([0xDC | _reg(args[0]), _imm8(args[1], name)])
         if name in ("ADD", "SUB") and args and args[0] == "HL":
             return bytes([0x70, {"ADD": 0x60, "SUB": 0x61}[name]])
         if name == "ADD" and args and args[0] == "SP":
@@ -598,34 +672,34 @@ def asm(src: str) -> bytes:
         if name == "XCHG":
             return bytes([0x70, 0x62])
         if name == "STC":
-            return bytes([0x70, 0x80 | _r(args[1])])
+            return bytes([0x70, 0x80 | _reg(args[1])])
         if name == "LDC":
-            return bytes([0x70, 0x84 | _r(args[0])])
+            return bytes([0x70, 0x84 | _reg(args[0])])
         if name == "EXT":
             return bytes([0x70, 0x70, _imm8(args[0], name)])
         rr2 = {"AND": 0x20, "OR": 0x30, "XOR": 0x40, "MUL": 0x50}
         if name in rr2:
-            return bytes([rr2[name] | (_r(args[0]) << 2) | _r(args[1])])
+            return bytes([rr2[name] | (_reg(args[0]) << 2) | _reg(args[1])])
         rr3 = {"DIV": 0x00, "MOD": 0x10, "CMP": 0x20}
         if name in rr3:
-            return bytes([0x70, rr3[name] | (_r(args[0]) << 2) | _r(args[1])])
+            return bytes([0x70, rr3[name] | (_reg(args[0]) << 2) | _reg(args[1])])
         un2 = {"NOT": 0x40, "NEG": 0x44, "ROL": 0x48, "ROR": 0x4C}
         if name in un2:
-            return bytes([0x70, un2[name] | _r(args[0])])
+            return bytes([0x70, un2[name] | _reg(args[0])])
         rr = {"ADD": 0x80, "SUB": 0x90, "ADC": 0xA0, "SBB": 0xB0, "MOV": 0xC0}
         if name == "MOV":
             mem = {"[HL]": 0xE0, "[DE]": 0xE8}
             if args[1] in ("[HL]", "[DE]"):
-                return bytes([mem[args[1]] | _r(args[0])])
+                return bytes([mem[args[1]] | _reg(args[0])])
             if args[0] in ("[HL]", "[DE]"):
-                return bytes([(mem[args[0]] + 4) | _r(args[1])])
-            return bytes([0xC0 | (_r(args[0]) << 2) | _r(args[1])])
+                return bytes([(mem[args[0]] + 4) | _reg(args[1])])
+            return bytes([0xC0 | (_reg(args[0]) << 2) | _reg(args[1])])
         if name in rr:
-            return bytes([rr[name] | (_r(args[0]) << 2) | _r(args[1])])
+            return bytes([rr[name] | (_reg(args[0]) << 2) | _reg(args[1])])
         unary = {"PUSH": 0xF0, "POP": 0xF4, "OUT": 0xF8, "IN": 0xFC,
                  "SHL": 0x60, "SHR": 0x64, "TST": 0x68}
         if name in unary:
-            return bytes([unary[name] | _r(args[0])])
+            return bytes([unary[name] | _reg(args[0])])
 
 
         movw = {("HL", "DE"): 0x30, ("DE", "HL"): 0x31, ("HL", "SP"): 0x32,
@@ -646,11 +720,11 @@ def asm(src: str) -> bytes:
                 raise AssemblyError(f"unknown operand combination {args!r} in {text!r}", lineno)
             return bytes([0x70, wide[key]])
         if name == "LDX":
-            return bytes([0x70, 0x50 | _r(args[0]), _frame_off(args[1], name)])
+            return bytes([0x70, 0x50 | _reg(args[0]), _frame_off(args[1], name)])
         if name == "STX":
-            return bytes([0x70, 0x54 | _r(args[1]), _frame_off(args[0], name)])
+            return bytes([0x70, 0x54 | _reg(args[1]), _frame_off(args[0], name)])
         if name == "MULH":
-            return bytes([0x70, 0x90 | (_r(args[0]) << 2) | _r(args[1])])
+            return bytes([0x70, 0x90 | (_reg(args[0]) << 2) | _reg(args[1])])
         raise AssemblyError(f"unknown instruction {name!r} in {text!r}", lineno)
 
     labels, addr = {}, 0
