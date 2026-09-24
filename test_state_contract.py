@@ -120,9 +120,11 @@ def test_d1_register_write_port_masks():
 
 def test_d1_width_conformance_on_the_bundled_programs():
 
+    high_pc = bytes([0x09, 0x2C, 0x01]) + b"\x00" * 297 + bytes([0x14, 0x00])
     cases = [(programs.MUL, bytes([200, 30])), (programs.FIB, bytes([13])),
              (programs.SUMREC, bytes([40])), (programs.LONG_ADD, bytes([8] + [7] * 24)),
-             (programs.FRAME_MUL, bytes([0x34, 0x12, 1, 2, 3, 4]))]
+             (programs.FRAME_MUL, bytes([0x34, 0x12, 1, 2, 3, 4])),
+             (high_pc, b"")]
     ticks = 0
     for code, data in cases:
         for impl in ("reference", "torch", "triton"):
