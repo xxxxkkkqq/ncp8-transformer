@@ -24,7 +24,7 @@ import sys
 import debug
 import disasm
 import loader
-import profile
+import profiler
 from golden_sim import AssemblyError, CODE_SIZE, DATA_SIZE, MachineError, NCP8, asm
 
 IMMS = (0x00, 0x01, 0x7F, 0x80, 0xFF)
@@ -952,7 +952,7 @@ def test_profile_totals_match_the_machine():
     f = loader.assemble("  JMP 0x0030\n", image=0x30).image
     cases.append(("PC off the image", f, dict(tick_budget=1000)))
     for name, image, kw in cases:
-        p = profile.run(image, **kw)
+        p = profiler.run(image, **kw)
         g = NCP8(image, **kw)
         refuses(g.run)
         machine_ticks = g.tick
@@ -971,20 +971,20 @@ def test_profile_totals_match_the_machine():
               f"codepoints={p.distinct_codepoints:3d} pcs={p.distinct_pcs:3d} "
               f"stopped={p.stopped}")
 
-    p = profile.run(b, tick_budget=1000)
+    p = profiler.run(b, tick_budget=1000)
     require(len(p.faults) == 1 and p.faults[0][0] == 3, f"fault at {p.faults}")
     require(p.stopped == "fault", f"stopped={p.stopped}")
     require(p.total_ticks == 3, f"ticks before the divide-by-zero: {p.total_ticks}")
-    p = profile.run(c, tick_budget=97)
+    p = profiler.run(c, tick_budget=97)
     require(p.overruns == 1 and p.total_ticks == 97, f"overrun accounting: {p}")
     require(p.by_codepoint == {0x6C: 97}, f"DJNZ should own all 97 ticks: {p.by_codepoint}")
-    p = profile.run(e, tick_budget=200_000)
+    p = profiler.run(e, tick_budget=200_000)
     require(p.stopped == "fault" and len(p.faults) == 1, f"output overflow: {p.faults}")
 
     require(p.by_codepoint[0xF8] == 8192, f"OUT should commit exactly OUT_CAP emits: "
                                           f"{p.by_codepoint}")
     require(p.total_ticks == 8192 * 2, f"ticks around the overflow: {p.total_ticks}")
-    p = profile.run(f, tick_budget=1000)
+    p = profiler.run(f, tick_budget=1000)
     require(p.stopped == "fault" and p.by_codepoint == {0x09: 1}, f"off-image jump: "
                                                                   f"{p.by_codepoint} "
                                                                   f"{p.faults}")
@@ -992,18 +992,18 @@ def test_profile_totals_match_the_machine():
           f"count, with faults and the overrun accounted separately")
 
 def test_profile_rejects_source_text():
-    msg = refuses(profile.run, "HALT\n")
+    msg = refuses(profiler.run, "HALT\n")
     require(msg and "image" in msg, f"profile accepted a bare source string: {msg}")
-    msg = refuses(profile.run, b"")
+    msg = refuses(profiler.run, b"")
     require(msg and "bytes" in msg, f"profile accepted an empty image: {msg}")
-    msg = refuses(profile.run, b"\x00" * (CODE_SIZE + 1))
+    msg = refuses(profiler.run, b"\x00" * (CODE_SIZE + 1))
     require(msg and "CODE_SIZE" in msg, f"profile accepted an oversized image: {msg}")
     print("  the profiler refuses source text, an empty image and an oversized one")
 
 def test_profile_reports_every_number_it_carries():
 
     r = loader.assemble(FLOW_SRC, image=64)
-    p = profile.run_result(r, tick_budget=1000)
+    p = profiler.run_result(r, tick_budget=1000)
     require((p.total_ticks, p.steps, p.budget, p.length, p.out) == (11, 11, 1000, 64, b""),
             f"ticks {p.total_ticks}, steps {p.steps}, budget {p.budget}, "
             f"length {p.length}, out {p.out!r}")
@@ -1027,7 +1027,7 @@ def test_profile_reports_every_number_it_carries():
             "the profiler's per-tick PCs disagree with the debugger's frame log")
     require(all(row[4] and not row[5] for row in p.rows),
             f"a row of an all-assigned, all-canonical program claims otherwise: {p.rows}")
-    capped = profile.run(r.image, tick_budget=1000, max_rows=5)
+    capped = profiler.run(r.image, tick_budget=1000, max_rows=5)
     require(len(capped.rows) == 5 and capped.by_codepoint == p.by_codepoint
             and capped.total_ticks == p.total_ticks,
             f"max_rows changed the counts: {len(capped.rows)} rows, "
@@ -1038,25 +1038,25 @@ def test_profile_reports_every_number_it_carries():
             f"the accounting line reads: {lines[0]!r}")
     require(lines[1] == "code point sums: 11  PC sums: 11  (must equal ticks: 11)",
             f"{lines[1]!r}")
-    tampered = profile.run(r.image, tick_budget=1000)
+    tampered = profiler.run(r.image, tick_budget=1000)
     tampered.by_pc[0x1234] = 5
     msg = refuses(tampered.report)
     require(msg and "ProfileError" in msg, f"report() printed its claim about an "
                                            f"unbalanced profile: {msg}")
-    sized = profile.run(r.image, data=bytes([0, 0, 0, 7]), tick_budget=1000)
+    sized = profiler.run(r.image, data=bytes([0, 0, 0, 7]), tick_budget=1000)
     require(sized.total_ticks == p.total_ticks and sized.check(),
             f"a DATA image changed the run: {sized.total_ticks} against {p.total_ticks}")
-    msg = refuses(profile.run, r.image, data=bytes(DATA_SIZE + 1))
+    msg = refuses(profiler.run, r.image, data=bytes(DATA_SIZE + 1))
     require(msg and "DATA_SIZE" in msg, f"an oversized DATA image was accepted: {msg}")
-    msg = refuses(profile.run, r.image, tick_budget=True)
+    msg = refuses(profiler.run, r.image, tick_budget=True)
     require(msg and "tick_budget" in msg, f"a bool tick_budget was accepted: {msg}")
-    msg = refuses(profile.run_result, loader.assemble("  HALT\nmain:\n  HALT\n"),
+    msg = refuses(profiler.run_result, loader.assemble("  HALT\nmain:\n  HALT\n"),
                   tick_budget=10)
     require(msg and "entry 0x0001" in msg and "PC 0" in msg,
             f"run_result profiled an image whose declared entry is not the boot PC: {msg}")
-    require(profile.compare(p, capped)[0] == profile.compare(p)[0]
-            and profile.compare(p)[0] == (11, 7, 7, "HALT", 0, 0),
-            f"compare says {profile.compare(p, capped)}")
+    require(profiler.compare(p, capped)[0] == profiler.compare(p)[0]
+            and profiler.compare(p)[0] == (11, 7, 7, "HALT", 0, 0),
+            f"compare says {profiler.compare(p, capped)}")
     print(f"  every Profile number is pinned: {p.total_ticks} ticks in {len(p.rows)} "
           f"rows, budget/length/out, top() and hot_pcs() by name, max_rows shortening "
           f"the trace only, and report() refusing to print an unbalanced account")
@@ -1072,7 +1072,7 @@ target:
   NOP
   HALT
 """, window=(0x00, 0x20), image=0x0F22, entry="main")
-    p = profile.run_result(r, tick_budget=1000)
+    p = profiler.run_result(r, tick_budget=1000)
     require(p.out == bytes([5]), f"the profiled run emitted {p.out!r}; the patched byte "
                                  f"is OUT r0 and r0 holds 5")
     here = [row for row in p.rows if row[1] == r.symbols["target"]]
@@ -1357,7 +1357,7 @@ def test_validation_survives_python_O():
     script = r"""
 import sys
 sys.path.insert(0, sys.argv[1])
-import loader, profile, debug
+import loader, profiler, debug
 from golden_sim import NCP8
 n = 0
 for fn, args, kw in (
@@ -1373,8 +1373,8 @@ for fn, args, kw in (
      {"vectors": {0: 0x10}, "image": 0x0F22}),
     (loader.assemble, ("  .org 0x0F20\n  .byte 7\n",),
      {"window": (0, 8), "image": 0x0F22}),
-    (profile.run, ("HALT\n",), {}),
-    (profile.run, (b"",), {}),
+    (profiler.run, ("HALT\n",), {}),
+    (profiler.run, (b"",), {}),
     (debug.Debug, ("HALT\n",), {}),
     (debug.Debug, (b"\x00\x00",), {"tick_budget": -1}),
     (debug.Debug, (b"\x00\x00",), {"PC": 99}),
@@ -1405,14 +1405,14 @@ print(n)
         require("WRONG" not in got.stdout, got.stdout)
         outs.append(got.stdout.strip())
     require(outs == ["17", "17"], f"guard counts differ between modes: {outs}")
-    print("  17 input guards across loader/profile/debug fire identically under python "
+    print("  17 input guards across loader/profiler/debug fire identically under python "
           "and python -O, and a tampered replay still raises")
 
 def test_no_path_hacks_and_no_silent_except():
 
     here = os.path.dirname(os.path.abspath(__file__))
     tmp_marker = "/" + "tmp"
-    for mod in ("loader.py", "disasm.py", "profile.py", "debug.py", "test_toolchain.py"):
+    for mod in ("loader.py", "disasm.py", "profiler.py", "debug.py", "test_toolchain.py"):
         text = open(os.path.join(here, mod)).read()
         require(tmp_marker not in text, f"{mod} mentions an absolute temp path")
         require("sys.path.insert" not in text or mod == "test_toolchain.py",
@@ -1426,12 +1426,12 @@ def test_no_path_hacks_and_no_silent_except():
             require(not bad, f"{mod} validates with bare assert (gone under -O): {bad[:3]}")
 
     got = subprocess.run([sys.executable, "-c",
-                          "import loader, disasm, profile, debug; print('ok')"],
+                          "import loader, disasm, profiler, debug; print('ok')"],
                          capture_output=True, text=True, cwd="/",
                          env={**os.environ, "PYTHONPATH": here})
     require(got.returncode == 0 and got.stdout.strip() == "ok",
             f"the modules do not import as siblings: {got.stderr}")
-    print("  loader/disasm/profile/debug import as siblings from anywhere, contain no "
+    print("  loader/disasm/profiler/debug import as siblings from anywhere, contain no "
           "absolute temp-path hack, no bare except and no bare-assert validation")
 
 def test_shape_table_agrees_with_the_decoder():
