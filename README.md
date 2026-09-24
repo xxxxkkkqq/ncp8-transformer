@@ -33,6 +33,7 @@ python3 test_isa_v2_equivalence.py    # escape subcode space + program lockstep
 python3 test_error_atomicity.py       # every bound case, on the reference too
 python3 test_fault_registers.py       # why and where a tick stopped the machine
 python3 test_state_contract.py        # the state contract every path must honour
+python3 test_state_record.py          # capture a machine mid-run and put it back
 python3 test_spec_conformance.py      # the ISA is stated once: table vs all three
 python3 test_recursion.py             # multiply, nested CALL/RET, stack overflow
 python3 test_batched_execution.py     # batched/resident executor vs reference

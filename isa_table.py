@@ -30,6 +30,8 @@ argument state differently. `as_dict()`/`from_dict()` are how a block is carried
 data, so a record or a recording can hold the machine it describes.
 """
 
+from collections import namedtuple
+
 DATA_SIZE = 4096
 ESCAPE_PREFIX = 0x70
 PREFIX_BYTES = 2
@@ -455,6 +457,265 @@ def fault_state_error(status, fault_reason, fault_addr=0, where=""):
         return (f"{where}status is the error status 3 while fault_reason is 0 (OK): an "
                 f"error tick must name the cause it stopped for")
     return None
+
+StateField = namedtuple("StateField", "name lo hi cells")
+
+STATE_FIELDS = (
+    StateField("r", 0, 255, 4),
+    StateField("HL", 0, 65535, None),
+    StateField("DE", 0, 65535, None),
+    StateField("PC", 0, 65535, None),
+    StateField("SP", 0, DATA_SIZE, None),
+    StateField("C", 0, 1, None),
+    StateField("Z", 0, 1, None),
+    StateField("ipos", 0, None, None),
+    StateField("tick", 0, None, None),
+    StateField("status", 0, 3, None),
+    StateField("fault_reason", 0, (1 << FAULT_BITS) - 1, None),
+    StateField("fault_addr", 0, (1 << FAULT_ADDR_BITS) - 1, None),
+)
+
+STATE_FIELD_NAMES = tuple(f.name for f in STATE_FIELDS)
+
+RECORD_IMAGES = ("CODE", "DATA")
+RECORD_STREAMS = ("out", "inputs")
+RECORD_BLOCK = "block"
+RECORD_COMPONENTS = (STATE_FIELD_NAMES + RECORD_IMAGES + RECORD_STREAMS
+                     + (RECORD_BLOCK,))
+
+RecordBounds = namedtuple("RecordBounds",
+                          "where out_cap code_size data_size inputs block")
+
+CheckedRecord = namedtuple("CheckedRecord", "state code data out inputs")
+
+def state_error(values, where=""):
+
+    unknown = sorted(set(values) - set(STATE_FIELD_NAMES))
+    if unknown:
+        return (f"{where}state carries {unknown}, which this table declares no width "
+                f"for: add the field to isa_table.STATE_FIELDS or stop carrying it")
+    for f in STATE_FIELDS:
+        if f.name not in values:
+            return f"{where}state field {f.name} is missing"
+        v = values[f.name]
+        if f.cells is None:
+            bad = _width_error(f, v, f.name, where)
+            if bad is not None:
+                return bad
+            continue
+        try:
+            cells = list(v)
+        except TypeError:
+            return (f"{where}state field {f.name} is {v!r}, which is not the "
+                    f"{f.cells} cells this machine declares")
+        if len(cells) != f.cells:
+            return (f"{where}state field {f.name} has {len(cells)} cells, this machine "
+                    f"declares {f.cells}")
+        for i, cell in enumerate(cells):
+            bad = _width_error(f, cell, f"{f.name}[{i}]", where)
+            if bad is not None:
+                return bad
+    return fault_state_error(values["status"], values["fault_reason"],
+                             values["fault_addr"], where)
+
+def _width_error(f, v, label, where):
+
+    try:
+        bad = v < f.lo if f.hi is None else not f.lo <= v <= f.hi
+    except TypeError:
+        bad = True
+    if bad:
+        hi = "unbounded" if f.hi is None else f.hi
+        return (f"{where}state field {label} is {v}, outside [{f.lo}, {hi}]")
+    return None
+
+def state_shape(values, where=""):
+
+    unknown = sorted(set(values) - set(STATE_FIELD_NAMES))
+    if unknown:
+        return (f"{where}state carries {unknown}, which this table declares no width "
+                f"for: add the field to isa_table.STATE_FIELDS or stop carrying it")
+    for f in STATE_FIELDS:
+        if f.name not in values:
+            return f"{where}state field {f.name} is missing"
+        v = values[f.name]
+        if f.cells is None:
+            if isinstance(v, bool) or not isinstance(v, int):
+                return (f"{where}state field {f.name} is {v!r}, which is not the integer "
+                        f"this machine stores")
+        else:
+            try:
+                cells = list(v)
+            except TypeError:
+                return (f"{where}state field {f.name} is {v!r}, which is not the "
+                        f"{f.cells} cells this machine declares")
+            if len(cells) != f.cells:
+                return (f"{where}state field {f.name} has {len(cells)} cells, this "
+                        f"machine declares {f.cells}")
+            if any(isinstance(c, bool) or not isinstance(c, int) for c in cells):
+                return (f"{where}state field {f.name} is {cells!r}, and every cell of it "
+                        f"is an integer")
+    return None
+
+def record_from(machine, readers, where=""):
+
+    missing = [name for name in RECORD_COMPONENTS if name not in readers]
+    if missing:
+        raise ValueError(f"{where}records no reader for {missing}, so this machine's "
+                         f"state is not fully recorded")
+    extra = sorted(set(readers) - set(RECORD_COMPONENTS))
+    if extra:
+        raise ValueError(f"{where}records {extra}, which is not a component of a state "
+                         f"record")
+    return {name: readers[name](machine) for name in RECORD_COMPONENTS}
+
+def check_record(snap, bounds):
+
+    where = bounds.where
+    if not isinstance(snap, dict):
+        raise ValueError(f"{where}a state record is the dict of components "
+                         f"record_state() publishes, not a {type(snap).__name__}")
+    missing = [name for name in RECORD_COMPONENTS if name not in snap]
+    if missing:
+        raise ValueError(f"{where}record has no component {missing}: a record is "
+                         f"refused rather than installed with those fields left at "
+                         f"their reset values")
+    extra = sorted(set(snap) - set(RECORD_COMPONENTS))
+    if extra:
+        raise ValueError(f"{where}record carries {extra}, which is not a component of a "
+                         f"state record")
+    state = {name: snap[name] for name in STATE_FIELD_NAMES}
+    bad = state_shape(state, where)
+    if bad is not None:
+        raise ValueError(bad)
+    state = {f.name: (list(state[f.name]) if f.cells is not None else state[f.name])
+             for f in STATE_FIELDS}
+
+    code = _record_image(snap["CODE"], "CODE", bounds.code_size, where)
+    data = _record_image(snap["DATA"], "DATA", bounds.data_size, where)
+    out = _record_bytes(snap["out"], "out", where)
+    if len(out) > bounds.out_cap:
+        raise ValueError(f"{where}record's output stream is {len(out)} bytes, above "
+                         f"this machine's output capacity {bounds.out_cap}: the stream "
+                         f"a machine emitted is bounded by the capacity it was built "
+                         f"with")
+    given = _record_bytes(bounds.inputs, "input stream", where)
+    taken = _record_bytes(snap["inputs"], "inputs", where)
+    if state["ipos"] > len(taken):
+        raise ValueError(f"{where}record's ipos is {state['ipos']}, past the end of the "
+                         f"{len(taken)}-byte input stream it was recorded with")
+    if taken != given:
+        raise ValueError(f"{where}record consumed {state['ipos']} bytes of a "
+                         f"{len(taken)}-byte input stream and this machine's stream is "
+                         f"{len(given)} bytes: the cursor means the same byte only over "
+                         f"the same stream")
+    block = snap[RECORD_BLOCK]
+    if not isinstance(block, dict):
+        raise ValueError(f"{where}record's configuration block is {block!r}, which is "
+                         f"not the dict of declared fields as_dict() publishes")
+    want = MachineConfig.from_dict(block)
+    moved = sorted(n for n in MachineConfig.__slots__
+                   if getattr(want, n) != getattr(bounds.block, n))
+    if moved:
+        raise ValueError(
+            f"{where}record was taken under a different configuration: {moved} "
+            f"{'differs' if len(moved) == 1 else 'differ'} (record "
+            f"{ {n: getattr(want, n) for n in moved} }, this machine "
+            f"{ {n: getattr(bounds.block, n) for n in moved} })")
+    return CheckedRecord(state=state, code=code, data=data, out=out, inputs=given)
+
+def publish_record(machine, readers, bounds):
+
+    snap = record_from(machine, readers, bounds.where)
+    got = check_record(snap, bounds)
+    rec = dict(got.state)
+    rec["CODE"], rec["DATA"] = got.code, got.data
+    rec["out"], rec["inputs"] = got.out, got.inputs
+    rec[RECORD_BLOCK] = dict(snap[RECORD_BLOCK])
+    return {name: rec[name] for name in RECORD_COMPONENTS}
+
+def _record_bytes(value, name, where):
+
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, (bytearray, list, tuple)):
+        try:
+            return bytes(value)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{where}record's {name} is not a byte stream: {e}") from e
+    raise ValueError(f"{where}record's {name} is a {type(value).__name__}, which is not "
+                     f"a byte stream")
+
+def _record_image(value, name, size, where):
+
+    data = _record_bytes(value, name, where)
+    if len(data) != size:
+        raise ValueError(f"{where}record's {name} image is {len(data)} bytes, and this "
+                         f"machine's {name} region is {size} bytes: an image is "
+                         f"recorded whole, because a prefix would install the rest of "
+                         f"the region at its reset value")
+    return data
+
+def _illegal_state_values(f):
+
+    out = [f.lo - 1]
+    if f.cells is None:
+        out.append("x" if f.hi is None else f.hi + 1)
+    else:
+        out.append([f.hi + 1] + [0] * (f.cells - 1))
+        out.append([0] * (f.cells - 1))
+    return out
+
+def check_state_table():
+
+    if len(set(STATE_FIELD_NAMES)) != len(STATE_FIELD_NAMES):
+        raise DecodeTableError("the state table names a field twice")
+    legal = {f.name: ([f.lo] * f.cells if f.cells else f.lo) for f in STATE_FIELDS}
+    if state_error(dict(legal)) is not None:
+        raise DecodeTableError("the state table refuses its own reset values: "
+                               f"{state_error(dict(legal))}")
+    for f in STATE_FIELDS:
+        for value in _illegal_state_values(f):
+            probe = dict(legal)
+            probe[f.name] = value
+            msg = state_error(probe)
+            if msg is None or f.name not in msg:
+                raise DecodeTableError(f"the state table accepts {f.name}={value!r} "
+                                       f"without refusing it by name")
+    short = dict(legal)
+    del short["SP"]
+    if "SP" not in (state_error(short) or ""):
+        raise DecodeTableError("the state table does not refuse a missing field by name")
+    if "extra_field" not in (state_error(dict(legal, extra_field=1)) or ""):
+        raise DecodeTableError("the state table accepts a field it declares no width for")
+    if state_shape(dict(legal, SP=legal["SP"] + 1)) is not None:
+        raise DecodeTableError("the shape check refused a value above a width, and "
+                               "check_state() is the gate that owns that refusal")
+    if state_shape(dict(legal, r=[0, 0, 0])) is None:
+        raise DecodeTableError("the shape check accepted a register file of the wrong "
+                               "cell count")
+    pairing = dict(legal, status=3, fault_reason=0)
+    if state_error(pairing) is None:
+        raise DecodeTableError("the state table accepts status 3 with no cause named")
+    if set(RECORD_COMPONENTS) != set(STATE_FIELD_NAMES) | set(RECORD_IMAGES) \
+            | set(RECORD_STREAMS) | {RECORD_BLOCK}:
+        raise DecodeTableError("the record's component list is not the state table plus "
+                               "the images, streams and block it names")
+    if len(RECORD_COMPONENTS) != len(set(RECORD_COMPONENTS)):
+        raise DecodeTableError("the record lists a component twice")
+    if "oplen" in RECORD_COMPONENTS:
+        raise DecodeTableError("a record carries its output stream as `out`, so an "
+                               "`oplen` component would be a second copy of the same quantity "
+                               "under the name the paths that keep a cursor use")
+    declared = {n.lower() for n in CONFIG_NAMES} | {"out_cap", "tick_budget", "tb",
+                                                    "config", "cfg"}
+    leaked = sorted({n.lower() for n in RECORD_COMPONENTS} & declared)
+    if leaked:
+        raise DecodeTableError(f"a record component names load-time configuration "
+                               f"{leaked}")
+    return True
+
+check_state_table()
 
 def single_row(op):
 

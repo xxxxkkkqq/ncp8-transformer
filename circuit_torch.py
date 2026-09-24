@@ -56,28 +56,12 @@ _ALU2, _S02, _S12, _LX2 = _rom(ISA.escape_rom())
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
                 fault_reason=0, fault_addr=0, where=""):
 
-    def outside(field, value, lo, hi):
-        raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
-
-    for i, v in enumerate(list(R)):
-        if not 0 <= v < 256:
-            outside(f"r[{i}]", v, 0, 255)
-    for field, v in (("HL", HL), ("DE", DE), ("PC", PC)):
-        if not 0 <= v < 65536:
-            outside(field, v, 0, 65535)
-    if not 0 <= SP <= DATA_SIZE:
-        outside("SP", SP, 0, DATA_SIZE)
-    for field, v in (("C", C), ("Z", Z)):
-        if v not in (0, 1):
-            outside(field, v, 0, 1)
     if not 0 <= oplen <= OUT_CAP:
-        outside("oplen", oplen, 0, OUT_CAP)
-    for field, v in (("ipos", ipos), ("tick", tick)):
-        if v < 0:
-            outside(field, v, 0, "unbounded")
-    if status not in (0, 1, 2, 3):
-        outside("status", status, 0, 3)
-    bad = ISA.fault_state_error(status, fault_reason, fault_addr, where)
+        raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
+    bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "PC": PC, "SP": SP,
+                           "C": C, "Z": Z, "ipos": ipos, "tick": tick, "status": status,
+                           "fault_reason": fault_reason, "fault_addr": fault_addr},
+                          where)
     if bad is not None:
         raise ValueError(bad)
 
@@ -521,6 +505,63 @@ class TorchCircuit:
         self.Z = t([Z], dtype=torch.int32, device=self.dev)
         self.tick = t([tick], dtype=torch.int32, device=self.dev)
         self.PC = t([PC], dtype=torch.int32, device=self.dev)
+
+    def _record_inputs(self):
+
+        return bytes(int(v) for v in self.INPUTS[: int(self.inlen.item())].cpu().tolist())
+
+    def _record_block(self):
+
+        lo, hi = self.config.window()
+        return ISA.MachineConfig(codelen=self.codelen, winlo=lo, winhi=hi,
+                                 vec=self.config.vectors(), nbanks=self.nbanks,
+                                 tdlim=self.tdlim, tickbudget=self.tb,
+                                 outcap=self.out_cap)
+
+    _RECORD_SCALARS = ("HL", "DE", "PC", "SP", "C", "Z", "ipos", "tick", "status",
+                       "fault_reason", "fault_addr")
+    _RECORD_READERS = {
+        **{n: (lambda m, n=n: int(getattr(m, n).item())) for n in _RECORD_SCALARS},
+        "r": lambda m: [int(v) for v in m.R.tolist()],
+
+        "CODE": lambda m: bytes(int(v) for v in m.CODE.cpu().tolist()),
+        "DATA": lambda m: bytes(int(v) for v in m.DATA.cpu().tolist()),
+        "out": lambda m: m.out(),
+        "inputs": lambda m: m._record_inputs(),
+        "block": lambda m: m._record_block().as_dict(),
+    }
+
+    def _record_bounds(self):
+
+        return ISA.RecordBounds(where="TorchCircuit: ", out_cap=self.out_cap,
+                                code_size=CODE_SIZE, data_size=DATA_SIZE,
+                                inputs=self._record_inputs(),
+                                block=self._record_block())
+
+    def record_state(self):
+
+        return ISA.publish_record(self, self._RECORD_READERS, self._record_bounds())
+
+    def install_state(self, snap):
+
+        got = ISA.check_record(snap, self._record_bounds())
+        st = got.state
+        check_state(st["r"], st["HL"], st["DE"], st["SP"], st["C"], st["Z"],
+                    tick=st["tick"], PC=st["PC"], ipos=st["ipos"],
+                    oplen=len(got.out), status=st["status"],
+                    fault_reason=st["fault_reason"], fault_addr=st["fault_addr"],
+                    where="TorchCircuit: ")
+        t = torch.tensor
+        i32 = torch.int32
+        self.R = t(st["r"], dtype=i32, device=self.dev)
+        for name in self._RECORD_SCALARS:
+            setattr(self, name, t([st[name]], dtype=i32, device=self.dev))
+        self.OUTBUF.zero_()
+        if got.out:
+            self.OUTBUF[: len(got.out)] = t(list(got.out), dtype=i32, device=self.dev)
+        self.oplen = t([len(got.out)], dtype=i32, device=self.dev)
+        self.CODE = t(list(got.code), dtype=i32, device=self.dev)
+        self.DATA = t(list(got.data), dtype=i32, device=self.dev)
 
     def snapshot(self):
 

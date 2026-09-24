@@ -162,30 +162,118 @@ CODE_MASK = tl.constexpr(CODE_SIZE - 1)
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
                 fault_reason=0, fault_addr=0, where=""):
 
-    def outside(field, value, lo, hi):
-        raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
-
-    for i, v in enumerate(list(R)):
-        if not 0 <= v < 256:
-            outside(f"r[{i}]", v, 0, 255)
-    for field, v in (("HL", HL), ("DE", DE), ("PC", PC)):
-        if not 0 <= v < 65536:
-            outside(field, v, 0, 65535)
-    if not 0 <= SP <= DATA_SIZE:
-        outside("SP", SP, 0, DATA_SIZE)
-    for field, v in (("C", C), ("Z", Z)):
-        if v not in (0, 1):
-            outside(field, v, 0, 1)
     if not 0 <= oplen <= OUT_CAP:
-        outside("oplen", oplen, 0, OUT_CAP)
-    for field, v in (("ipos", ipos), ("tick", tick)):
-        if v < 0:
-            outside(field, v, 0, "unbounded")
-    if status not in (0, 1, 2, 3):
-        outside("status", status, 0, 3)
-    bad = ISA.fault_state_error(status, fault_reason, fault_addr, where)
+        raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
+    bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "PC": PC, "SP": SP,
+                           "C": C, "Z": Z, "ipos": ipos, "tick": tick, "status": status,
+                           "fault_reason": fault_reason, "fault_addr": fault_addr},
+                          where)
     if bad is not None:
         raise ValueError(bad)
+
+STATE_ROW_OF = {"r": (0, 1, 2, 3), "HL": 4, "DE": 5, "PC": 6, "SP": 7, "C": 8, "Z": 9,
+                "ipos": 10, "tick": 12, "status": 13, "fault_reason": 14,
+                "fault_addr": 15}
+STATE_ROW_OPLEN = 11
+if set(STATE_ROW_OF) != set(ISA.STATE_FIELD_NAMES):
+    raise ISA.DecodeTableError(
+        f"the state row layout covers {sorted(STATE_ROW_OF)} while the state table "
+        f"names {sorted(ISA.STATE_FIELD_NAMES)}: a field of one is missing from the "
+        f"other, so a record taken on this path would be incomplete")
+
+def _row_state(row):
+
+    out = {}
+    for name, at in STATE_ROW_OF.items():
+        out[name] = ([int(row[i]) for i in at] if isinstance(at, tuple) else int(row[at]))
+    return out
+
+def _write_row_state(row, st):
+
+    for name, at in STATE_ROW_OF.items():
+        if isinstance(at, tuple):
+            for i, cell in zip(at, st[name]):
+                row[i] = cell
+        else:
+            row[at] = st[name]
+
+def _row_bytes(cells, name, size):
+
+    values = [int(v) for v in cells]
+    if len(values) != size:
+        raise ValueError(f"{name} row has {len(values)} cells, this machine's region is "
+                         f"{size} bytes")
+    for i, v in enumerate(values):
+        if not 0 <= v <= 255:
+            raise ValueError(f"{name} cell {i} is {v}, which is not an 8-bit value, so "
+                             f"the image cannot be recorded as bytes")
+    return bytes(values)
+
+_TRITON_RECORD_READERS = {
+    **{name: (lambda m, name=name: m._record_state()[name])
+       for name in ISA.STATE_FIELD_NAMES},
+
+    "CODE": lambda m: m._record_code(),
+    "DATA": lambda m: m._record_data(),
+    "out": lambda m: m._record_out(),
+    "inputs": lambda m: m._record_inputs(),
+    "block": lambda m: m._record_block().as_dict(),
+}
+
+def _byte_image(values):
+
+    return torch.tensor(list(values), dtype=torch.int32)
+
+class _Row:
+
+    __slots__ = ("b", "i")
+
+    def __init__(self, batch, i):
+        batch._row(i)
+        self.b = batch
+        self.i = i
+
+    def _record_state(self):
+        return _row_state(self.b.STATE[self.i])
+
+    def _record_code(self):
+        return _row_bytes(self.b.CODE[self.i], "CODE", CODE_SIZE)
+
+    def _record_data(self):
+        return _row_bytes(self.b.DATA[self.i], "DATA", DATA_SIZE)
+
+    def _record_out(self):
+        n = min(int(self.b.STATE[self.i, STATE_ROW_OPLEN].item()), self.b.out_cap)
+        return bytes(int(v) for v in self.b.OUTBUF[self.i, :n].cpu().tolist())
+
+    def _record_inputs(self):
+        n = int(self.b.INLENS[self.i].item())
+        return bytes(int(v) for v in self.b.INPUTS[self.i, :n].cpu().tolist())
+
+    def _record_block(self):
+        cfg = self.b.config
+        lo, hi = cfg.window()
+        return ISA.MachineConfig(codelen=int(self.b.CODELENS[self.i].item()),
+                                 winlo=lo, winhi=hi, vec=cfg.vectors(),
+                                 nbanks=self.b.nbanks, tdlim=self.b.tdlim,
+                                 tickbudget=int(self.b.BUDGETS[self.i].item()),
+                                 outcap=self.b.out_cap)
+
+    def _record_bounds(self):
+        return ISA.RecordBounds(where=f"machine {self.i}: ", out_cap=self.b.out_cap,
+                                code_size=CODE_SIZE, data_size=DATA_SIZE,
+                                inputs=self._record_inputs(),
+                                block=self._record_block())
+
+    def install(self, got):
+
+        b, i = self.b, self.i
+        b.set_state(i, oplen=len(got.out), **got.state)
+        b.CODE[i].copy_(_byte_image(got.code).to(b.dev))
+        b.DATA[i].copy_(_byte_image(got.data).to(b.dev))
+        b.OUTBUF[i].zero_()
+        if got.out:
+            b.OUTBUF[i, : len(got.out)] = _byte_image(got.out).to(b.dev)
 
 @triton.jit
 def _get4(v0, v1, v2, v3, idx):
@@ -913,6 +1001,16 @@ class TritonBatch:
         self._row(i)
         self.BUDGETS[i] = int(budget)
 
+    def record_state(self, i):
+
+        row = _Row(self, i)
+        return ISA.publish_record(row, _TRITON_RECORD_READERS, row._record_bounds())
+
+    def install_state(self, i, snap):
+
+        row = _Row(self, i)
+        row.install(ISA.check_record(snap, row._record_bounds()))
+
     def run(self):
 
         self._launch(0)
@@ -1068,6 +1166,57 @@ class TritonCircuit:
         self.S[7] = SP; self.S[8] = C; self.S[9] = Z
         self.S[12] = tick
         self.S[14] = fr; self.S[15] = fa
+
+    def _record_state(self):
+        return _row_state(self.S)
+
+    def _record_code(self):
+        return _row_bytes(self.CODE, "CODE", CODE_SIZE)
+
+    def _record_data(self):
+        return _row_bytes(self.DATA, "DATA", DATA_SIZE)
+
+    def _record_out(self):
+        n = min(int(self.S[STATE_ROW_OPLEN].item()), self.out_cap)
+        return bytes(int(v) for v in self.OUTBUF[:n].cpu().tolist())
+
+    def _record_inputs(self):
+        return bytes(int(v) for v in self.INP[: self.inlen].cpu().tolist())
+
+    def _record_block(self):
+
+        lo, hi = self.config.window()
+        return ISA.MachineConfig(codelen=self.codelen, winlo=lo, winhi=hi,
+                                 vec=self.config.vectors(), nbanks=self.nbanks,
+                                 tdlim=self.tdlim, tickbudget=self.tb,
+                                 outcap=self.out_cap)
+
+    def _record_bounds(self):
+
+        return ISA.RecordBounds(where="TritonCircuit: ", out_cap=self.out_cap,
+                                code_size=CODE_SIZE, data_size=DATA_SIZE,
+                                inputs=self._record_inputs(),
+                                block=self._record_block())
+
+    def record_state(self):
+
+        return ISA.publish_record(self, _TRITON_RECORD_READERS, self._record_bounds())
+
+    def install_state(self, snap):
+
+        got = ISA.check_record(snap, self._record_bounds())
+        st = got.state
+        check_state(st["r"], st["HL"], st["DE"], st["SP"], st["C"], st["Z"],
+                    tick=st["tick"], PC=st["PC"], ipos=st["ipos"], oplen=len(got.out),
+                    status=st["status"], fault_reason=st["fault_reason"],
+                    fault_addr=st["fault_addr"], where="TritonCircuit: ")
+        _write_row_state(self.S, st)
+        self.S[STATE_ROW_OPLEN] = len(got.out)
+        self.CODE.copy_(_byte_image(got.code).to(self.dev))
+        self.DATA.copy_(_byte_image(got.data).to(self.dev))
+        self.OUTBUF.zero_()
+        if got.out:
+            self.OUTBUF[: len(got.out)] = _byte_image(got.out).to(self.dev)
 
     def step(self):
         ncp_step_kernel[(1,)](self.CODE, self.DATA, self.INP, self.OUTBUF, self.S,
