@@ -203,7 +203,7 @@ eq:
   LDI DE, 5
   ADD HL, DE
   SUB HL, DE
-  XCHG
+  XCHG HL, DE
   OUT r3
   HALT
 """)

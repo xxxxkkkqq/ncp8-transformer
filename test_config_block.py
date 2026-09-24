@@ -431,7 +431,7 @@ def s4_case2():
               u["cause"] == CAUSE["TRAP_UNREG"],
               f"cause {NAME.get(u["cause"])} out {u["out"].hex()}")
 
-        k, _ = p.run(p.build(asm("EXT 16\nHALT"),
+        k, _ = p.run(p.build(bytes([0x70, 0x70, 16]) + asm("HALT"),
                              config=CFG(codelen=4, vec={0: 0x0F0C})))
         check(f"S4 {p.name}: EXT 16 refused", k["cause"] == CAUSE["TRAP_UNREG"],
               NAME.get(k["cause"]))

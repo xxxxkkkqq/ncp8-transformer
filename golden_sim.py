@@ -30,6 +30,7 @@ Opcode layout (fields do not overlap):
 from __future__ import annotations
 import re
 
+import isa_forms
 import isa_table as ISA
 
 DATA_SIZE = 4096
@@ -578,7 +579,273 @@ class AssemblyError(Exception):
         self.line = line
         super().__init__(f"line {line}: {msg}" if line is not None else msg)
 
+class _Operand(Exception):
+
+    pass
+
+def _literal(text):
+
+    try:
+        return int(text.replace("_", ""), 0)
+    except (ValueError, TypeError):
+        return None
+
+def _is_symbol(text):
+    return bool(re.fullmatch(r"[A-Za-z_]\w*", text))
+
+def _operand_value(kind, x, name, labels, strict):
+
+    s = str(x).strip()
+    if kind in ("HL", "DE", "SP", "[HL]", "[DE]"):
+        return None
+    if kind in ("r", "rcanon"):
+        return int(s[1])
+    if kind in ("a16", "i16"):
+        v = labels[s] if s in labels else _literal(s)
+        if v is None:
+            if not strict:
+                return 0
+            if s in isa_forms.RESERVED:
+                raise _Operand(f"{s!r} names a register or pointer, not a target")
+            if _is_symbol(s):
+                raise _Operand(f"undefined symbol {s!r}")
+            raise _Operand(f"unsupported operand expression {s!r}")
+        if not 0 <= v <= 0xFFFF:
+            raise _Operand(f"{name} address {v} is out of range 0..65535")
+        return v
+    if kind in ("i8", "k"):
+        word, hi = (("8-bit immediate", 0xFF) if kind == "i8"
+                    else ("trap number", ISA.VEC_COUNT - 1))
+        if s in labels:
+            raise _Operand(f"{name} needs a numeric {word}, {s!r} is a label")
+        v = _literal(s)
+        if v is None:
+            if not strict and _is_symbol(s):
+                return 0
+            if _is_symbol(s):
+                raise _Operand(f"undefined symbol {s!r}")
+            raise _Operand(f"unsupported operand expression {s!r}")
+        if not 0 <= v <= hi:
+            if kind == "k":
+                raise _Operand(f"{name} trap number {v} is outside the trap vector "
+                               f"table's indices 0..{hi}, so this code point can never "
+                               "be dispatched")
+            raise _Operand(f"{name} immediate {v} is out of range 0..{hi}")
+        return v & 0xFF
+    if kind == "soff":
+        if s in labels:
+            raise _Operand(f"{name} needs a numeric signed 8-bit immediate, "
+                           f"{s!r} is a label")
+        v = _literal(s)
+        if v is None:
+            if not strict and _is_symbol(s):
+                return 0
+            if _is_symbol(s):
+                raise _Operand(f"undefined symbol {s!r}")
+            raise _Operand(f"unsupported operand expression {s!r}")
+        if not -128 <= v <= 127:
+            raise _Operand(f"{name} immediate {v} is out of range -128..127")
+        return v & 0xFF
+    if kind == "[HL+-i8]":
+        m = re.fullmatch(r"\[HL(?:([+-])([^+\-\[\]]+))?\]", s.replace(" ", ""))
+        if not m:
+            raise _Operand(f"{name} needs an [HL+i8] address operand, {s!r} is not one")
+        sign, num = m.group(1), m.group(2)
+        if num is None:
+            return 0
+        if num in labels:
+            raise _Operand(f"{name} needs a numeric signed 8-bit offset, {num!r} is a "
+                           "label")
+        v = _literal(num)
+        if v is None:
+            if not strict and _is_symbol(num):
+                return 0
+            if _is_symbol(num):
+                raise _Operand(f"undefined symbol {num!r}")
+            raise _Operand(f"unsupported operand expression {num!r}")
+        if sign == "-":
+            v = -v
+        if not -128 <= v <= 127:
+            raise _Operand(f"{name} offset {v} is out of range -128..127")
+        return v & 0xFF
+    raise KeyError(f"golden_sim: undeclared operand kind {kind!r}")
+
+def _diagnose(kind, x, name, labels):
+
+    try:
+        _operand_value(kind, x, name, labels, True)
+    except _Operand as e:
+        return str(e)
+    except (IndexError, KeyError, TypeError, ValueError):
+        return None
+    return None
+
+def _code(byte_index, shift):
+    return ("code", byte_index, shift)
+
+PLACE_KIND = {"r": "code", "rcanon": "byte", "a16": "word", "i16": "word", "i8": "byte",
+              "soff": "byte", "k": "byte", "[HL+-i8]": "byte", "HL": None, "DE": None,
+              "SP": None, "[HL]": None, "[DE]": None}
+
+ENC = {
+    ("ADC", ("r", "r")): (b"\xa0", [_code(0, 2), _code(0, 0)]),
+    ("ADCI", ("r", "i8")): (b"\xdc", [_code(0, 0), ("byte",)]),
+    ("ADD", ("HL", "DE")): (b"\x70\x60", [None, None]),
+    ("ADD", ("SP", "soff")): (b"\x70\x58", [None, ("byte",)]),
+    ("ADD", ("r", "r")): (b"\x80", [_code(0, 2), _code(0, 0)]),
+    ("ADDI", ("DE", "rcanon")): (b"\x12", [None, ("byte",)]),
+    ("ADDI", ("HL", "rcanon")): (b"\x11", [None, ("byte",)]),
+    ("ADDI", ("r", "i8")): (b"\xd4", [_code(0, 0), ("byte",)]),
+    ("AND", ("r", "r")): (b"\x20", [_code(0, 2), _code(0, 0)]),
+    ("CALL", ("a16",)): (b"\x0e", [("word",)]),
+    ("CLC", ()): (b"\x05", []),
+    ("CMP", ("r", "r")): (b"\x70\x20", [_code(1, 2), _code(1, 0)]),
+    ("DEC", ("HL",)): (b"\x03", [None]),
+    ("DJNZ", ("r", "a16")): (b"\x6c", [_code(0, 0), ("word",)]),
+    ("DIV", ("r", "r")): (b"\x70\x00", [_code(1, 2), _code(1, 0)]),
+    ("EXT", ("k",)): (b"\x70\x70", [("byte",)]),
+    ("GETF", ("r",)): (b"\x1c", [_code(0, 0)]),
+    ("GETPC", ("r",)): (b"\x14", [_code(0, 0)]),
+    ("GETSP", ("r",)): (b"\x18", [_code(0, 0)]),
+    ("HALT", ()): (b"\x00", []),
+    ("IN", ("r",)): (b"\xfc", [_code(0, 0)]),
+    ("INC", ("DE",)): (b"\x04", [None]),
+    ("INC", ("HL",)): (b"\x02", [None]),
+    ("JC", ("a16",)): (b"\x0c", [("word",)]),
+    ("JMP", ("a16",)): (b"\x09", [("word",)]),
+    ("JNC", ("a16",)): (b"\x0d", [("word",)]),
+    ("JNZ", ("a16",)): (b"\x0b", [("word",)]),
+    ("JPHL", ()): (b"\x13", []),
+    ("JZ", ("a16",)): (b"\x0a", [("word",)]),
+    ("LDC", ("r", "[HL]")): (b"\x70\x84", [_code(1, 0), None]),
+    ("LDI", ("DE", "i16")): (b"\x10", [None, ("word",)]),
+    ("LDI", ("HL", "i16")): (b"\x0f", [None, ("word",)]),
+    ("LDI", ("r", "i8")): (b"\xd0", [_code(0, 0), ("byte",)]),
+    ("LDW", ("DE", "[HL]")): (b"\x70\x3e", [None, None]),
+    ("LDW", ("HL", "[DE]")): (b"\x70\x3f", [None, None]),
+    ("LDX", ("r", "[HL+-i8]")): (b"\x70\x50", [_code(1, 0), ("byte",)]),
+    ("MOD", ("r", "r")): (b"\x70\x10", [_code(1, 2), _code(1, 0)]),
+    ("MOV", ("[DE]", "r")): (b"\xec", [None, _code(0, 0)]),
+    ("MOV", ("[HL]", "r")): (b"\xe4", [None, _code(0, 0)]),
+    ("MOV", ("r", "[DE]")): (b"\xe8", [_code(0, 0), None]),
+    ("MOV", ("r", "[HL]")): (b"\xe0", [_code(0, 0), None]),
+    ("MOV", ("r", "r")): (b"\xc0", [_code(0, 2), _code(0, 0)]),
+    ("MOVW", ("DE", "HL")): (b"\x70\x31", [None, None]),
+    ("MOVW", ("DE", "SP")): (b"\x70\x33", [None, None]),
+    ("MOVW", ("HL", "DE")): (b"\x70\x30", [None, None]),
+    ("MOVW", ("HL", "SP")): (b"\x70\x32", [None, None]),
+    ("MOVW", ("SP", "DE")): (b"\x70\x35", [None, None]),
+    ("MOVW", ("SP", "HL")): (b"\x70\x34", [None, None]),
+    ("MUL", ("r", "r")): (b"\x50", [_code(0, 2), _code(0, 0)]),
+    ("MULH", ("r", "r")): (b"\x70\x90", [_code(1, 2), _code(1, 0)]),
+    ("NEG", ("r",)): (b"\x70\x44", [_code(1, 0)]),
+    ("NOP", ()): (b"\x01", []),
+    ("NOT", ("r",)): (b"\x70\x40", [_code(1, 0)]),
+    ("OR", ("r", "r")): (b"\x30", [_code(0, 2), _code(0, 0)]),
+    ("OUT", ("r",)): (b"\xf8", [_code(0, 0)]),
+    ("OUTDE", ()): (b"\x07", []),
+    ("OUTM", ()): (b"\x06", []),
+    ("POP", ("r",)): (b"\xf4", [_code(0, 0)]),
+    ("POPW", ("DE",)): (b"\x70\x3b", [None]),
+    ("POPW", ("HL",)): (b"\x70\x3a", [None]),
+    ("PUSH", ("r",)): (b"\xf0", [_code(0, 0)]),
+    ("PUSHW", ("DE",)): (b"\x70\x39", [None]),
+    ("PUSHW", ("HL",)): (b"\x70\x38", [None]),
+    ("RET", ()): (b"\x08", []),
+    ("ROL", ("r",)): (b"\x70\x48", [_code(1, 0)]),
+    ("ROR", ("r",)): (b"\x70\x4c", [_code(1, 0)]),
+    ("SBB", ("r", "r")): (b"\xb0", [_code(0, 2), _code(0, 0)]),
+    ("SHL", ("r",)): (b"\x60", [_code(0, 0)]),
+    ("SHR", ("r",)): (b"\x64", [_code(0, 0)]),
+    ("STC", ("[HL]", "r")): (b"\x70\x80", [None, _code(1, 0)]),
+    ("STW", ("[DE]", "HL")): (b"\x70\x3d", [None, None]),
+    ("STW", ("[HL]", "DE")): (b"\x70\x3c", [None, None]),
+    ("STX", ("[HL+-i8]", "r")): (b"\x70\x54", [("byte",), _code(1, 0)]),
+    ("SUB", ("HL", "DE")): (b"\x70\x61", [None, None]),
+    ("SUB", ("r", "r")): (b"\x90", [_code(0, 2), _code(0, 0)]),
+    ("SUBI", ("r", "i8")): (b"\xd8", [_code(0, 0), ("byte",)]),
+    ("TST", ("r",)): (b"\x68", [_code(0, 0)]),
+    ("XCHG", ("HL", "DE")): (b"\x70\x62", [None, None]),
+    ("XOR", ("r", "r")): (b"\x40", [_code(0, 2), _code(0, 0)]),
+}
+
+def _encode(name, shape, values):
+
+    codes, places = ENC[(name, shape)]
+    out = bytearray(codes)
+    tail = bytearray()
+    for place, v in zip(places, values):
+        if place is None or v is None:
+            continue
+        if place[0] == "code":
+            out[place[1]] |= v << place[2]
+        elif place[0] == "byte":
+            tail.append(v & 0xFF)
+        else:
+            tail += (v & 0xFFFF).to_bytes(2, "little")
+    return bytes(out) + bytes(tail)
+
+def _codepoint_of(codes):
+
+    return codes[0] if len(codes) == 1 else 0x7000 | codes[1]
+
+def _check_encodings():
+
+    declared = {(n, s) for n, shapes in isa_forms.FORMS.items() for s in shapes}
+    problems = [f"no encoding for accepted shape {key}"
+                for key in sorted(declared - set(ENC))]
+    problems += [f"encoding for {key} names no shape FORMS accepts"
+                 for key in sorted(set(ENC) - declared)]
+    info = isa_forms.shape_info()
+    for name, shape in sorted(declared & set(ENC)):
+        codes, places = ENC[(name, shape)]
+        size, cps = info[(name, shape)]
+        if len(places) != len(shape):
+            problems.append(f"{name} {shape}: {len(places)} placements for "
+                            f"{len(shape)} operands")
+            continue
+        for kind, place in zip(shape, places):
+            got = place[0] if place else None
+            if got not in (None, "code", "byte", "word"):
+                problems.append(f"{name} {shape}: unknown placement {place}")
+            elif PLACE_KIND[kind] != got:
+                problems.append(f"{name} {shape}: kind {kind!r} placed as {got}, "
+                                "expected "
+                                + repr(PLACE_KIND[kind]))
+            elif got == "code" and (place[1] >= len(codes) or place[2] not in (0, 2)):
+                problems.append(f"{name} {shape}: code placement {place} is outside "
+                                "the code bytes")
+        width = sum({"byte": 1, "word": 2}.get(p[0], 0) for p in places if p)
+        if len(codes) + width != size:
+            problems.append(f"{name} {shape}: emits {len(codes) + width} bytes, the "
+                            f"decoder reads {size}")
+        fields = [i for i, k in enumerate(shape) if k == "r"]
+        emitted = set()
+        for combo in range(4 ** len(fields)):
+            rest, values = combo, []
+            for i in range(len(shape)):
+                if i in fields:
+                    values.append(rest % 4)
+                    rest //= 4
+                else:
+                    values.append(0)
+            body = _encode(name, shape, values)
+            emitted.add(_codepoint_of(body[:len(codes)]))
+        if emitted != set(cps):
+            problems.append(f"{name} {shape}: emits code points "
+                            f"{sorted(hex(c) for c in emitted)} but isa_table assigns "
+                            f"{sorted(hex(c) for c in cps)}")
+    return problems
+
+_ENCODING_PROBLEMS = _check_encodings()
+if _ENCODING_PROBLEMS:
+    raise RuntimeError("golden_sim's encoding table disagrees with the decode table: "
+                       + "; ".join(_ENCODING_PROBLEMS[:6]))
+
 def asm(src: str) -> bytes:
+
+    if not isinstance(src, str):
+        raise AssemblyError(f"asm() needs source text, got a {type(src).__name__}")
     pat = re.compile(r"^(\w+):$")
     items = []
     for lineno, raw in enumerate(src.splitlines(), 1):
@@ -594,193 +861,21 @@ def asm(src: str) -> bytes:
         items.append(("inst", name.strip(), args, lineno, line))
 
     def enc(name, args, labels, lineno, text, strict):
-        def _bad(msg):
-            raise AssemblyError(msg, lineno)
 
-        def _reg(x):
-
-            if not isinstance(x, str) or x not in ("r0", "r1", "r2", "r3"):
-                _bad(f"invalid register operand {x!r} in {text!r}")
-            return int(x[1])
-
-        def _value(x):
-
-            s = str(x)
-            if s in labels:
-                return labels[s]
-            try:
-                return int(s, 0)
-            except ValueError:
-                pass
-            if re.fullmatch(r"[A-Za-z_]\w*", s):
-                _bad(f"undefined symbol {s!r} in {text!r}")
-            _bad(f"unsupported operand expression {s!r} in {text!r}")
-
-        def _addr(x, mnemonic):
-
-            if not strict:
-
-                return 0
-            v = _value(x)
-            if not 0 <= v <= 0xFFFF:
-                _bad(f"{mnemonic} address {v} is out of range 0..65535 in {text!r}")
-            return v
-
-        def _imm8(x, mnemonic):
-
-            if not strict:
-                return 0
-            s = str(x)
-            if s in labels:
-                _bad(f"{mnemonic} needs a numeric 8-bit immediate, {s!r} is a label in {text!r}")
-            try:
-                v = int(s, 0)
-            except ValueError:
-                if re.fullmatch(r"[A-Za-z_]\w*", s):
-                    _bad(f"undefined symbol {s!r} in {text!r}")
-                _bad(f"unsupported operand expression {s!r} in {text!r}")
-            if not 0 <= v <= 0xFF:
-                _bad(f"{mnemonic} immediate {v} is out of range 0..255 in {text!r}")
-            return v
-
-        def _imm8s(x, mnemonic):
-
-            if not strict:
-                return 0
-            s = str(x)
-            if s in labels:
-                _bad(f"{mnemonic} needs a numeric signed 8-bit immediate, {s!r} is a label in {text!r}")
-            try:
-                v = int(s, 0)
-            except ValueError:
-                if re.fullmatch(r"[A-Za-z_]\w*", s):
-                    _bad(f"undefined symbol {s!r} in {text!r}")
-                _bad(f"unsupported operand expression {s!r} in {text!r}")
-            if not -128 <= v <= 127:
-                _bad(f"{mnemonic} immediate {v} is out of range -128..127 in {text!r}")
-            return v & 0xFF
-
-        def _frame_off(x, mnemonic):
-
-            if not strict:
-                return 0
-            s = str(x).replace(" ", "")
-            mm = re.fullmatch(r"\[HL(?:([+-])([^+\-\[\]]+))?\]", s)
-            if not mm:
-                _bad(f"{mnemonic} needs an [HL+i8] address operand, {x!r} is not one in {text!r}")
-            sign, num = mm.group(1), mm.group(2)
-            if num is None:
-                return 0
-            if num in labels:
-                _bad(f"{mnemonic} needs a numeric signed 8-bit offset, {num!r} is a label in {text!r}")
-            try:
-                v = int(num, 0)
-            except ValueError:
-                if re.fullmatch(r"[A-Za-z_]\w*", num):
-                    _bad(f"undefined symbol {num!r} in {text!r}")
-                _bad(f"unsupported operand expression {num!r} in {text!r}")
-            if sign == "-":
-                v = -v
-            if not -128 <= v <= 127:
-                _bad(f"{mnemonic} offset {v} is out of range -128..127 in {text!r}")
-            return v & 0xFF
-
-        simple = {"HALT": 0x00, "NOP": 0x01, "INC HL": 0x02, "DEC HL": 0x03,
-                  "INC DE": 0x04, "CLC": 0x05, "OUTM": 0x06, "OUTDE": 0x07, "RET": 0x08,
-                  "LDI HL": 0x0F, "LDI DE": 0x10, "ADDI HL": 0x11, "ADDI DE": 0x12}
-        if args and f"{name} {args[0]}" in simple:
-            base = simple[f"{name} {args[0]}"]
-            rest = args[1:]
-            if base in (0x0F, 0x10):
-
-                v = _addr(rest[0], name)
-                return bytes([base, v & 0xFF, v >> 8])
-            if base in (0x11, 0x12):
-                return bytes([base, _reg(rest[0])])
-            return bytes([base])
-        if name in simple:
-            return bytes([simple[name]])
-        if name == "JPHL":
-            return bytes([0x13])
-        if name in ("GETPC", "GETSP", "GETF"):
-            base = {"GETPC": 0x14, "GETSP": 0x18, "GETF": 0x1C}[name]
-            return bytes([base | _reg(args[0])])
-        jump = {"JMP": 0x09, "JZ": 0x0A, "JNZ": 0x0B, "JC": 0x0C, "JNC": 0x0D, "CALL": 0x0E}
-        if name in jump:
-
-            a = _addr(args[0], name)
-            return bytes([jump[name], a & 0xFF, a >> 8])
-        if name == "DJNZ":
-            a = _addr(args[1], name)
-            return bytes([0x6C | _reg(args[0]), a & 0xFF, a >> 8])
-        if name == "LDI":
-            return bytes([0xD0 | _reg(args[0]), _imm8(args[1], name)])
-        if name == "ADDI":
-            return bytes([0xD4 | _reg(args[0]), _imm8(args[1], name)])
-        if name == "SUBI":
-            return bytes([0xD8 | _reg(args[0]), _imm8(args[1], name)])
-        if name == "ADCI":
-            return bytes([0xDC | _reg(args[0]), _imm8(args[1], name)])
-        if name in ("ADD", "SUB") and args and args[0] == "HL":
-            return bytes([0x70, {"ADD": 0x60, "SUB": 0x61}[name]])
-        if name == "ADD" and args and args[0] == "SP":
-            return bytes([0x70, 0x58, _imm8s(args[1], name)])
-        if name == "XCHG":
-            return bytes([0x70, 0x62])
-        if name == "STC":
-            return bytes([0x70, 0x80 | _reg(args[1])])
-        if name == "LDC":
-            return bytes([0x70, 0x84 | _reg(args[0])])
-        if name == "EXT":
-            return bytes([0x70, 0x70, _imm8(args[0], name)])
-        rr2 = {"AND": 0x20, "OR": 0x30, "XOR": 0x40, "MUL": 0x50}
-        if name in rr2:
-            return bytes([rr2[name] | (_reg(args[0]) << 2) | _reg(args[1])])
-        rr3 = {"DIV": 0x00, "MOD": 0x10, "CMP": 0x20}
-        if name in rr3:
-            return bytes([0x70, rr3[name] | (_reg(args[0]) << 2) | _reg(args[1])])
-        un2 = {"NOT": 0x40, "NEG": 0x44, "ROL": 0x48, "ROR": 0x4C}
-        if name in un2:
-            return bytes([0x70, un2[name] | _reg(args[0])])
-        rr = {"ADD": 0x80, "SUB": 0x90, "ADC": 0xA0, "SBB": 0xB0, "MOV": 0xC0}
-        if name == "MOV":
-            mem = {"[HL]": 0xE0, "[DE]": 0xE8}
-            if args[1] in ("[HL]", "[DE]"):
-                return bytes([mem[args[1]] | _reg(args[0])])
-            if args[0] in ("[HL]", "[DE]"):
-                return bytes([(mem[args[0]] + 4) | _reg(args[1])])
-            return bytes([0xC0 | (_reg(args[0]) << 2) | _reg(args[1])])
-        if name in rr:
-            return bytes([rr[name] | (_reg(args[0]) << 2) | _reg(args[1])])
-        unary = {"PUSH": 0xF0, "POP": 0xF4, "OUT": 0xF8, "IN": 0xFC,
-                 "SHL": 0x60, "SHR": 0x64, "TST": 0x68}
-        if name in unary:
-            return bytes([unary[name] | _reg(args[0])])
-
-        movw = {("HL", "DE"): 0x30, ("DE", "HL"): 0x31, ("HL", "SP"): 0x32,
-                ("DE", "SP"): 0x33, ("SP", "HL"): 0x34, ("SP", "DE"): 0x35}
-        if name == "MOVW":
-            if tuple(args) not in movw:
-                raise AssemblyError(f"unknown operand combination {args!r} in {text!r}", lineno)
-            return bytes([0x70, movw[tuple(args)]])
-        if name in ("PUSHW", "POPW"):
-            if args not in (["HL"], ["DE"]):
-                raise AssemblyError(f"{name} needs HL or DE in {text!r}", lineno)
-            return bytes([0x70, {"PUSHW": 0x38, "POPW": 0x3A}[name] + (args == ["DE"])])
-        if name in ("STW", "LDW"):
-            wide = {("STW", "[HL]", "DE"): 0x3C, ("STW", "[DE]", "HL"): 0x3D,
-                    ("LDW", "DE", "[HL]"): 0x3E, ("LDW", "HL", "[DE]"): 0x3F}
-            key = tuple([name] + args)
-            if key not in wide:
-                raise AssemblyError(f"unknown operand combination {args!r} in {text!r}", lineno)
-            return bytes([0x70, wide[key]])
-        if name == "LDX":
-            return bytes([0x70, 0x50 | _reg(args[0]), _frame_off(args[1], name)])
-        if name == "STX":
-            return bytes([0x70, 0x54 | _reg(args[1]), _frame_off(args[0], name)])
-        if name == "MULH":
-            return bytes([0x70, 0x90 | (_reg(args[0]) << 2) | _reg(args[1])])
-        raise AssemblyError(f"unknown instruction {name!r} in {text!r}", lineno)
+        shape = isa_forms.match(name, args)
+        if shape is None:
+            _reason, pos, kind = isa_forms.blame(name, args)
+            detail = None
+            if kind is not None:
+                detail = _diagnose(kind, args[pos], name, labels)
+            raise AssemblyError(isa_forms.refusal(name, args, text, detail), lineno)
+        try:
+            values = [_operand_value(k, a, name, labels, strict)
+                      for k, a in zip(shape, args)]
+        except _Operand as e:
+            raise AssemblyError(isa_forms.refusal(name, args, text, str(e)),
+                                lineno) from None
+        return _encode(name, shape, values)
 
     labels, addr = {}, 0
 
@@ -798,6 +893,9 @@ def asm(src: str) -> bytes:
 
     for it in items:
         if it[0] == "label":
+            if it[1] in labels:
+                raise AssemblyError(f"symbol {it[1]!r} defined twice (already a label) "
+                                    f"in {it[3]!r}", it[2])
             labels[it[1]] = addr
         else:
             addr += len(enc_checked(it, labels, False))

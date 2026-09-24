@@ -113,7 +113,8 @@ def _c_trap_unreg(pc):
     return img(asm("EXT 0"), pc), state(PC=pc), pc, b"", b""
 
 def _c_trap_k_oob(pc):
-    return img(asm("EXT 16"), pc), state(PC=pc), pc, b"", b""
+
+    return img(bytes([0x70, 0x70, 16]), pc), state(PC=pc), pc, b"", b""
 
 def _c_sp_pair_oob(pc):
     return img(asm("MOVW SP, HL"), pc), state(PC=pc, HL=DATA_SIZE + 1), pc, b"", b""
@@ -155,7 +156,7 @@ def _p_data_oob_before_out_cap(pc):
 
 def _p_trap_k_before_stack(pc):
 
-    return img(asm("EXT 16"), pc), state(PC=pc, SP=0), pc, b"", b""
+    return img(bytes([0x70, 0x70, 16]), pc), state(PC=pc, SP=0), pc, b"", b""
 
 CASES = (
     ("OK", "NOP commits a tick and names no cause", _c_ok),
