@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 
 import disasm
+import isa_forms
 import isa_table as ISA
 from golden_sim import AssemblyError, CODE_SIZE, asm
 
@@ -247,157 +248,44 @@ def evaluate(expr, symbols, lineno, *, forward=None):
             raise
         raise LoaderError(e.msg, lineno)
 
-_KIND_OF_PLACEHOLDER = {"{a16}": "addr16", "{i16}": "addr16", "{i8}": "imm8",
-                        "{k}": "imm8", "{soff}": "soff", "{rcanon}": "reg",
-                        "{off}": "frame"}
-_REG_RE = re.compile(r"^r[0-3]$")
-_MEM_RE = re.compile(r"^\[(?:HL|DE)\]$")
+_SHAPE_ENCODING = isa_forms.shape_info()
+
+_FRAME = "[HL+-i8]"
+_PASSTHROUGH = ("r", "rcanon", "HL", "DE", "SP", "[HL]", "[DE]")
 _FRAME_RE = re.compile(r"^\[HL(?:([+-])([^\]]+))?\]$")
-_FRAME_TEMPLATE = "[HL{off}]"
 
-def _classify_piece(piece):
+def _fits(kind, text):
 
-    if piece == _FRAME_TEMPLATE:
-        return ("frame", None)
-    for ph, kind in _KIND_OF_PLACEHOLDER.items():
-        if ph in piece:
-            if piece != ph:
-                raise LoaderError(f"template operand {piece!r} mixes a placeholder with "
-                                  "other text, which the shape table cannot represent")
-            return (kind, None)
-    if piece == "r?" or _REG_RE.match(piece):
-        return ("reg", None)
-    if _MEM_RE.match(piece):
-        return ("mem", piece)
-    if piece == "[HL*]" or _FRAME_RE.match(piece):
-        return ("frame", None)
-    return ("fixed", piece)
+    return isa_forms.fits(kind, text, value_loose=True)
 
-def _generalise(piece):
+def match_line(name, args, lineno, text):
 
-    out = re.sub(r"\br[0-3]\b", "r?", piece)
-    out = out.replace("{rcanon}", "r?")
-    out = re.sub(r"\[HL\s*(?:[+-]\s*[^\]]+)?\]", "[HL*]", out)
-    return out
-
-def _shape_element(spec):
-
-    kind, fixed = spec
-    if kind == "fixed":
-        return _generalise(fixed)
-    if kind == "mem":
-        return fixed
-    return kind
-
-def build_shapes():
-
-    rows = [(tmpl, size, op) for op, (tmpl, size) in disasm.SINGLE.items()]
-    rows += [(tmpl, size, 0x7000 | sub) for sub, (tmpl, size) in disasm.ESC.items()]
-    groups = {}
-    for tmpl, size, cp in rows:
-        name, _, rest = tmpl.partition(" ")
-        name = name.strip()
-        pieces = [p.strip() for p in rest.split(",")] if rest.strip() else []
-        specs = tuple(_classify_piece(p) for p in pieces)
-        key = (name, tuple(_shape_element(s) for s in specs))
-        got = groups.get(key)
-        if got is None:
-            groups[key] = [name, specs, size, [cp], tmpl]
-            continue
-        if got[2] != size:
-            raise LoaderError(f"operand shape {key!r} covers both a {got[2]}-byte encoding "
-                              f"({got[4]!r}) and a {size}-byte one ({tmpl!r})")
-        got[3].append(cp)
-    table = {}
-    for name, specs, size, cps, tmpl in groups.values():
-        table.setdefault(name, []).append((name, specs, size, tuple(cps), tmpl))
-    for v in table.values():
-        v.sort(key=lambda e: (-len(e[1]), e[3][0]))
-    return table
-
-SHAPES = build_shapes()
-
-def _match_operand(spec, user):
-
-    kind, fixed = spec
-    if kind == "fixed":
-        return user == fixed
-    if kind == "reg":
-        return bool(_REG_RE.match(user))
-    if kind == "mem":
-        return user == fixed or (fixed is None and bool(_MEM_RE.match(user)))
-    if kind == "frame":
-        return bool(_FRAME_RE.match(user.replace(" ", "")))
-    if kind in ("addr16", "imm8", "soff"):
-        return bool(user)
-    raise LoaderError(f"internal: unhandled operand kind {kind!r}")
-
-def _accepted(name):
-    if name not in SHAPES:
-        return "no such mnemonic"
-    return " | ".join(repr(e[4]) for e in sorted(SHAPES[name], key=lambda e: e[4]))
-
-_KIND_WORDS = {"reg": "register operand (want r0-r3)",
-               "mem": "memory operand (want [HL] or [DE])",
-               "frame": "frame operand (want [HL], [HL+i8] or [HL-i8])"}
-
-def _blame(name, args, lineno):
-
-    same_arity = [e for e in SHAPES.get(name, []) if len(e[1]) == len(args)]
-
-    for i, a in enumerate(args):
-        if re.fullmatch(r"r\d+", a) and not _REG_RE.match(a):
-            if any(e[1][i][0] == "reg" for e in same_arity):
-                return (f"{name} {', '.join(args)}: invalid register operand (want r0-r3) "
-                        f"{a!r} in position {i + 1}")
-    if len(same_arity) == 1:
-        specs = same_arity[0][1]
-        for i, (spec, a) in enumerate(zip(specs, args)):
-            if not _match_operand(spec, a):
-                word = _KIND_WORDS.get(spec[0])
-                if word is None:
-                    word = f"operand (must read {spec[1]!r})"
-                return (f"{name} {', '.join(args)}: invalid {word} {a!r} in position {i + 1}")
-    return (f"{name} {', '.join(args)}: matches no assigned encoding")
-
-def match_shape(name, args, lineno):
-
-    cands = []
-    for entry in SHAPES.get(name, []):
-        _n, specs, _size, _cp, _tmpl = entry
-        if len(specs) != len(args):
-            continue
-        if all(_match_operand(spec, a) for spec, a in zip(specs, args)):
-            cands.append(entry)
+    cands = [s for s in isa_forms.FORMS.get(name, ()) if len(s) == len(args)
+             and all(_fits(k, a) for k, a in zip(s, args))]
+    if len(cands) > 1:
+        raise LoaderError(f"{text!r}: matches several encodings {sorted(cands)}, the "
+                          "text is ambiguous", lineno)
     if not cands:
-        raise LoaderError(f"{_blame(name, args, lineno)}; accepted forms for {name!r}: "
-                          f"{_accepted(name)}", lineno)
-    kinds = {tuple(k for k, _ in e[1]) for e in cands}
-    if len(kinds) > 1:
-        raise LoaderError(f"{name} {', '.join(args)}: matches several encodings "
-                          f"{sorted(kinds)}, the text is ambiguous", lineno)
-    return cands[0]
+        _reason, pos, kind = isa_forms.blame(name, args)
+        detail = None
+        if kind in ("a16", "i16") and args[pos].strip() in isa_forms.RESERVED:
+            detail = f"{args[pos].strip()!r} names a register or pointer, not a target"
+        raise LoaderError(isa_forms.refusal(name, args, text, detail), lineno)
+    return cands[0], [a.strip() for a in args]
 
-def resolve_line(name, args, lineno):
+def shape_size(shape_name):
 
-    try:
-        return match_shape(name, args, lineno), list(args)
-    except LoaderError:
-        if args:
-            raise
-        cands = [e for e in SHAPES.get(name, []) if all(k == "fixed" for k, _ in e[1])]
-        if len(cands) != 1:
-            raise LoaderError(f"{name}: matches no assigned encoding; accepted forms for "
-                              f"{name!r}: {_accepted(name)}", lineno)
-        return cands[0], [f for _k, f in cands[0][1]]
+    return _SHAPE_ENCODING[shape_name]
 
-def _render_operand(spec, text, symbols, lineno, name):
+def _render_operand(kind, text, symbols, lineno, name):
 
-    kind = spec[0]
-    if kind in ("fixed", "reg", "mem"):
-        return text
-    if kind == "frame":
+    if kind in _PASSTHROUGH:
+        return text.strip()
+    if kind == _FRAME:
         m = _FRAME_RE.match(text.replace(" ", ""))
+        if not m:
+            raise LoaderError(f"{name} needs an [HL+i8] address operand, {text!r} is "
+                              "not one", lineno)
         sign, num = m.group(1), m.group(2)
         if num is None:
             return "[HL]"
@@ -409,21 +297,25 @@ def _render_operand(spec, text, symbols, lineno, name):
             raise LoaderError(f"{name} frame offset {v} is outside -128..127 "
                               f"in {text!r}", lineno)
         return "[HL]" if v == 0 else f"[HL{v:+d}]"
-    if kind in ("imm8", "soff"):
+    if kind in ("i8", "soff", "k"):
         _reject_address_symbols(text, symbols, lineno, name, kind)
     v = evaluate(text, symbols.flat(), lineno)
-    if kind == "addr16":
+    if kind in ("a16", "i16"):
         if not 0 <= v <= 0xFFFF:
-            raise LoaderError(f"{name} address {v} is outside 0..65535 in {text!r}", lineno)
-        return f"0x{v:04X}"
-    if kind == "imm8":
-        if not 0 <= v <= 0xFF:
-            raise LoaderError(f"{name} immediate {v} is outside 0..255 in {text!r}", lineno)
-        if name == "EXT" and v >= VEC_COUNT:
-            raise LoaderError(f"EXT {v}: the trap vector table holds indices "
-                              f"0..{VEC_COUNT - 1}, so this code point can never be "
-                              f"dispatched (write the bytes with .byte if that is intended)",
+            raise LoaderError(f"{name} address {v} is outside 0..65535 in {text!r}",
                               lineno)
+        return f"0x{v:04X}"
+    if kind == "i8":
+        if not 0 <= v <= 0xFF:
+            raise LoaderError(f"{name} immediate {v} is outside 0..255 in {text!r}",
+                              lineno)
+        return f"0x{v:02X}"
+    if kind == "k":
+        if not 0 <= v < VEC_COUNT:
+            raise LoaderError(f"{name} {v}: the trap vector table holds indices "
+                              f"0..{VEC_COUNT - 1}, so this code point can never be "
+                              f"dispatched (write the bytes with .byte if that is "
+                              "intended)", lineno)
         return f"0x{v:02X}"
     if kind == "soff":
         if not -128 <= v <= 127:
@@ -686,9 +578,10 @@ def assemble(src, *, vectors=None, window=None, image=None, entry=None):
             pc += n
             continue
         name, args = it.payload
-        shape, _operands = resolve_line(name, args, it.lineno)
-        sizes.append((it, shape[2]))
-        pc += shape[2]
+        shape, _operands = match_line(name, args, it.lineno, it.text)
+        size = shape_size((name, shape))[0]
+        sizes.append((it, size))
+        pc += size
 
     out, origins, blocks = {}, {}, []
     hi_water = 0
@@ -736,10 +629,10 @@ def assemble(src, *, vectors=None, window=None, image=None, entry=None):
             pc += len(data)
             continue
         name, args = it.payload
-        shape, operands = resolve_line(name, args, it.lineno)
-        _n, specs, size, cps, _tmpl = shape
-        rendered = [_render_operand(spec, a, symbols, it.lineno, name)
-                    for spec, a in zip(specs, operands)]
+        shape, operands = match_line(name, args, it.lineno, it.text)
+        size, cps = shape_size((name, shape))
+        rendered = [_render_operand(k, a, symbols, it.lineno, name)
+                    for k, a in zip(shape, operands)]
         text = name if not rendered else f"{name} {', '.join(rendered)}"
         try:
             data = asm(text)

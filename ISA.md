@@ -99,6 +99,18 @@ pops and pointer increments leave them untouched. `GETF` returns flags packed as
 
 Fields do not overlap. `f = (r << 2) | s` with `r`, `s` in 0-3.
 
+Which spellings the assembler accepts is stated once, in `isa_forms.FORMS`: one entry per
+mnemonic, each a list of operand shapes, and a line is legal only when one of its mnemonic's
+shapes matches it with every argument consumed. Both front ends consult that table -- the one
+that turns text into bytes, and the loader that decides whether a line is legal before it
+evaluates an operand's expression -- so the two cannot disagree about which instructions
+exist. Addressing modes are operand kinds of their own, never variants folded into a register
+kind. The table is checked against the assignments below: `python3 isa_forms.py` proves that
+every assigned code point is claimed by exactly one shape, that every shape is backed by an
+assigned code point, that operand bytes account for each shape's declared length, and that the
+matcher accepts each shape's own spelling with no ambiguity. A refusal quotes the forms the
+table gives for that mnemonic rather than inventing one.
+
 ### 4.1 Control and 16-bit operands (0x00-0x1F)
 
 | code | mnemonic | effect | flags |

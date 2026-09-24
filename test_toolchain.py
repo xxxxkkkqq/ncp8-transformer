@@ -28,6 +28,8 @@ import sys
 
 import debug
 import disasm
+import golden_sim
+import isa_forms
 import isa_table as ISA
 import loader
 import profiler
@@ -118,7 +120,7 @@ def expected_operand_encodings():
 
 def expected_flag_and_fold_keys():
 
-    flagged, folds = set(), set()
+    flagged, folds, refused = set(), set(), set()
     for cp, (tmpl, size) in disasm.SINGLE.items():
         if "{rcanon}" in tmpl and size == 2:
             folds.update((cp, imm) for imm in IMMS if imm > REG_FIELD_MAX)
@@ -126,8 +128,10 @@ def expected_flag_and_fold_keys():
     for sub, (tmpl, size) in disasm.ESC.items():
         if "{k}" in tmpl and size == 3:
             key = disasm.codepoint(0x70, sub)
-            flagged.update((key, imm) for imm in IMMS if imm >= loader.VEC_COUNT)
-    return flagged, folds
+            past = {(key, imm) for imm in IMMS if imm >= loader.VEC_COUNT}
+            flagged.update(past)
+            refused.update(past)
+    return flagged, folds, refused
 
 def sweep_images():
 
@@ -151,7 +155,8 @@ def test_round_trip_all_encodings():
     combos = 0
     flagged_seen = set()
     folded = {}
-    want_flagged, want_folded = expected_flag_and_fold_keys()
+    undispatched = {}
+    want_flagged, want_folded, want_undispatched = expected_flag_and_fold_keys()
     tables = [(None, disasm.SINGLE), (0x70, disasm.ESC)]
     for prefix, table in tables:
         for cp in sorted(table):
@@ -179,6 +184,14 @@ def test_round_trip_all_encodings():
                         f"consume the whole encoding")
                 if non_canonical:
                     flagged_seen.add((key, imm))
+                if (key, imm) in want_undispatched:
+                    again = refuses(lambda: asm(text))
+                    require(again is not None and "trap vector table" in again
+                            and f"0..{loader.VEC_COUNT - 1}" in again,
+                            f"{img.hex()} -> {text!r} was not refused as undispatchable: "
+                            f"{again}")
+                    undispatched[(key, imm)] = (img, text)
+                    continue
                 again = refuses(lambda: asm(text))
                 require(again is None, f"{img.hex()} -> {text!r} will not assemble: {again}")
                 back = asm(text)
@@ -211,12 +224,20 @@ def test_round_trip_all_encodings():
             f"don't-care field predicts: unexpected ["
             f"{pair_labels(set(folded) - want_folded)}], missing ["
             f"{pair_labels(want_folded - set(folded))}]")
-    print(f"  asm->disasm->asm byte-exact on {combos - len(folded)}/{combos} combinations "
+    require(set(undispatched) == want_undispatched,
+            f"the renderings the assembler refused are not the set past the vector "
+            f"table: unexpected [{pair_labels(set(undispatched) - want_undispatched)}], "
+            f"missing [{pair_labels(want_undispatched - set(undispatched))}]")
+    print(f"  asm->disasm->asm byte-exact on "
+          f"{combos - len(folded) - len(undispatched)}/{combos} combinations "
           f"over {ASSIGNED} assigned encodings ({ASSIGNED_SINGLE} single-byte, "
           f"{ASSIGNED_ESC} escape), operand set {tuple(hex(v) for v in IMMS)}; the "
           f"{len(folded)} others, each one flagged and folded to a form that round trips: "
           + ", ".join(f"{img.hex()} -> {back.hex()}" for img, _t, back
-                      in (folded[k] for k in sorted(folded))))
+                      in (folded[k] for k in sorted(folded)))
+          + f"; the {len(undispatched)} others refused because no trap vector slot holds"
+          ": " + ", ".join(f"{img.hex()} -> {text!r}" for img, text
+                           in (undispatched[k] for k in sorted(undispatched))))
 
 def test_zero_operand_swept():
 
@@ -806,10 +827,10 @@ def test_configuration_shaped_bytes_in_code_configure_nothing():
           "leave STC refused by WINDOW where the declaration allows the same write, "
           "and a table appended past the buffer faults like one that is absent")
 
-SHAPE_ONLY_HOLES = ("STC nonsense, r0", "ADD HL, r0", "XCHG DE, HL", "HALT r0",
-                    "STC [HL]", "LDI")
+CLOSED_SHAPE_HOLES = ("STC nonsense, r0", "ADD HL, r0", "XCHG DE, HL", "HALT r0",
+                      "STC [HL]", "LDI")
 
-SYMBOL_ONLY_HOLES = ("x:\nx:\nHALT",)
+CLOSED_SYMBOL_HOLES = ("x:\nx:\nHALT",)
 
 def test_loader_directives():
     r = loader.assemble(""".equ SLOT, 0x0040
@@ -865,11 +886,11 @@ def test_loader_refuses_bad_source():
         ("  ADD SP, 128\n", "-128..127", None),
 
         ("  STC nonsense, r0\n", "invalid memory operand", "nonsense"),
-        ("  ADD HL, r0\n", "matches no assigned encoding", "ADD"),
-        ("  XCHG DE, HL\n", "invalid operand (must read", "position 1"),
-        ("  HALT r0\n", "matches no assigned encoding", "HALT"),
-        ("  STC [HL]\n", "matches no assigned encoding", None),
-        ("  LDI\n", "matches no assigned encoding", None),
+        ("  ADD HL, r0\n", "invalid pointer operand", "ADD"),
+        ("  XCHG DE, HL\n", "invalid pointer operand", "position 1"),
+        ("  HALT r0\n", "HALT takes 0 operands", "HALT"),
+        ("  STC [HL]\n", "STC takes 2 operands", None),
+        ("  LDI\n", "LDI takes 2 operands", None),
         ("main:\n  LDI r0, main\n", "is a label", "main"),
         ("main:\n  EXT main\n", "is a label", "main"),
         ("main:\n  LDX r0, [HL+main]\n", "is a label", "main"),
@@ -899,31 +920,37 @@ def test_loader_refuses_bad_source():
                                                        f"{ex.image[1:4].hex()}")
 
     let_through = {}
-    for s, frag, _extra in cases:
+    for src, frag, _extra in cases:
         if not frag:
             continue
-        out = refuses(asm, s.strip())
+        out = refuses(asm, src.strip())
         if out is None or not out.startswith("AssemblyError"):
-            let_through[s.strip()] = out
-    require(sorted(let_through) == sorted(SHAPE_ONLY_HOLES + SYMBOL_ONLY_HOLES),
-            f"the sources the loader refuses and asm does not are now "
-            f"{sorted(let_through)}, expected "
-            f"{sorted(SHAPE_ONLY_HOLES + SYMBOL_ONLY_HOLES)}")
-    silent = sorted(s for s, out in let_through.items() if out is None
-                    and s in SHAPE_ONLY_HOLES)
-    unnamed = sorted(s for s, out in let_through.items() if out)
-    require(len(silent) == 4 and len(unnamed) == 2
-            and len(let_through) == len(SHAPE_ONLY_HOLES) + len(SYMBOL_ONLY_HOLES),
-            f"{len(silent)} of them asm encodes into another instruction and "
-            f"{len(unnamed)} it fails on with an error that names nothing")
-    refused_by_asm = sum(1 for s, frag, _x in cases if frag
-                         and (refuses(asm, s.strip()) or "").startswith("AssemblyError"))
-    named = sum(1 for _s, frag, _x in cases if frag)
+            let_through[src.strip()] = out
+    require(not let_through,
+            f"the loader refuses these and asm() does not, or does not refuse them "
+            f"cleanly: {sorted(let_through)}")
+    for spelling in CLOSED_SHAPE_HOLES:
+        msg = refuses(asm, spelling)
+        name = spelling.split(" ")[0]
+        require(msg is not None and msg.startswith("AssemblyError")
+                and f"{name} accepts " in msg,
+                f"asm() does not refuse {spelling!r} naming {name}'s accepted forms: {msg}")
+    dup = refuses(asm, CLOSED_SYMBOL_HOLES[0])
+    require(dup is not None and dup.startswith("AssemblyError")
+            and "defined twice" in dup and "line 2" in dup,
+            f"a label defined twice is not refused by name and line: {dup}")
+    refused_by_asm = sum(1 for src, frag, _x in cases if frag
+                         and (refuses(asm, src.strip()) or "").startswith("AssemblyError"))
+    named = sum(1 for _src, frag, _x in cases if frag)
+    require(refused_by_asm == named,
+            f"{named} bad sources are refused by the loader but only {refused_by_asm} by "
+            f"asm(): {sorted(let_through)}")
     print(f"  {named} bad sources refused with the line named and the {len(cases) - named} "
-          f"legal neighbours beside them accepted; {refused_by_asm} of the refusals are "
-          f"asm's own, and the {len(silent)} the shape table adds are ones asm encodes as "
-          f"something else ({', '.join(silent)}) or fails on unnamed "
-          f"({', '.join(unnamed)})")
+          f"legal neighbours beside them accepted; all {refused_by_asm} are asm's own "
+          f"refusals too, and the "
+          f"{len(CLOSED_SHAPE_HOLES) + len(CLOSED_SYMBOL_HOLES)} the shape table used to "
+          f"stand alone against ({', '.join(CLOSED_SHAPE_HOLES)}, and a label defined "
+          "twice) are refused by asm() with the accepted forms named")
 
 def test_loader_default_image_length():
 
@@ -1483,63 +1510,50 @@ def test_no_path_hacks_and_no_silent_except():
     print("  loader/disasm/profiler/debug import as siblings from anywhere, contain no "
           "absolute temp-path hack, no bare except and no bare-assert validation")
 
-def test_shape_table_agrees_with_the_decoder():
+def test_accepted_forms_agree_with_the_decoder():
 
     checked = 0
-    for name, shapes in sorted(loader.SHAPES.items()):
-        for entry in shapes:
-            _n, specs, size, cps, tmpl = entry
-            rendered = []
-            for spec in specs:
-                kind, fixed = spec
-                if kind == "fixed":
-                    rendered.append(fixed)
-                elif kind == "reg":
-                    rendered.append("r1")
-                elif kind == "mem":
-                    rendered.append(fixed)
-                elif kind == "frame":
-                    rendered.append("[HL+3]")
-                elif kind == "addr16":
-                    rendered.append("0x1234")
-                elif kind == "soff":
-                    rendered.append("-4")
-                elif kind == "imm8":
-                    rendered.append("3" if name == "EXT" else "0x55")
-                else:
-                    raise AssertionError(f"unhandled kind {kind}")
-            text = f"{name} {', '.join(rendered)}" if rendered else name
+    info = isa_forms.shape_info()
+    for name, shapes in sorted(isa_forms.FORMS.items()):
+        for shape in shapes:
+            args = [isa_forms.SAMPLE[k] for k in shape]
+            text = f"{name} {', '.join(args)}" if args else name
+            size, cps = info[(name, shape)]
             img = asm(text)
             require(len(img) == size, f"{text!r}: asm gave {len(img)} bytes, the shape "
-                                      f"table says {size} ({tmpl!r})")
+                                      f"covers {size}")
             row = disasm.decode(img, 0)
             require(row.size == size and row.assigned, f"{text!r} decoded as {row}")
             require(row.codepoint in cps, f"{text!r} decoded to 0x{row.codepoint:04X}, "
-                                          f"not one of {[hex(c) for c in cps]} from "
-                                          f"{tmpl!r}")
+                                          f"not one of {[hex(c) for c in cps]} claimed by "
+                                          f"{name} {shape}")
             checked += 1
-    require(len(loader.SHAPES) >= 40, f"only {len(loader.SHAPES)} mnemonics in the shape "
-                                      f"table")
-    print(f"  all {checked} canonical operand shapes assemble to a code point the "
-          f"decoder assigns them ({len(loader.SHAPES)} mnemonics)")
+    require(checked == sum(len(v) for v in isa_forms.FORMS.values()),
+            f"only {checked} of the accepted shapes were walked")
+    require(len(isa_forms.FORMS) >= 40,
+            f"only {len(isa_forms.FORMS)} mnemonics in the accepted-form table")
+    gaps = isa_forms.self_test(verbose=False)
+    require(not gaps, f"the accepted-form table disagrees with the decode table: "
+                      f"{gaps[:4]}")
+    require(not golden_sim._check_encodings(),
+            "the assembler's encoding table disagrees with the decode table")
+    print(f"  all {checked} accepted operand shapes ({len(isa_forms.FORMS)} mnemonics) "
+          f"assemble to a code point the decoder assigns them, and the table's claim set "
+          f"equals isa_table's {len(ISA.SINGLE) + len(ISA.ESCAPE)} assigned "
+          "encodings")
 
 def test_loader_and_asm_agree_on_every_instruction():
 
-    EXAMPLE = {"reg": "r2", "mem": "[DE]", "frame": "[HL]", "addr16": "0x0F05",
-               "soff": "0", "imm8": "0x02"}
-    shapes = sum(len(v) for v in loader.SHAPES.values())
-    for name, entries in sorted(loader.SHAPES.items()):
-        for entry in entries:
-            _n, specs, _size, _cps, _tmpl = entry
-            args = [f if k in ("fixed", "mem") else EXAMPLE[k] for k, f in specs]
-            if name == "EXT":
-                args = ["0"]
+    shapes = sum(len(v) for v in isa_forms.FORMS.values())
+    for name, shape_list in sorted(isa_forms.FORMS.items()):
+        for shape in shape_list:
+            args = [isa_forms.SAMPLE[k] for k in shape]
             text = f"{name} {', '.join(args)}" if args else name
             want = asm(text)
             got = loader.assemble(f"  {text}\n", image=max(len(want), 4)).image[:len(want)]
             require(got == want, f"{text!r}: loader placed {got.hex()}, asm emits "
                                  f"{want.hex()}")
-    print(f"  {shapes} canonical shapes place asm's own bytes, operand for operand")
+    print(f"  {shapes} accepted shapes place asm's own bytes, operand for operand")
 
 def main():
     print("NCP-8 toolchain acceptance (CPU only, no GPU, no circuits):")
@@ -1559,7 +1573,7 @@ def main():
         test_loader_directives,
         test_loader_refuses_bad_source,
         test_loader_default_image_length,
-        test_shape_table_agrees_with_the_decoder,
+        test_accepted_forms_agree_with_the_decoder,
         test_loader_and_asm_agree_on_every_instruction,
         test_profile_totals_match_the_machine,
         test_profile_rejects_source_text,

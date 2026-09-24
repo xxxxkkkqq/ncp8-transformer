@@ -188,7 +188,7 @@ if __name__ == "__main__":
             "PUSH r0\nPOP r1\nOUT r2\nIN r3",
             "GETPC r0\nGETSP r1\nGETF r2\nSHL r3\nSHR r0\nTST r1\nDJNZ r2, 0x0004",
             "DIV r1, r2\nMOD r3, r0\nCMP r0, r1\nNOT r2\nNEG r1\nROL r3\nROR r0",
-            "ADD HL, DE\nSUB HL, DE\nXCHG", "STC [HL], r0\nLDC r1, [HL]",
+            "ADD HL, DE\nSUB HL, DE\nXCHG HL, DE", "STC [HL], r0\nLDC r1, [HL]",
             "MOVW HL, SP\nMOVW SP, HL\nPUSHW HL\nPOPW DE\nSTW [HL], DE\nLDW HL, [DE]",
             "LDX r2, [HL+5]\nSTX [HL-8], r3\nLDX r0, [HL]\nADD SP, -4\nADD SP, 0",
             "MULH r1, r3\nMULH r0, r0\nEXT 3",

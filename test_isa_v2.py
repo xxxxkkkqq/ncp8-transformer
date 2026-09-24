@@ -321,7 +321,7 @@ def test_ptr16():
         g = NCP8(asm("SUB HL, DE\nHALT")); g.HL, g.DE = hl, de
         drive(g)
         assert g.HL == (hl - de) & 0xFFFF and g.C == int(hl < de), ("SUB HL,DE", hl, de)
-        g = NCP8(asm("XCHG\nHALT")); g.HL, g.DE = hl, de
+        g = NCP8(asm("XCHG HL, DE\nHALT")); g.HL, g.DE = hl, de
         drive(g)
         assert (g.HL, g.DE) == (de, hl), "XCHG"
     print("  16-bit pointers (ADD/SUB HL,DE with carry + XCHG)")

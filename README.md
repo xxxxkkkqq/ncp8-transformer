@@ -28,6 +28,7 @@ python3 isa_table.py                  # the decode table against the live ROMs a
 python3 test_isa_v2.py                # instruction semantics (reference only)
 python3 test_arithmetic_bounds.py     # bit-width / radix bounds, carry chains
 python3 test_asm_strictness.py        # assembler must refuse, never mis-encode
+python3 isa_forms.py                  # one accepted-form table, checked against the encodings
 python3 test_circuit_equivalence.py   # both circuits vs reference, all 256 opcodes
 python3 test_isa_v2_equivalence.py    # escape subcode space + program lockstep
 python3 test_error_atomicity.py       # every bound case, on the reference too

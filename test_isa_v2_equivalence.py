@@ -275,7 +275,7 @@ zero:
     n = _lockstep(Machine, "extended arithmetic", asm(prog), expect=bytes([0xB9, 0x25, 0x00, 0x03, 0x01]))
     print(f"[{name}] extended arithmetic program lockstep {n} ticks (MUL/DIV/MOD/bitwise/rotate/CMP output matches)")
 
-    n = _lockstep(Machine, "pointer family", asm("LDI HL, 100\nLDI DE, 7\nADD HL, DE\nSUB HL, DE\nXCHG\nOUTDE\nHALT"),
+    n = _lockstep(Machine, "pointer family", asm("LDI HL, 100\nLDI DE, 7\nADD HL, DE\nSUB HL, DE\nXCHG HL, DE\nOUTDE\nHALT"),
                   data=bytes(range(256)), expect=bytes([100]))
     print(f"[{name}] 16-bit pointer family lockstep {n} ticks (ADD/SUB HL,DE + XCHG)")
 
