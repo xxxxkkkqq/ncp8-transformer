@@ -12,8 +12,12 @@ implementations as they are actually loaded, and reports the escape subcodes sti
 
 The fault causes live here too: `FAULT_CAUSES` numbers every cause a machine can name
 (dense from 0, where 0 means no fault) and `FAULT_SITE_ORDER` states the sites in
-precedence order, so the tick that stops a machine names exactly one cause and every
-implementation reads that order from this module rather than restating it.
+precedence order, so the tick that stops a machine names exactly one cause. The order is
+*a statement* here, not a driver: each implementation sequences its own checks, and the
+claim that all three sequence them the way this table lists them is held by a searched
+sweep over code points and bound values, not by construction. Reordering a check inside
+an implementation, or a row in this table, is a change to the contract and has to be
+shown by that sweep.
 `fault_state_error` is the single legality rule the three `check_state()`s share: widths,
 cause-in-table, and the pairing `fault_reason != 0` if and only if `status == 3`.
 
