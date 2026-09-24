@@ -37,43 +37,93 @@ import triton
 import triton.language as tl
 from typing import NamedTuple
 
+import isa_table as ISA
+
 DATA_SIZE = 4096
 CODE_SIZE = 4096
 OUT_CAP = 8192
 
-ESC_DIV = tl.constexpr(0x100)
-ESC_MOD = tl.constexpr(0x101)
-ESC_CMP = tl.constexpr(0x102)
-ESC_NOT = tl.constexpr(0x103)
-ESC_NEG = tl.constexpr(0x104)
-ESC_ROL = tl.constexpr(0x105)
-ESC_ROR = tl.constexpr(0x106)
-ESC_ADD_HLDE = tl.constexpr(0x107)
-ESC_SUB_HLDE = tl.constexpr(0x108)
-ESC_XCHG = tl.constexpr(0x109)
-ESC_EXT = tl.constexpr(0x10A)
-ESC_STC = tl.constexpr(0x10B)
-ESC_LDC = tl.constexpr(0x10C)
-ESC_BAD = tl.constexpr(0x10D)
+ESCAPE_PREFIX = tl.constexpr(ISA.ESCAPE_PREFIX)
+PREFIX_BYTES = tl.constexpr(ISA.PREFIX_BYTES)
+_ESC_EOP_BASE = tl.constexpr(ISA.ESC_EOP_BASE)
 
-ESC_MOVW_HL_DE = tl.constexpr(0x10E)
-ESC_MOVW_DE_HL = tl.constexpr(0x10F)
-ESC_MOVW_HL_SP = tl.constexpr(0x110)
-ESC_MOVW_DE_SP = tl.constexpr(0x111)
-ESC_MOVW_SP_HL = tl.constexpr(0x112)
-ESC_MOVW_SP_DE = tl.constexpr(0x113)
-ESC_PUSHW_HL = tl.constexpr(0x114)
-ESC_PUSHW_DE = tl.constexpr(0x115)
-ESC_POPW_HL = tl.constexpr(0x116)
-ESC_POPW_DE = tl.constexpr(0x117)
-ESC_STW_HLDE = tl.constexpr(0x118)
-ESC_STW_DEHL = tl.constexpr(0x119)
-ESC_LDW_DEHL = tl.constexpr(0x11A)
-ESC_LDW_HLDE = tl.constexpr(0x11B)
-ESC_LDX = tl.constexpr(0x11C)
-ESC_STX = tl.constexpr(0x11D)
-ESC_ADD_SP = tl.constexpr(0x11E)
-ESC_MULH = tl.constexpr(0x11F)
+def _escape_effective_opcodes():
+
+    return {("ESC_" + name): tl.constexpr(v)
+            for name, v in sorted(ISA.ESC_EOP_ID.items())}
+
+globals().update(_escape_effective_opcodes())
+
+class DecodeTableMismatch(Exception):
+
+    pass
+
+def _check_decode_against_table():
+
+    alu1, s01, s11, ln1 = ISA.single_rom()
+    alu2, s02, s12, lx2 = ISA.escape_rom()
+    bad = []
+    for op in range(256):
+        eop, d, s, ln = (int(v) for v in _dec_first.fn(op))
+        if eop != op:
+            bad.append(f"single {op:#04x}: effective opcode {eop:#x}, table {op:#x}")
+        for field, got, want in (("s0", d, s01[op]), ("s1", s, s11[op]),
+                                 ("length", ln, ln1[op])):
+            if got != want:
+                bad.append(f"single {op:#04x}: {field} {got}, table {want}")
+    for sub in range(256):
+        eop, d, s, lx = (int(v) for v in _dec_esc.fn(sub))
+        row = ISA.ESCAPE.get(sub)
+        want_eop = ISA.ESC_EOP_ID["BAD" if row is None else row["alu"]]
+        if eop != want_eop:
+            bad.append(f"escape {sub:#04x}: effective opcode {eop:#x}, table {want_eop:#x}")
+        for field, got, want in (("s0", d, s02[sub]), ("s1", s, s12[sub]),
+                                 ("extra bytes", lx, lx2[sub])):
+            if got != want:
+                bad.append(f"escape {sub:#04x}: {field} {got}, table {want}")
+    for name, val in sorted(ISA.ESC_EOP_ID.items()):
+        live = int(globals()["ESC_" + name])
+        if live != val:
+            bad.append(f"escape id {name}: kernel {live:#x}, table {val:#x}")
+    if bad:
+        raise DecodeTableMismatch(
+            "the Triton decode disagrees with isa_table on "
+            f"{len(bad)} field(s): " + "; ".join(bad[:8]))
+
+@triton.jit
+def _dec_first(op):
+
+    eop = op
+    d = 0
+    s = 0
+    ln = 1
+    if op <= 0x08:
+        pass
+    elif op <= 0x10:
+        ln = 3
+    elif op <= 0x12:
+        ln = 2
+    elif op == 0x13:
+        pass
+    elif op <= 0x1F:
+        d = op & 3; s = op & 3
+    elif op <= 0x5F:
+        d = (op >> 2) & 3; s = op & 3
+    elif op <= 0x6B:
+        d = op & 3; s = op & 3
+    elif op <= 0x6F:
+        d = op & 3; s = op & 3; ln = 3
+    elif op == ESCAPE_PREFIX:
+        ln = PREFIX_BYTES
+    elif op <= 0x7F:
+        pass
+    elif op <= 0xCF:
+        d = (op >> 2) & 3; s = op & 3
+    elif op <= 0xDF:
+        d = op & 3; s = op & 3; ln = 2
+    else:
+        d = op & 3; s = op & 3
+    return eop, d, s, ln
 
 def _power_of_two_or_die(name, size):
 
@@ -150,6 +200,8 @@ def _dec_esc(sub):
         eop = ESC_BAD; d = 0; s = 0; lx = 0
     return eop, d, s, lx
 
+_check_decode_against_table()
+
 @triton.jit
 def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
 
@@ -174,17 +226,16 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
 
     if PC < CODELEN:
         op = tl.load(CODE + PC)
-        eop = op
-        ed = op & 3
-        es = op & 3
-        if op == 0x70:
+        eop, ed, es, elen = _dec_first(op)
+        nPC = PC + elen
+        if op == ESCAPE_PREFIX:
 
-            if PC + 2 > CODELEN:
+            if PC + elen > CODELEN:
                 err = 1
             else:
                 sub = tl.load(CODE + PC + 1)
                 eop, ed, es, elx = _dec_esc(sub)
-                elen = 2 + elx
+                elen = PREFIX_BYTES + elx
                 nPC = PC + elen
                 if PC + elen > CODELEN:
 
@@ -221,45 +272,45 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                     nPC = (tl.load(DATA + SP) << 8) | tl.load(DATA + SP + 1)
                     nSP = SP + 2
             elif eop >= 0x09 and eop <= 0x0D:
-                if PC + 3 > CODELEN:
+                if PC + elen > CODELEN:
                     err = 1
                 else:
                     t = tl.load(CODE + PC + 1) | (tl.load(CODE + PC + 2) << 8)
                     if eop == 0x09:
                         nPC = t
                     elif eop == 0x0A:
-                        nPC = t if Z == 1 else PC + 3
+                        nPC = t if Z == 1 else PC + elen
                     elif eop == 0x0B:
-                        nPC = t if Z == 0 else PC + 3
+                        nPC = t if Z == 0 else PC + elen
                     elif eop == 0x0C:
-                        nPC = t if C == 1 else PC + 3
+                        nPC = t if C == 1 else PC + elen
                     else:
-                        nPC = t if C == 0 else PC + 3
+                        nPC = t if C == 0 else PC + elen
             elif eop == 0x0E:
-                if SP < 2 or PC + 3 > CODELEN:
+                if SP < 2 or PC + elen > CODELEN:
                     err = 1
                 else:
                     t = tl.load(CODE + PC + 1) | (tl.load(CODE + PC + 2) << 8)
-                    ret = PC + 3
+                    ret = PC + elen
                     A1 = SP - 1; V1 = ret & 0xFF; E1 = 1
                     A2 = SP - 2; V2 = (ret >> 8) & 0xFF; E2 = 1
                     nSP = SP - 2; nPC = t
             elif eop == 0x0F or eop == 0x10:
-                if PC + 3 > CODELEN:
+                if PC + elen > CODELEN:
                     err = 1
                 else:
                     t = tl.load(CODE + PC + 1) | (tl.load(CODE + PC + 2) << 8)
-                    nPC = PC + 3
+                    nPC = PC + elen
                     if eop == 0x0F:
                         nHL = t
                     else:
                         nDE = t
             elif eop == 0x11 or eop == 0x12:
-                if PC + 2 > CODELEN:
+                if PC + elen > CODELEN:
                     err = 1
                 else:
                     rs = _get4(r0, r1, r2, r3, tl.load(CODE + PC + 1) & 3)
-                    nPC = PC + 2
+                    nPC = PC + elen
                     if eop == 0x11:
                         nHL = (HL + rs) & 0xFFFF
                     else:
@@ -318,12 +369,12 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 err = 1
             nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
         elif eop >= 0xD0 and eop <= 0xDF:
-            if PC + 2 > CODELEN:
+            if PC + elen > CODELEN:
                 err = 1
             else:
                 i8 = tl.load(CODE + PC + 1)
                 rr = _get4(r0, r1, r2, r3, eop & 3)
-                nPC = PC + 2
+                nPC = PC + elen
                 if eop <= 0xD3:
                     v = i8
                 elif eop <= 0xD7:
@@ -345,12 +396,12 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 nZ = (rr == 0).to(tl.int32)
                 v = rr
             else:
-                if PC + 3 > CODELEN:
+                if PC + elen > CODELEN:
                     err = 1
                 else:
                     t = tl.load(CODE + PC + 1) | (tl.load(CODE + PC + 2) << 8)
                     v = (rr - 1) & 255
-                    nPC = PC + 3
+                    nPC = PC + elen
                     if v != 0:
                         nPC = t
             nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
@@ -396,7 +447,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 else:
                     v = 0; nC = 1
             nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
-        elif eop >= 0x100:
+        elif eop >= _ESC_EOP_BASE:
 
             if eop == ESC_DIV or eop == ESC_MOD:
                 a = _get4(r0, r1, r2, r3, ed)
@@ -454,7 +505,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 nDE = HL
             elif eop == ESC_EXT:
 
-                if PC + 3 > CODELEN:
+                if PC + elen > CODELEN:
                     err = 1
                 else:
                     k = tl.load(CODE + PC + 2)
@@ -466,7 +517,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                         if tgt == 0 or SP < 2:
                             err = 1
                         else:
-                            ret = PC + 3
+                            ret = PC + elen
                             A1 = SP - 1; V1 = ret & 0xFF; E1 = 1
                             A2 = SP - 2; V2 = (ret >> 8) & 0xFF; E2 = 1
                             nSP = SP - 2; nPC = tgt
@@ -899,6 +950,7 @@ class TritonCircuit:
         b.CODE[0].copy_(self.CODE)
         b.CODELENS[0] = self.codelen
         b.DATA[0].copy_(self.DATA)
+        b.OUTBUF[0].copy_(self.OUTBUF)
         b.INPUTS[0, :self.INP.numel()].copy_(self.INP)
         b.INLENS[0] = self.inlen
         b.BUDGETS[0] = self.tb

@@ -459,6 +459,26 @@ def test_d6_assembly_error_is_not_a_machine_error():
     print("  D6 AssemblyError is decoupled from MachineError: a run's error handler cannot"
           " swallow a bad program text")
 
+def test_d7_resident_path_carries_the_stream_in():
+
+    prog = bytes([0xD0, 0xA5, 0xF8, 0xF8, 0x00])
+    ref = NCP8(prog)
+    ref.run()
+    want = bytes(ref.out)
+    for steps in (0, 1, 2, 3):
+        m = TritonCircuit(prog)
+        for _ in range(steps):
+            m.step()
+        got = bytes(m.run_resident())
+        assert got == want, (f"run_resident() after {steps} step() calls produced "
+                             f"{got.hex()}, the per-tick path and the reference produce "
+                             f"{want.hex()}")
+        assert int(m.snapshot()["oplen"]) == len(want), (
+            f"after {steps} steps the state reports {int(m.snapshot()['oplen'])} output "
+            f"bytes while the stream holds {len(want)}")
+    print("  D7 resident path: stepping then run_resident() keeps the bytes already "
+          "emitted, for every split point of a two-byte stream")
+
 CHECKS = (
     test_d1_register_write_port_masks,
     test_d1_width_conformance_on_the_bundled_programs,
@@ -479,6 +499,7 @@ CHECKS = (
     test_d5_batch_and_resident_report_the_overflow,
     test_d6_validation_survives_python_O,
     test_d6_assembly_error_is_not_a_machine_error,
+    test_d7_resident_path_carries_the_stream_in,
 )
 
 def run_all():
