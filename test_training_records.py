@@ -171,6 +171,17 @@ def main():
     check("a registered emitter rebuilds a record tagged with its prefix",
           not R.emitter_problems(tagged) and calls == [tagged["text"]],
           str(R.emitter_problems(tagged)))
+    before = len(calls)
+    by_tag = R.label({"kind": "rl", "text": good["text"], "input": "",
+                      "initial_data": "", "budget": good["budget"],
+                      "config": good["config"],
+                      "compiler_identity": {**good["compiler_identity"],
+                                            "ncl_version": "probe-tag"}})
+
+    check("a label with no code and no hook compiles through the tagged emitter",
+          by_tag["code"] == good["code"] and len(calls) - before == 2
+          and set(calls[before:]) == {good["text"]},
+          f"{by_tag['code']} vs {good['code']}, {len(calls) - before} calls")
     for collide in ("probe-x", "asm-"):
         try:
             R.register_emitter(collide, probe_emit)

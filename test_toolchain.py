@@ -7,10 +7,15 @@ count. Coverage is asserted as set equality against the decode tables, so a swee
 visits the wrong members of the encoding space fails even when it visits the right number
 of them.
 
-Also checked: the debugger's replay fails on a tampered frame, a tampered pre-state, a
-tampered write set and a dropped frame; a recording that stopped at its step cap replays
-exactly; input validation behaves identically under `python` and `python -O`; and no
-module in this package reaches outside its own directory to import a sibling.
+Also checked: a layout stated twice - as placed bytes with a hand-written
+configuration block and as source with directives - builds one machine, byte for byte,
+block for block, and tick for tick; bytes at the addresses configuration used to occupy
+configure nothing, so the declaration is what dispatches a trap and what permits a code
+write; the debugger's replay fails on a tampered frame, a tampered pre-state, a tampered
+write set and a dropped frame; a recording that stopped at its step cap replays exactly,
+and one that lost its block does not; input validation behaves identically under `python`
+and `python -O`; and no module in this package reaches outside its own directory to
+import a sibling.
 
 Run: python3 test_toolchain.py     (also under -O)
 """
@@ -23,10 +28,11 @@ import sys
 
 import debug
 import disasm
+import isa_table as ISA
 import loader
 import profiler
 from golden_sim import (AssemblyError, CODE_SIZE, DATA_SIZE, MachineError, NCP8,
-                          STATUS_ERROR, asm)
+                          STATUS_ERROR, STATUS_RUNNING, asm)
 
 IMMS = (0x00, 0x01, 0x7F, 0x80, 0xFF)
 A16_HIGH = 0x80
@@ -433,13 +439,40 @@ handler:
     r = loader.assemble(src, vectors={0: "handler"}, window=(0x00, 0x08), entry="main")
     require(r.vectors == {0: r.symbols["handler"]}, f"vector table {r.vectors} vs symbols "
                                                     f"{r.symbols}")
-    lo = loader.VEC_BASE
-    cell = int.from_bytes(r.image[lo:lo + 2], "little")
-    require(cell == r.symbols["handler"], f"CODE[0x0F00] holds {cell:#06x}, want "
-                                          f"{r.symbols['handler']:#06x}")
-    require(r.image[loader.WINDOW_LO_CELL] == 0x00 and r.image[loader.WINDOW_HI_CELL] == 0x08,
-            "window bounds not at 0x0F20/0x0F21")
-    require(len(r.image) >= 0x0F22, f"image with tables is only {len(r.image)} bytes")
+    cfg = r.config()
+    require(cfg.vec[0] == r.symbols["handler"], f"the block declares vector 0 as "
+                                                 f"{cfg.vec[0]:#06x}, want "
+                                                 f"{r.symbols['handler']:#06x}")
+    require((cfg.winlo, cfg.winhi) == (0x00, 0x08),
+            f"the block declares the window as {(cfg.winlo, cfg.winhi)}")
+    require(cfg.codelen == r.content_extent == 10,
+            f"the block declares CODELEN {cfg.codelen} for {r.content_extent} bytes of "
+            f"content")
+    require(len(r.image) >= r.content_extent,
+            f"the {len(r.image)}-byte buffer is shorter than its content")
+
+    off = loader.assemble("  LDI r0, 1\n  CLC\n")
+    require(off.content_extent == 3 and len(off.image) > 3,
+            f"a 3-byte load got content {off.content_extent} in {len(off.image)} bytes")
+    import golden_sim as G
+    from circuit_torch import TorchCircuit
+    from circuit_triton import TritonCircuit
+    seen = {}
+    g = off.to_machine()
+    try:
+        g.run()
+    except G.MachineError:
+        pass
+    seen["reference"] = (G.STATUS_CODE[g.status], g.fault_reason)
+    for name, cls in (("torch", TorchCircuit), ("triton", TritonCircuit)):
+        c = cls(off.image, tick_budget=8, config=off.config())
+        c.run()
+        snap = c.snapshot()
+        seen[name] = (int(snap["status"]), int(snap["fault_reason"]))
+    require(len(set(seen.values())) == 1 and seen["reference"][0] == 3,
+            f"falling off the content is not one outcome on all three: {seen}")
+    print("  the padded tail is unreachable: running past the content is one fault on all "
+          "three paths")
     g = r.to_machine()
     g.r[0] = 41
     g.run()
@@ -449,87 +482,51 @@ handler:
     require("vector" in r.summary() and "window" in r.summary(),
             f"the report does not say what was placed:\n{r.summary()}")
     require(loader.describe(r) == r.summary(), "describe() is not the load report")
-    require(r.content_extent == 10 and r.needed == 0x0F22,
+    require(r.content_extent == 10 and r.needed == 10,
             f"content {r.content_extent} bytes, needing {r.needed}")
-    require(r.origins[loader.VEC_BASE].startswith("vector 0 -> 0x0007"),
-            f"the origin of the vector cell is {r.origins[loader.VEC_BASE]!r}")
-    require(r.origins[loader.WINDOW_LO_CELL].startswith("window lo -> "),
-            f"the origin of the window cell is {r.origins[loader.WINDOW_LO_CELL]!r}")
+    require(loader.VEC_COUNT == 16, f"the loader thinks there are {loader.VEC_COUNT} traps")
     require(r.entry_explicit is True and loader.assemble("  HALT\n").entry_explicit is False,
             "the result does not say whether the entry was given or defaulted")
-    print("  vectors={0:'handler'} lands at CODE[0x0F00] and window=(0,8) at 0x0F20/21; "
-          "the image runs and the trap returns 42")
+    print("  vectors={0:'handler'} and window=(0,8) reach the machine through the block; "
+          "the image is only program, and the trap returns 42")
 
-def test_loader_refuses_unreadable_abi():
-
-    src = "  EXT 0\n  HALT\n  .org 0x10\nh:\n  ADDI r0, 1\n  RET\n"
-
-    msg = refuses(loader.assemble, src, vectors={0: "h"}, image=loader.VEC_BASE + 1)
-    require(msg is not None and "LoaderError" in msg, f"short image accepted: {msg}")
-    for frag in ("vector 0", "0x0F00", "3841", "unregistered"):
-        require(frag in msg, f"the refusal message lacks {frag!r}: {msg}")
-
-    ok = loader.assemble(src, vectors={0: "h"}, image=loader.MIN_IMAGE_FOR_VECTORS)
-    require(ok.image[loader.VEC_BASE:loader.VEC_BASE + 2] == b"\x10\x00",
-            "the accepted image does not carry the vector")
-
-    msg = refuses(loader.assemble, "  HALT\n", window=(0x00, 0x08), image=0x0F21)
-    require(msg is not None and "outside window" in msg, f"short window image accepted: "
-                                                         f"{msg}")
-    for frag in ("0x0F20", "0x0F21", "3874"):
-        require(frag in msg, f"the window refusal lacks {frag!r}: {msg}")
-    require(loader.assemble("  HALT\n", window=(0x00, 0x08), image=0x0F22).length == 0x0F22,
-            "0x0F22 must be enough for the window bounds")
-
-    msg = refuses(loader.assemble, "  HALT\n", vectors={16: 0x10})
-    require(msg and "0..15" in msg, f"vector index 16 accepted: {msg}")
-    msg = refuses(loader.assemble, "  HALT\n", vectors={-1: 0x10})
-    require(msg and "0..15" in msg, f"vector index -1 accepted: {msg}")
-    msg = refuses(loader.assemble, "  HALT\n", vectors={"zero": 0x10})
-    require(msg and "int" in msg, f"non-int vector index accepted: {msg}")
-    msg = refuses(loader.assemble, "  HALT\n", vectors={0: 0})
-    require(msg and "not registered" in msg, f"a vector at address 0 accepted: {msg}")
-    msg = refuses(loader.assemble, "  HALT\n", vectors={0: 0x2000}, image=0x0F22)
-    require(msg and "past the end" in msg, f"a vector past the image accepted: {msg}")
-    msg = refuses(loader.assemble, "  HALT\n", vectors={0: "nothere"})
-    require(msg and "undefined symbol" in msg, f"an undefined vector label accepted: {msg}")
-
-    msg = refuses(loader.assemble, "  HALT\n", window=(0x00, 0x100), image=0x0F22)
-    require(msg and "0..255" in msg, f"a window bound wider than one byte accepted: {msg}")
-    msg = refuses(loader.assemble, "  HALT\n", window=(0x20, 0x10), image=0x0F22)
-    require(msg and "reversed" in msg, f"reversed window bounds accepted: {msg}")
-    msg = refuses(loader.assemble, "  HALT\n", window=(0x00, 0x00), image=0x0F22)
-    require(msg is None, f"a zero-width window must stay legal (it is the fail-closed "
-                         f"default the tests use): {msg}")
-
-    msg = refuses(loader.assemble, "  .org 0x0F00\n  .word 0xDEAD\n", vectors={0: 0x10},
-                  image=0x0F22)
-    require(msg and "overwrite" in msg, f"a vector over placed data accepted: {msg}")
-    print("  8 unreadable/contradictory ABI declarations refused at load time with the "
-          "cell, the value and the length in the message; the two minimal lengths "
-          "(0x0F02, 0x0F22) accepted")
-
-def test_loader_abi_needed_matches_reference():
-
-    require(loader.abi_needed(vectors={0: 0x10}) == 0x0F02, "EXT 0 needs 0x0F02")
-    require(loader.abi_needed(vectors={15: 0x10}) == 0x0F20, "EXT 15 needs 0x0F20")
-    require(loader.abi_needed(window=(0, 8)) == 0x0F22, "a window needs 0x0F22")
-    require(loader.abi_needed() == 1, "no tables need nothing")
+def test_loader_declarations_are_configuration():
 
     src = "  EXT 0\n  HALT\n  .org 0x10\nh:\n  ADDI r0, 1\n  RET\n"
-    short = loader.assemble(src, image=0x0F01).image
-    g = NCP8(short)
-    msg = refuses(g.step)
 
-    require(msg and "EXT handler" in msg, f"at 0x0F01 the reference was expected to fail "
-                                           f"the dispatch: {msg}")
-    good = loader.assemble(src, vectors={0: "h"}, image=0x0F02).image
-    g = NCP8(good)
-    g.r[0] = 41
-    g.run()
-    require(g.r[0] == 42, f"at 0x0F02 the same vector dispatches: {g.snapshot()}")
-    print("  the declared minimum lengths are the reference's real thresholds (0x0F01 "
-          "fails, 0x0F02 dispatches)")
+    ok = loader.assemble(src, vectors={0: "h"})
+    require(ok.config().vec[0] == ok.symbols["h"],
+            f"the block does not carry the declared vector: {ok.config().vec}")
+    require(ok.config().codelen == ok.content_extent and ok.length >= ok.content_extent,
+            f"a {ok.content_extent}-byte program got CODELEN {ok.config().codelen} in a "
+            f"{ok.length}-byte buffer")
+
+    freed = loader.assemble("  .org 0x0F00\n  .word 0xDEAD\n  HALT\n")
+    require(freed.content_extent == 0x0F03,
+            f"code at 0x0F00 gives an extent of {freed.content_extent}, want 0x0F03")
+    require(freed.image[0x0F00:0x0F02] == bytes([0xAD, 0xDE]),
+            f"the words at 0x0F00 are not what was written: {freed.image[0x0F00:0x0F02]!r}")
+
+    wide = loader.assemble("  HALT\n", window=(0x00, 0x100))
+    require(wide.config().winhi == 0x100,
+            f"a 16-bit window bound was not carried across: {wide.config().winhi}")
+    for frag in (
+            ("vectors index 16", dict(vectors={16: 0x10}), "0..15"),
+            ("vectors index -1", dict(vectors={-1: 0x10}), "0..15"),
+            ("non-int index", dict(vectors={"zero": 0x10}), "int"),
+            ("vector at 0", dict(vectors={0: 0}), "not registered"),
+            ("vector past the code", dict(vectors={0: 0x2000}), "past the end"),
+            ("undefined symbol", dict(vectors={0: "nothere"}), "undefined symbol"),
+            ("reversed window", dict(window=(0x20, 0x10)), "reversed"),
+    ):
+        name, kw, want = frag
+        msg = refuses(loader.assemble, "  HALT\n", **kw)
+        require(msg and want in msg, f"{name} accepted: {msg}")
+    zero = refuses(loader.assemble, "  HALT\n", window=(0x00, 0x00))
+    require(zero is None, f"a zero-width window must stay legal: {zero}")
+    print("  declarations validate without occupying code: a short image loads, the freed "
+          "region holds program bytes, 16-bit bounds carry across, and 7 bad declarations "
+          "are refused by name")
 
 def test_loader_boundaries_both_sides():
 
@@ -545,18 +542,16 @@ def test_loader_boundaries_both_sides():
             require(frag in msg, f"{kw} refused with {msg!r}, expected to name {frag!r}")
 
     vec_src = "  EXT 15\n  HALT\n  .org 0x20\nh:\n  ADDI r0, 1\n  RET\n"
-    r = accepted(src=vec_src, vectors={15: "h"}, image=0x0F20)
-    require(int.from_bytes(r.image[0x0F1E:0x0F20], "little") == r.symbols["h"],
-            "vector 15 is not the last two bytes of the table")
+    r = accepted(src=vec_src, vectors={15: "h"})
+    require(r.config().vec[15] == r.symbols["h"],
+            f"vector 15 is not in the block: {sorted(r.config().vec)}")
     refused(["vector index", "is 16", "0..15"], vectors={16: 0x10})
 
-    refused(["vector 15", "0x0F1E", "0x0F1F"], src=vec_src, vectors={15: "h"},
-            image=0x0F1F)
+    accepted(src="  HALT\n  HALT\n", vectors={0: 1})
+    refused(["vector 0", "past the end"], src="  HALT\n", vectors={0: 1})
 
-    refused(["vector 0", "0x0F00", "unregistered"], vectors={0: 0x10}, image=0x0F01)
-    accepted(vectors={0: 0x10}, image=0x0F02)
-    refused(["0x0F20", "0x0F21"], window=(0x00, 0x08), image=0x0F21)
-    accepted(window=(0x00, 0x08), image=0x0F22)
+    accepted(window=(0x0000, 0xFFFF))
+    refused(["window", "outside 0..65535"], window=(0x0000, 0x10000))
     refused(["image length", "1..4096"], image=0)
     accepted(image=1)
     accepted(image=CODE_SIZE)
@@ -573,82 +568,92 @@ def test_loader_boundaries_both_sides():
     accepted(src="  HALT\n  .org 0x1000\n")
     refused([".org target", "0..4096"], src="  .org 0x1001\n  HALT\n")
 
-    accepted(src="  .org 0x0EFF\n  .byte 7\n", vectors={0: 0x10}, image=0x0F22)
-    refused(["vector 0", "overwrite"], src="  .org 0x0F00\n  .byte 7\n",
-            vectors={0: 0x10}, image=0x0F22)
-    refused(["vector 0", "overwrite"], src="  .org 0x0F01\n  .byte 7\n",
-            vectors={0: 0x10}, image=0x0F22)
-    accepted(src="  .org 0x0F1F\n  .byte 7\n", window=(0x00, 0x08), image=0x0F22)
-    refused(["window lo", "overwrite"], src="  .org 0x0F20\n  .byte 7\n",
-            window=(0x00, 0x08), image=0x0F22)
-    refused(["window hi", "overwrite"], src="  .org 0x0F21\n  .byte 7\n",
-            window=(0x00, 0x08), image=0x0F22)
+    for addr in (0x0EFF, 0x0F00, 0x0F01, 0x0F1F, 0x0F20, 0x0F21):
+        r = accepted(src=f"  .org {addr:#06x}\n  .byte 7\n", vectors={0: 0x10},
+                     window=(0x0000, 0x0008))
+        require(r.image[addr] == 7, f"nothing was placed at {addr:#06x}")
+        require(r.config().vec[0] == 0x10 and r.config().winlo == 0
+                and r.config().winhi == 8,
+                f"code at {addr:#06x} moved the declaration: vec={r.config().vec} "
+                f"window=({r.config().winlo:#06x},{r.config().winhi:#06x})")
 
-    accepted(vectors={0: 0x0F01}, image=0x0F02)
-    refused(["vector 0", "past the end", "0x0F02"], vectors={0: 0x0F02}, image=0x0F02)
+    edge = "  .org 0x0F01\n  .byte 0\n"
+    r = accepted(src=edge, vectors={0: 0x0F01})
+    require(r.config().codelen == 0x0F02,
+            f"the content reaches {r.config().codelen}, want 0x0F02")
+    refused(["vector 0", "past the end", "0x0F02", "3842-byte"], src=edge,
+            vectors={0: 0x0F02})
     refused(["vector 0", "not registered"], vectors={0: 0})
-
-    accepted(entry=0x0F01, image=0x0F02)
-    refused(["entry", "past the end", "0x0F02"], entry=0x0F02, image=0x0F02)
+    accepted(src=edge, entry=0x0F01)
+    refused(["entry", "past the end", "0x0F02"], src=edge, entry=0x0F02)
 
     accepted(window=(0x08, 0x08))
-    accepted(window=(0x00, 0xFF), image=0x0F22)
-    refused(["reversed", "0x08", "0x07"], window=(0x08, 0x07))
-    refused(["window hi", "0..255"], window=(0x00, 0x100))
-    refused(["window lo", "0..255"], window=(0x100, 0xFF))
+    accepted(window=(0x0000, CODE_SIZE))
+    refused(["reversed", "0x0008", "0x0007"], window=(0x08, 0x07))
 
-    stc = loader.assemble("  LDI r0, 0xEE\n  LDI HL, 0x00FE\n  STC [HL], r0\n  HALT\n",
-                          window=(0x00, 0xFF), image=0x0F22).image
-    g = NCP8(stc)
-    g.run()
-    require(g.status == "HALT" and g.code[0x00FE] == 0xEE,
-            f"the last address inside the window was not writable: {g.trace[-1]}")
-    g2 = NCP8(loader.assemble("  LDI r0, 0xEE\n  LDI HL, 0x00FF\n  STC [HL], r0\n  HALT\n",
-                              window=(0x00, 0xFF), image=0x0F22).image)
-    msg = refuses(g2.run)
+    def stc(target, *, winhi, filler=0x0100):
 
-    require(msg and "STC" in msg and "0xff" in msg and g2.code[0x00FF] == 0x00,
-            f"the first address past the widest window was written: {msg}")
+        m = loader.assemble(
+            f"  LDI r0, 0xEE\n  LDI HL, {target:#06x}\n  STC [HL], r0\n  HALT\n"
+            f"  .org {filler:#06x}\n  .byte 0\n", window=(0x0000, winhi)).to_machine()
+        return m, refuses(m.run)
+
+    ok = ISA.CAUSE["OK"]
+    m, msg = stc(0x00FE, winhi=0x00FF)
+    require(m.fault_reason == ok and m.code[0x00FE] == 0xEE,
+            f"the last address inside the window was not written: {msg}")
+    m, msg = stc(0x00FF, winhi=0x00FF)
+    require(m.fault_reason == ISA.CAUSE["WINDOW"] and m.code[0x00FF] == 0x00,
+            f"a write outside the window, inside the content, was not refused by the "
+            f"window: cause {m.fault_reason} ({msg})")
+    m, msg = stc(0x0100, winhi=CODE_SIZE)
+    require(m.fault_reason == ok and m.code[0x0100] == 0xEE,
+            f"the last address of the content was not written under the widest "
+            f"window: {msg}")
+    m, msg = stc(0x0F00, winhi=CODE_SIZE)
+    require(m.fault_reason == ISA.CAUSE["CODE_OOB"] and 0x0F00 >= len(m.code),
+            f"a write at 0x0f00 under a window that covers it was not refused by the "
+            f"content bound: cause {m.fault_reason} ({msg})")
+    require("window" not in str(msg or "").lower(),
+            f"the refusal above is the content's, but it blames the window: {msg}")
     print("  every loader boundary checked from both sides: vector index 15/16, the "
-          "0x0F01/0x0F02 and 0x0F21/0x0F22 length floors, content against the length "
-          "asked for, .org at the last byte of CODE, placed data against the ABI cells, "
-          "vector targets, entry, and window order/width; the byte-wide window bound "
-          "cannot reach the tables, and the machine's 0xFE/0xFF edge says so")
+          "content floors at 0x0F01/0x0F02 for a target and an entry, content against "
+          "the length asked for, .org at the last byte of CODE, program bytes over "
+          "every address configuration used to live at, and window order; STC is "
+          "stopped by the window and by the content separately, each with its own "
+          "cause, so the counterfactual refuses because there is no code there")
 
-VEC, WLO, WHI = 0x0F00, 0x0F20, 0x0F21
+def hand_image(placements, length):
 
-def hand_place_vector(code, k, addr):
-
-    b = bytearray(code.ljust(VEC + 2 * (k + 1), b"\x00"))
-    b[VEC + 2 * k:VEC + 2 * k + 2] = (addr & 0xFFFF).to_bytes(2, "little")
+    b = bytearray(length)
+    for addr, chunk in placements:
+        require(addr + len(chunk) <= length,
+                f"the placement at 0x{addr:04X} does not fit in {length} bytes")
+        b[addr:addr + len(chunk)] = chunk
     return bytes(b)
 
-def hand_with_vec(code, table):
+def hand_config(placements, vec=None, window=None):
 
-    b = bytearray(bytes(code).ljust(max(VEC + 2 * (k + 1) for k in table), b"\x00"))
-    for k, addr in table.items():
-        b[VEC + 2 * k:VEC + 2 * k + 2] = (addr & 0xFFFF).to_bytes(2, "little")
-    return bytes(b)
+    lo, hi = (None, None) if window is None else window
+    return ISA.MachineConfig(codelen=max([a + len(c) for a, c in placements] or [1]),
+                             winlo=lo, winhi=hi, vec=vec)
 
-def hand_code_esc(sub, vec=0, pc=0, tail=(0xAA, 0x55)):
+def first_difference(want, got):
+    for i in range(max(len(want), len(got))):
+        a = want[i] if i < len(want) else None
+        b = got[i] if i < len(got) else None
+        if a != b:
+            return i, a, b
+    return None
 
-    b = bytearray(max(0x0F20, pc + 4))
-    b[pc], b[pc + 1], b[pc + 2], b[pc + 3] = 0x70, sub, tail[0], tail[1]
-    if vec:
-        for k in range(16):
-            b[VEC + 2 * k:VEC + 2 * k + 2] = (vec & 0xFFFF).to_bytes(2, "little")
-    return bytes(b)
+def declared(name, segments, length, src, kw, vec=None, window=None, expect=None):
 
-def hand_build_code(head, vec0=None):
+    placements = [(addr, asm(text)) for addr, text in segments]
+    return dict(name=name, image=hand_image(placements, length),
+                config=hand_config(placements, vec=vec, window=window),
+                src=src, kw=kw, expect=expect or {})
 
-    b = bytearray(bytes(head).ljust(WHI + 2, b"\x00"))
-    if vec0 is not None:
-        b[VEC:VEC + 2] = (vec0 & 0xFFFF).to_bytes(2, "little")
-    return bytes(b)
-
-def hand_selfmod(window_cells):
-
-    src = """    JMP main
+SELFMOD = """    JMP main
 sub:
     LDI r0, 7
     RET
@@ -660,150 +665,146 @@ main:
     OUT r0
     HALT
 """
-    base = asm(src)
-    b = bytearray(base.ljust(window_cells, b"\x00"))
-    return b, base
 
-def first_difference(want, got):
-    for i in range(max(len(want), len(got))):
-        a = want[i] if i < len(want) else None
-        b = got[i] if i < len(got) else None
-        if a != b:
-            return i, a, b
-    return None
-
-LOADER_CASES = (
-    ("test_isa_v2.test_esc_and_trap: EXT 0 -> handler at 0x10",
-     lambda: hand_place_vector(bytearray(bytes([0x70, 0x70, 0x00, 0x00]).ljust(0x10, b"\x00"))
-                               + bytes([0xD4 | 0, 1, 0x08]), 0, 0x10),
-     lambda: loader.assemble("  EXT 0\n  HALT\n  .org 0x10\nhandler:\n  ADDI r0, 1\n"
-                             "  RET\n", vectors={0: "handler"}, image=0x0F02)),
-    ("test_isa_v2.test_esc_and_trap: nested EXT 0 -> EXT 1",
-     lambda: (lambda h0, h1: hand_place_vector(
-         hand_place_vector(bytearray(bytes([0x70, 0x70, 0x00, 0x00]).ljust(0x10, b"\x00"))
-                           + h0 + h1, 0, 0x10), 1, 0x10 + len(h0)))(
-         bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x08]), bytes([0xD4 | 0, 1, 0x08])),
-     lambda: loader.assemble("  EXT 0\n  HALT\n  .org 0x10\nh0:\n  EXT 1\n  ADDI r0, 1\n"
-                             "  RET\nh1:\n  ADDI r0, 1\n  RET\n",
-                             vectors={0: "h0", 1: "h1"}, image=0x0F04)),
-    ("test_isa_v2.test_pc_bookkeeping: EXT 0 then LDI r3, 0xAB",
-     lambda: hand_place_vector(bytearray(bytes([0x70, 0x70, 0x00, 0xD0 | 3, 0xAB, 0x00])
-                                         .ljust(0x10, b"\x00")) + bytes([0xD4 | 0, 1, 0x08]),
-                               0, 0x10),
-     lambda: loader.assemble("  EXT 0\n  LDI r3, 0xAB\n  HALT\n  .org 0x10\nhandler:\n"
-                             "  ADDI r0, 1\n  RET\n", vectors={0: "handler"}, image=0x0F02)),
-    ("test_isa_v2.test_esc_and_trap: an unregistered vector (address 0)",
-     lambda: hand_place_vector(bytes([0x70, 0x70, 0x00]), 0, 0),
-     lambda: loader.assemble("  EXT 0\n  .org 0x0F00\n  .word 0\n", image=0x0F02)),
-    ("test_isa_v2.test_selfmod: window cells at WLO+2, bounds (0x00, 0x08)",
-     lambda: bytes((lambda b: (b.__setitem__(WLO, 0x00), b.__setitem__(WHI, 0x08), b)[-1])(
-         hand_selfmod(WLO + 2)[0])),
-     lambda: loader.assemble("""    JMP main
-sub:
-    LDI r0, 7
-    RET
-main:
-    LDI HL, 0x04
-    LDI r0, 42
-    STC [HL], r0
-    CALL sub
-    OUT r0
-    HALT
-""", window=(0x00, 0x08), image=0x0F22, entry="main")),
-    ("test_isa_v2_equivalence.test_selfmod_lockstep: window cells at WHI+1",
-     lambda: bytes((lambda b: (b.__setitem__(WLO, 0x10), b.__setitem__(WHI, 0x18), b)[-1])(
-         hand_selfmod(WHI + 1)[0])),
-     lambda: loader.assemble("""    JMP main
-sub:
-    LDI r0, 7
-    RET
-main:
-    LDI HL, 0x04
-    LDI r0, 42
-    STC [HL], r0
-    CALL sub
-    OUT r0
-    HALT
-""", window=(0x10, 0x18), image=0x0F22, entry="main")),
-    ("test_error_atomicity.build_code: head at 0, vector 0 at 0x40, cells to WHI+2",
-     lambda: hand_build_code(bytes([0x70, 0x70, 0x03]), vec0=0x0040),
-     lambda: loader.assemble("  EXT 3\n", vectors={0: 0x0040}, image=WHI + 2)),
-    ("test_error_atomicity.build_code: no vector registered at all",
-     lambda: hand_build_code(bytes([0xD4 | 1, 0xFF])),
-     lambda: loader.assemble("  ADDI r1, 0xFF\n", image=WHI + 2)),
-    ("test_isa_v2_equivalence._with_vec: EXT nested, table over two vectors",
-     lambda: hand_with_vec(bytearray(bytes([0x70, 0x70, 0x00, 0xD0 | 3, 0x7E, 0x00])
-                                     .ljust(0x20, b"\x00"))
-                           + bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x08])
-                           + bytes([0xD4 | 0, 5, 0x08]),
-                           {0: 0x20, 1: 0x20 + len(bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x08]))}),
-     lambda: loader.assemble("  EXT 0\n  LDI r3, 0x7E\n  HALT\n  .org 0x20\nh0:\n  EXT 1\n"
-                             "  ADDI r0, 1\n  RET\nh1:\n  ADDI r0, 5\n  RET\n",
-                             vectors={0: "h0", 1: "h1"}, image=0x0F04)),
-    ("test_isa_v2_equivalence._code_esc: a reserved subcode at pc=0, no vector",
-     lambda: hand_code_esc(0x36, vec=0),
-     lambda: loader.assemble("  .byte 0x70, 0x36, 0xAA, 0x55\n", image=0x0F20)),
-    ("test_isa_v2_equivalence._code_esc: LDX at pc=256 with all 16 vectors registered",
-     lambda: hand_code_esc(0x50, vec=0x0040, pc=256),
-     lambda: loader.assemble("  .org 256\n  .byte 0x70, 0x50, 0xAA, 0x55\n",
-                             vectors={k: 0x0040 for k in range(16)}, image=0x0F20)),
-    ("test_batched_execution.ext_program: the image that file actually builds",
-     lambda: (lambda b: (b.__setitem__(slice(VEC, VEC + 2), (0x20).to_bytes(2, "little")),
-                         b.__setitem__(slice(VEC + 2, VEC + 4),
-                                       (0x26).to_bytes(2, "little")), bytes(b))[-1])(
-         bytearray(bytes([0x70, 0x70, 0x00, 0xF8 | 0, 0xD0 | 3, 0x7E, 0x00])
-                   .ljust(0x20, b"\x00"))
-         + bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x08])
-         + bytes([0xD4 | 0, 5, 0x08])),
-     lambda: loader.assemble("  EXT 0\n  OUT r0\n  LDI r3, 0x7E\n  HALT\n  .org 0x20\n"
-                             "h0:\n  EXT 1\n  ADDI r0, 1\n  RET\nh1:\n  ADDI r0, 5\n"
-                             "  RET\n  .org 0x29\n  .word 0x0020, 0x0026\n", image=45)),
+DECLARED_CASES = (
+    declared("trap to a handler at 0x10, in a padded buffer",
+             [(0, "  EXT 0\n  HALT\n"), (0x10, "  ADDI r0, 1\n  RET\n")], 0x0F02,
+             "  EXT 0\n  HALT\n  .org 0x10\nhandler:\n  ADDI r0, 1\n  RET\n",
+             dict(vectors={0: "handler"}, image=0x0F02), vec={0: 0x10},
+             expect=dict(status="HALT", r0=1)),
+    declared("a handler that takes a second trap",
+             [(0, "  EXT 0\n  LDI r3, 0x7E\n  HALT\n"),
+              (0x20, "  EXT 1\n  ADDI r0, 1\n  RET\n"), (0x26, "  ADDI r0, 5\n  RET\n")],
+             0x29,
+             "  EXT 0\n  LDI r3, 0x7E\n  HALT\n  .org 0x20\nh0:\n  EXT 1\n  ADDI r0, 1\n"
+             "  RET\nh1:\n  ADDI r0, 5\n  RET\n",
+             dict(vectors={0: "h0", 1: "h1"}, image=0x29), vec={0: 0x20, 1: 0x26},
+             expect=dict(status="HALT", r0=6, r3=0x7E, SP=4096)),
+    declared("self-modification inside the declared span",
+             [(0, SELFMOD)], 0x100, SELFMOD, dict(window=(0x00, 0x08), image=0x100),
+             window=(0x00, 0x08), expect=dict(status="HALT", out=b"\x2a")),
+    declared("the same write outside the declared span",
+             [(0, SELFMOD)], 0x100, SELFMOD, dict(window=(0x10, 0x18), image=0x100),
+             window=(0x10, 0x18), expect=dict(status="ERROR", cause="WINDOW")),
+    declared("program bytes where configuration used to live",
+             [(0, "  JMP 0x0F00\n"), (0x0F00, "  LDI r0, 3\n  HALT\n")], 0x0F03,
+             "  JMP code\n  .org 0x0F00\ncode:\n  LDI r0, 3\n  HALT\n",
+             dict(image=0x0F03), expect=dict(status="HALT", r0=3)),
+    declared("all sixteen vectors registered, escape at 0x0100",
+             [(0, "  JMP 0x0100\n"), (0x40, "  ADDI r0, 1\n  RET\n"),
+              (0x100, "  LDX r0, [HL]\n  HALT\n")],
+             0x110,
+             "  JMP here\n  .org 0x40\nh:\n  ADDI r0, 1\n  RET\n  .org 0x100\nhere:\n"
+             "  LDX r0, [HL]\n  HALT\n",
+             dict(vectors={k: "h" for k in range(16)}, image=0x110),
+             vec={k: 0x40 for k in range(16)}, expect=dict(status="HALT")),
 )
 
-def test_loader_reproduces_hand_patched_images():
+def test_a_declared_load_and_a_hand_configured_machine_are_one_machine():
 
     lines = []
-    mismatches = []
-    for name, hand_fn, loader_fn in LOADER_CASES:
-        want = hand_fn()
-        got = loader_fn().image
-        note = f"{len(want)}B == {len(got)}B"
-        if want != got:
-            d = first_difference(want, got)
-            mismatches.append((name, d))
-            note = f"DIFF at 0x{d[0]:04X}: hand {d[1]} loader {d[2]} (len {len(want)} vs " \
-                   f"{len(got)})"
-        lines.append(f"  {'OK  ' if want == got else 'FAIL'} {name}  [{note}]")
-    require(not mismatches, "loader did not reproduce these hand-patched images:\n"
-                            + "\n".join(lines))
-    require(len(LOADER_CASES) == 12, f"{len(LOADER_CASES)} equivalence cases")
-    print(f"loader reproduces all {len(LOADER_CASES)} hand-patched images byte for byte:")
+    for case in DECLARED_CASES:
+        got = loader.assemble(case["src"], **case["kw"])
+        want = case["image"]
+        d = first_difference(want, got.image)
+        if d is not None:
+            require(False,
+                    f"{case['name']}: bytes differ from 0x{d[0]:04X} (hand {d[1]}, "
+                    f"loader {d[2]}, {len(want)}B against {len(got.image)}B)")
+        block, hand = got.config(), case["config"]
+        for field in ("codelen", "winlo", "winhi"):
+            require(getattr(block, field) == getattr(hand, field),
+                    f"{case['name']}: {field} is {getattr(block, field)}, the hand "
+                    f"block says {getattr(hand, field)}")
+        require([block.vector(k) for k in range(ISA.VEC_COUNT)]
+                == [hand.vector(k) for k in range(ISA.VEC_COUNT)],
+                f"{case['name']}: the vector table differs")
+        a, b = NCP8(want, config=hand), got.to_machine()
+        tick = 0
+        for _ in range(64):
+            sa, sb = a.snapshot(), b.snapshot()
+            require(sa == sb, f"{case['name']} diverged at tick {tick}: {sa} vs {sb}")
+            if sa["status"] != STATUS_RUNNING:
+                break
+            tick += 1
+            for m in (a, b):
+                try:
+                    m.step()
+                except MachineError:
+                    pass
+        sa, sb = a.snapshot(), b.snapshot()
+        require(sa == sb, f"{case['name']} diverged on its last tick: {sa} vs {sb}")
+        want_state = dict(case["expect"])
+        state = dict(status=sa["status"], out=bytes(a.out), r0=a.r[0], r1=a.r[1],
+                     r2=a.r[2], r3=a.r[3], PC=a.PC, SP=a.SP,
+                     cause=ISA.CAUSE_NAME[sa["fault_reason"]])
+        for key, value in want_state.items():
+            require(state[key] == value,
+                    f"{case['name']}: {key} is {state[key]!r}, want {value!r} after "
+                    f"{tick} ticks")
+        lines.append(f"  OK   {case['name']}: {len(want)}B, codelen {hand.codelen}, "
+                     f"window {hand.window()}, {tick} ticks to {state['status']}")
+    require(len(DECLARED_CASES) == 6, f"{len(DECLARED_CASES)} declared cases")
+    print(f"all {len(DECLARED_CASES)} layouts agree as bytes, as blocks and tick for "
+          f"tick:")
     for ln in lines:
         print(ln)
 
-def test_hand_patched_batched_image_is_broken_and_loader_says_so():
+def test_configuration_shaped_bytes_in_code_configure_nothing():
 
-    broken = LOADER_CASES[11][1]()
-    fixed = loader.assemble("  EXT 0\n  OUT r0\n  LDI r3, 0x7E\n  HALT\n  .org 0x20\n"
-                            "h0:\n  EXT 1\n  ADDI r0, 1\n  RET\nh1:\n  ADDI r0, 5\n  RET\n",
-                            vectors={0: 0x20, 1: 0x26}).image
-    g = NCP8(broken)
-    msg = refuses(g.step)
-    require(msg is not None and "MachineError" in msg,
-            f"the hand image was expected to fault, got {msg}")
-    require("EXT handler" in msg, f"unexpected fault text for the hand image: {msg}")
-    require(len(broken) == 45 and VEC >= len(broken),
-            "the hand image is not the short one this test describes")
-    require(broken[0x29:0x2D] == bytes([0x20, 0x00, 0x26, 0x00]),
-            f"the misplaced table is not at 0x0029: {broken[0x29:].hex()}")
-    require(fixed[VEC:VEC + 2] == b"\x20\x00", "the loader's vector table is not at 0x0F00")
-    h = NCP8(fixed)
-    h.run()
-    require(h.status == "HALT" and h.r[0] == 6 and h.r[3] == 0x7E and h.SP == 4096,
-            f"the loader-built equivalent does not run the nested chain: {h.snapshot()}")
-    print("  the hand image faults as 'handler 0 unregistered' at tick 0 while the "
-          "loader's placement of the same program runs the nested chain (r0=6, stack "
-          "restored) - TOOLCHAIN_NOTES.md records the file to fix")
+    trap_src = "  EXT 0\n  HALT\n  .org 0x20\nh:\n  ADDI r0, 1\n  RET\n"
+    plain = loader.assemble(trap_src, image=0x0F22)
+    stamped = bytearray(plain.image)
+    stamped[0x0F00:0x0F02] = (0x0020).to_bytes(2, "little")
+    stamped = bytes(stamped)
+    require(plain.image[0x0F00:0x0F02] == b"\x00\x00",
+            "a declared load wrote its vector into the image")
+    m = NCP8(stamped)
+    msg = refuses(m.step)
+    require(m.fault_reason == ISA.CAUSE["TRAP_UNREG"],
+            f"bytes spelling handler 0x0020 at 0x0F00 dispatched anyway: "
+            f"{m.fault_reason} ({msg})")
+    declared_trap = loader.assemble(trap_src, vectors={0: "h"}, image=0x0F22)
+    require(declared_trap.image == plain.image,
+            "declaring a vector costs a byte of the image")
+    d = declared_trap.to_machine()
+    d.step()
+    require(d.PC == 0x20 and d.fault_reason == ISA.CAUSE["OK"],
+            f"the declaration did not dispatch: PC {d.PC:#06x} cause {d.fault_reason}")
+
+    mod_src = "  LDI HL, 0x0006\n  LDI r0, 0xEE\n  STC [HL], r0\n  HALT\n"
+    cells = bytearray(loader.assemble(mod_src, image=0x0F22).image)
+    cells[0x0F20], cells[0x0F21] = 0x00, 0x08
+    w = NCP8(bytes(cells))
+    for _ in range(2):
+        require(refuses(w.step) is None, "the setup instructions faulted")
+    msg = refuses(w.step)
+    require(w.fault_reason == ISA.CAUSE["WINDOW"],
+            f"cells spelling [0x00,0x08) let STC write: {w.fault_reason} ({msg})")
+    require(w.code[0x0006] != 0xEE, "the refused write landed anyway")
+    with_window = loader.assemble(mod_src, window=(0x00, 0x08),
+                                  image=0x0F22).to_machine()
+    for _ in range(3):
+        refuses(with_window.step)
+    require(with_window.code[0x0006] == 0xEE,
+            f"the declared window did not allow the same write: "
+            f"{with_window.snapshot()}")
+    require(with_window.fault_reason == ISA.CAUSE["OK"],
+            f"the declared write faulted with {with_window.fault_reason}")
+
+    tail = bytearray(loader.assemble(trap_src, image=0x2D).image)
+    tail[0x2D:0x31] = bytes([0x20, 0x00, 0x26, 0x00])
+    require(len(tail) == 0x31 and tail[0x2D:0x31] == bytes([0x20, 0, 0x26, 0]),
+            "the table did not land past the buffer's end")
+    m2 = NCP8(bytes(tail))
+    msg = refuses(m2.step)
+    require(m2.fault_reason == ISA.CAUSE["TRAP_UNREG"],
+            f"a table at 0x0029 behaved differently from one at 0x0F00: "
+            f"{m2.fault_reason} ({msg})")
+    print("  bytes at every address configuration used to occupy are inert: a stamped "
+          "table faults TRAP_UNREG where the declaration dispatches, stamped bounds "
+          "leave STC refused by WINDOW where the declaration allows the same write, "
+          "and a table appended past the buffer faults like one that is absent")
 
 SHAPE_ONLY_HOLES = ("STC nonsense, r0", "ADD HL, r0", "XCHG DE, HL", "HALT r0",
                     "STC [HL]", "LDI")
@@ -928,18 +929,29 @@ def test_loader_default_image_length():
 
     require(loader.assemble("HALT\n").length == 1, "a bare HALT is 1 byte")
     require(loader.assemble("HALT\nHALT\nHALT\n").length == 4, "3 bytes rounds to 4")
-    require(loader.assemble("HALT\n", vectors={0: 0x10}).length == CODE_SIZE,
-            "with a vector declared the default must clear 0x0F22")
-    require(loader.assemble("HALT\n", window=(0, 8)).length == CODE_SIZE,
-            "with a window declared the default must clear 0x0F22")
+    at_10 = "  .org 0x10\n  HALT\n"
+    plain = loader.assemble(at_10)
+    require(plain.length == 0x20 and plain.config().codelen == 0x11,
+            f"content reaching 0x0011 gave {plain.length} bytes, codelen "
+            f"{plain.config().codelen}")
+    for kw in (dict(vectors={0: 0x10}), dict(window=(0, 8)),
+               dict(vectors={0: 0x10}, window=(0, 0x100))):
+        r = loader.assemble(at_10, **kw)
+        require(r.image == plain.image and len(r) == len(plain)
+                and r.config().codelen == plain.config().codelen,
+                f"{kw} changed the image ({len(r)} bytes against {len(plain)}) or the "
+                f"content ({r.config().codelen} against {plain.config().codelen})")
+        require(r.config().vector(0) == 0x10 or "vectors" not in kw,
+                f"{kw} lost the declared vector: {r.config().vector(0)}")
     big = loader.assemble("  .org 0x100\n  HALT\n")
     require(big.length == 0x200, f"content to 0x0101 gives {big.length}")
     msg = refuses(loader.assemble, "  .org 0x1001\n  HALT\n")
     require(msg and "outside 0..4096" in msg, f".org past CODE_SIZE accepted: {msg}")
     msg = refuses(loader.assemble, "  .org 0x0FFF\n  .byte 1, 2, 3\n")
     require(msg and "outside CODE" in msg, f"content past CODE_SIZE accepted: {msg}")
-    print("  default length is the next power of two over the content, and 0x1000 "
-          "whenever a vector or window is declared")
+    print("  default length is the next power of two over the content alone: three "
+          "loads that declare vectors, bounds, or both, are byte-identical to the load "
+          "that declares nothing")
 
 def test_profile_totals_match_the_machine():
 
@@ -1201,17 +1213,35 @@ def test_capped_recording_replays_exactly():
     require(t.stopped == "halt", f"a halting run reported stopped={t.stopped!r}")
     require(debug.replay(debug.to_dict(t)).status == t.status,
             "a recording through to_dict did not replay")
-    print(f"  recordings capped at 1, 2, 37 and 500 steps each replay exactly, and "
-          f"the stop reason is recorded ({t.stopped!r} for a halting run)")
+
+    mod = loader.assemble("  LDI HL, 0x0006\n  LDI r0, 0xEE\n  STC [HL], r0\n"
+                          "  HALT\n", window=(0x00, 0x08), image=64)
+    tc = debug.record(mod.image, config=mod.config())
+    require(tc.config is not None and tc.config.as_dict() == mod.config().as_dict(),
+            f"the recording did not keep the block it ran under: {tc.config}")
+    blob = debug.to_dict(tc)
+    require(blob["config"] == mod.config().as_dict(),
+            f"to_dict carried {blob['config']!r}, the load declares "
+            f"{mod.config().as_dict()!r}")
+    require(debug.replay(blob).status == tc.status,
+            "a configured recording did not replay through its dict")
+    lost = dict(blob, config=None)
+    msg = refuses(debug.replay, lost)
+    require(msg and "Replay" in msg,
+            f"dropping the block from a configured recording replayed as if nothing "
+            f"was missing: {msg}")
+    print(f"  recordings capped at 1, 2, 37 and 500 steps each replay exactly, the stop "
+          f"reason is recorded ({t.stopped!r} for a halting run), and a configured "
+          f"recording replays only while it carries its block")
 
 def test_debugger_replay_is_exact():
 
     progs = []
-    progs.append(("counts and halts", loader.assemble(FLOW_SRC, image=64).image, {}))
-    progs.append(("trap through the vector table",
+    progs.append(("counts and halts", loader.assemble(FLOW_SRC, image=64), {}))
+    progs.append(("trap through the declared vectors",
                   loader.assemble("  LDI r0, 41\n  EXT 0\n  OUT r0\n  HALT\nhandler:\n"
-                                  "  ADDI r0, 1\n  RET\n", vectors={0: "handler"}).image,
-                  {}))
+                                  "  ADDI r0, 1\n  RET\n", vectors={0: "handler"},
+                                  image=64), {}))
     mod = loader.assemble("""main:
   JMP step2
 sub:
@@ -1224,25 +1254,32 @@ step2:
   CALL sub
   OUT r0
   HALT
-""", window=(0x00, 0x08), image=0x0F22, entry="main")
-    progs.append(("self-modifying store", mod.image, {}))
+""", window=(0x00, 0x08), image=64)
+    progs.append(("self-modifying store", mod, {}))
     progs.append(("consumes inputs", loader.assemble("  IN r0\n  IN r1\n  OUT r0\n"
                                                      "  OUT r1\n  IN r2\n  HALT\n",
-                                                     image=32).image,
+                                                     image=32),
                   dict(inputs=b"\x11\x22")))
     progs.append(("faults on divide by zero",
-                  loader.assemble("  LDI r0, 5\n  DIV r1, r2\n  HALT\n", image=32).image,
-                  {}))
-    progs.append(("spends the tick budget",
-                  loader.assemble("loop:\n  JMP loop\n", image=32).image,
+                  loader.assemble("  LDI r0, 5\n  DIV r1, r2\n  HALT\n", image=32), {}))
+    progs.append(("spends the tick budget", loader.assemble("loop:\n  JMP loop\n",
+                                                            image=32),
                   dict(tick_budget=11)))
-    for name, image, kw in progs:
-        t = debug.record(image, **kw)
+    for name, load, kw in progs:
+        image = load.image
+        run_kw = dict(kw, config=load.config())
+        t = debug.record(image, **run_kw)
         require(len(t) >= 1, f"[{name}] recorded no frames")
+        require(t.config is not None and t.config.as_dict() == load.config().as_dict(),
+                f"[{name}] the recording dropped the block it ran under: {t.config}")
         t.replay()
-        fresh = debug.record(image, **kw)
+        fresh = debug.record(image, **run_kw)
         require(debug.to_dict(t) == debug.to_dict(fresh),
                 f"[{name}] two recordings of the same program differ")
+        if name == "trap through the declared vectors":
+            require(t.out == bytes([42]) and t.stopped == "halt",
+                    f"the declared vector did not dispatch: out {t.out!r} stopped "
+                    f"{t.stopped!r}")
         if name == "self-modifying store":
 
             require(t.end_code[4] == 42 and t.image[4] == 7,
@@ -1319,8 +1356,8 @@ def test_debugger_records_what_the_machine_did():
 sub:
   LDI r0, 7
   RET
-""", window=(0x00, 0x20), image=0x0F22, entry="main")
-    t = debug.record(mod.image)
+""", window=(0x00, 0x20), image=64)
+    t = debug.record(mod.image, config=mod.config())
     here = [f for f in t.frames if f["pc"] == mod.symbols["sub"]]
     require([f["code"] for f in here] == [bytes([0xD0, 7]), bytes([0xD0, 42])],
             f"the two visits to sub ran {[(f['code'].hex(), f['text']) for f in here]}, "
@@ -1381,12 +1418,10 @@ for fn, args, kw in (
     (loader.assemble, ("  .byte 256\n",), {}),
     (loader.assemble, ("  .equ A, 1\n  .equ A, 2\n",), {}),
     (loader.assemble, ("HALT\n",), {"vectors": {16: 0x10}}),
-    (loader.assemble, ("HALT\n",), {"vectors": {0: 0x10}, "image": 0x0F01}),
-    (loader.assemble, ("HALT\n",), {"window": (0, 8), "image": 0x0F21}),
-    (loader.assemble, ("  .org 0x0F01\n  .byte 7\n",),
-     {"vectors": {0: 0x10}, "image": 0x0F22}),
-    (loader.assemble, ("  .org 0x0F20\n  .byte 7\n",),
-     {"window": (0, 8), "image": 0x0F22}),
+    (loader.assemble, ("HALT\n",), {"vectors": {0: 0x10}}),
+    (loader.assemble, ("HALT\n",), {"window": (0x20, 0x10)}),
+    (loader.assemble, ("HALT\n",), {"entry": 0x10}),
+    (loader.assemble, ("  .org 0x0F01\n  .byte 7\n",), {"vectors": {0: 0x0F02}}),
     (profiler.run, ("HALT\n",), {}),
     (profiler.run, (b"",), {}),
     (debug.Debug, ("HALT\n",), {}),
@@ -1517,11 +1552,10 @@ def main():
         test_non_canonical_don_tcare_bits,
         test_truncated_encodings_reported,
         test_loader_places_vectors_and_window,
-        test_loader_refuses_unreadable_abi,
-        test_loader_abi_needed_matches_reference,
+        test_loader_declarations_are_configuration,
         test_loader_boundaries_both_sides,
-        test_loader_reproduces_hand_patched_images,
-        test_hand_patched_batched_image_is_broken_and_loader_says_so,
+        test_a_declared_load_and_a_hand_configured_machine_are_one_machine,
+        test_configuration_shaped_bytes_in_code_configure_nothing,
         test_loader_directives,
         test_loader_refuses_bad_source,
         test_loader_default_image_length,

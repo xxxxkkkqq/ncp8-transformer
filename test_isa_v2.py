@@ -16,18 +16,19 @@ from golden_sim import NCP8, MachineError, asm
 from test_state_contract import assert_widths
 
 CODE_SIZE = 4096
-HANDLER_VEC = 0x0F00
+CFG = ISA.MachineConfig
 
-def run_code(code, data=None, inputs=b"", r0=None, budget=5000):
-    g = NCP8(code, data=data, inputs=inputs, tick_budget=budget)
+def run_code(code, data=None, inputs=b"", r0=None, budget=5000, config=None):
+    g = NCP8(code, data=data, inputs=inputs, tick_budget=budget, config=config)
     if r0 is not None:
         g.r[0] = r0 & 0xFF
     drive(g)
     return g
 
-def expect_err(code, data=None, r0=None, r1=None, cause=None, addr=0, sp=None, hl=None):
+def expect_err(code, data=None, r0=None, r1=None, cause=None, addr=0, sp=None, hl=None,
+               config=None):
 
-    g = NCP8(code, data=data, tick_budget=5000)
+    g = NCP8(code, data=data, tick_budget=5000, config=config)
     if r0 is not None:
         g.r[0] = r0 & 0xFF
     if r1 is not None:
@@ -58,11 +59,9 @@ def drive(g):
         assert_widths(g.snapshot(), ("isa_v2", g.tick))
     return g
 
-def place_vector(code, k, addr):
+def vectors(*pairs):
 
-    b = bytearray(code.ljust(HANDLER_VEC + 2 * (k + 1), b"\x00"))
-    b[HANDLER_VEC + 2 * k: HANDLER_VEC + 2 * k + 2] = (addr & 0xFFFF).to_bytes(2, "little")
-    return bytes(b)
+    return CFG(vec=dict(pairs))
 
 def one_op(src, r0=None, r1=None):
 
@@ -340,15 +339,15 @@ def test_esc_and_trap():
 
     err, _ = expect_err(bytes([0x70, 0x70, 0x10]), cause="TRAP_UNREG")
     assert err, "EXT with k=16 did not raise"
-    err, _ = expect_err(place_vector(bytes([0x70, 0x70, 0x00]), 0, 0), cause="TRAP_UNREG")
+    err, _ = expect_err(bytes([0x70, 0x70, 0x00]), cause="TRAP_UNREG",
+                        config=vectors((0, 0)))
     assert err, "EXT with an unregistered vector did not raise"
 
     main = bytes([0x70, 0x70, 0x00, 0x00])
     handler_addr = 0x10
     handler = bytes([0xD4 | 0, 1, 0x08])
     code = bytearray(main.ljust(handler_addr, b"\x00")) + handler
-    code = place_vector(bytes(code), 0, handler_addr)
-    g = NCP8(code); g.r[0] = 41
+    g = NCP8(bytes(code), config=vectors((0, handler_addr))); g.r[0] = 41
     drive(g)
     assert g.r[0] == 42 and g.status == "HALT", ("EXT call failed", g.snapshot(), g.trace)
     assert g.SP == 4096, "stack not restored after EXT (return address bookkeeping)"
@@ -356,9 +355,8 @@ def test_esc_and_trap():
     h0 = bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x08])
     h1 = bytes([0xD4 | 0, 1, 0x08])
     code2 = bytearray(bytearray(main).ljust(handler_addr, b"\x00")) + h0 + h1
-    code2 = place_vector(bytes(code2), 0, handler_addr)
-    code2 = place_vector(bytes(code2), 1, handler_addr + len(h0))
-    g = NCP8(code2); g.r[0] = 0
+    g = NCP8(bytes(code2), config=vectors((0, handler_addr),
+                                          (1, handler_addr + len(h0)))); g.r[0] = 0
     drive(g)
     assert g.r[0] == 2 and g.SP == 4096, ("EXT nested call", g.r[0], g.SP)
     print("  escape prefix + user-instruction trap (reserved subcode atomic ERR / unregistered ERR / call-return-nested bookkeeping)")
@@ -368,15 +366,12 @@ def test_pc_bookkeeping():
     code = bytearray(bytes([0x70, 0x70, 0x00]) + bytes([0xD0 | 3, 0xAB, 0x00]))
     h = bytes([0xD4 | 0, 1, 0x08])
     code = bytearray(bytes(code).ljust(0x10, b"\x00")) + h
-    code = place_vector(bytes(code), 0, 0x10)
-    g = NCP8(bytes(code))
+    g = NCP8(bytes(code), config=vectors((0, 0x10)))
     drive(g)
     assert g.r[3] == 0xAB and g.r[0] == 1, ("PC bookkeeping wrong after EXT", g.snapshot())
     print("  escape PC bookkeeping (2-byte prefix, 3-byte trap; return lands correctly)")
 
 def test_selfmod():
-
-    WLO, WHI = 0x0F20, 0x0F21
 
     src = """    JMP main
 sub:
@@ -393,17 +388,16 @@ main:
     base = asm(src)
     stc_pc = base.index(bytes([0x70, 0x80]))
 
-    def build(wlo, whi):
-        b = bytearray(bytes(base).ljust(WLO + 2, b"\x00"))
-        b[WLO], b[WHI] = wlo, whi
-        return bytes(b)
+    def window(lo, hi):
 
-    g = NCP8(build(0x00, 0x08))
+        return CFG(winlo=lo, winhi=hi)
+
+    g = NCP8(base, config=window(0x00, 0x08))
     drive(g)
     assert bytes(g.out) == bytes([42]), ("self-modification had no effect", bytes(g.out))
 
     for wlo, whi in ((0x10, 0x18), (0x00, 0x00)):
-        g2 = NCP8(build(wlo, whi))
+        g2 = NCP8(base, config=window(wlo, whi))
         err = False
         try:
             drive(g2)
@@ -411,8 +405,7 @@ main:
             err = True
         assert err, f"window[{wlo:#x},{whi:#x}) did not raise"
 
-    code_bad = build(0x10, 0x18)
-    g3 = NCP8(code_bad)
+    g3 = NCP8(base, config=window(0x10, 0x18))
     err, snap = False, None
     try:
         drive(g3)

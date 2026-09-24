@@ -159,16 +159,10 @@ class TorchCircuit:
         self.KR = torch.arange(K, dtype=i32, device=dev)
         self.RD = torch.arange(DATA_SIZE, dtype=i32, device=dev)
         self.RC = torch.arange(CODE_SIZE, dtype=i32, device=dev)
-        self.IW0 = torch.tensor(0x0F20, dtype=i32, device=dev)
-        self.IW1 = torch.tensor(0x0F21, dtype=i32, device=dev)
         self.RO = torch.arange(self.out_cap, dtype=i32, device=dev)
 
-        self.cfg_win = None
-        self.cfg_vec = None
-        if cfg.has_window:
-            self.cfg_win = torch.tensor([cfg.winlo, cfg.winhi], dtype=i32, device=dev)
-        if cfg.has_vec:
-            self.cfg_vec = torch.tensor(list(cfg.vec), dtype=i32, device=dev)
+        self.cfg_win = torch.tensor(list(cfg.window()), dtype=i32, device=dev)
+        self.cfg_vec = torch.tensor(list(cfg.vectors()), dtype=i32, device=dev)
 
         self.fault_codes = torch.tensor(_FAULT_CODES, dtype=i32, device=dev)
         self._acts = None
@@ -263,25 +257,13 @@ class TorchCircuit:
         t_hladd = self.HL + self.DE; v_hladd = t_hladd & 0xFFFF; c_hladd = t_hladd >> 16
         v_hlsub = (self.HL - self.DE) & 0xFFFF; c_hlsub = (self.HL < self.DE).to(i32)
 
-        if self.cfg_vec is None:
-            veclo = self._g(self.CODE, 0x0F00 + 2 * imm0)
-            vec = veclo | (self._g(self.CODE, 0x0F00 + 2 * imm0 + 1) << 8)
-        else:
+        vec = self._g(self.cfg_vec, imm0)
+        ext_ok = (imm0 < ISA.VEC_COUNT).to(i32) * (vec != 0).to(i32)
 
-            vec = self._g(self.cfg_vec, imm0)
-        ext_ok = (imm0 < 16).to(i32) * (vec != 0).to(i32)
-
-        if self.cfg_win is None:
-            wlo = self._g(self.CODE, self.IW0); whi = self._g(self.CODE, self.IW1)
-        else:
-            wlo, whi = self.cfg_win[0], self.cfg_win[1]
+        wlo, whi = self.cfg_win[0], self.cfg_win[1]
         code_ok = (self.HL < self.codelen).to(i32)
 
-        stc_legacy = (zero if self.cfg_vec is None else
-                      (self.HL >= ISA.LEGACY_VEC_BASE).to(i32)
-                      * (self.HL < ISA.LEGACY_CONFIG_HI).to(i32))
-
-        win_ok = (self.HL >= wlo).to(i32) * (self.HL < whi).to(i32) * (1 - stc_legacy)
+        win_ok = (self.HL >= wlo).to(i32) * (self.HL < whi).to(i32)
         ldc_v = self._g(self.CODE, self.HL)
 
         v_mulh = ((a * b) >> 8) & 255

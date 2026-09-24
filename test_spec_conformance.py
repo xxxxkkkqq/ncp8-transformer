@@ -10,15 +10,17 @@ Run: python3 test_spec_conformance.py
 """
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import isa_table as ISA
 import circuit_torch as CT
 import circuit_triton as CTT
 from golden_sim import MachineError, NCP8, asm
 
 PC_SITES = (0, 256)
-IMAGE = 0x0F40
-VEC = 0x0F00
-WLO, WHI = 0x0F20, 0x0F21
+IMAGE = 0x0110
+CFG = ISA.MachineConfig
 
 def rows():
 
@@ -48,9 +50,7 @@ def case(space, code, row, pc):
     img = bytearray(IMAGE)
     for i, v in enumerate(head + tuple(body)):
         img[pc + i] = v
-    img[WLO], img[WHI] = 0x00, 0x10
-    for k in range(16):
-        img[VEC + 2 * k: VEC + 2 * k + 2] = (end & 0xFFFF).to_bytes(2, "little")
+    cfg = CFG(vec={k: end for k in range(ISA.VEC_COUNT)}, winlo=0x00, winhi=0x10)
     R = [1, 2, 3, 4]
     HL, DE, SP = 8, 8, 2048
     data = bytearray(CT.DATA_SIZE)
@@ -59,12 +59,12 @@ def case(space, code, row, pc):
     if row["alu"] == "RET":
         data[SP] = end >> 8
         data[SP + 1] = end & 0xFF
-    return bytes(img), R, HL, DE, SP, data
+    return bytes(img), R, HL, DE, SP, data, cfg
 
 def step(space, code, row, pc):
 
-    img, R, HL, DE, SP, data = case(space, code, row, pc)
-    g = NCP8(img, data=data)
+    img, R, HL, DE, SP, data, cfg = case(space, code, row, pc)
+    g = NCP8(img, data=data, config=cfg)
     g.load_state(R, HL, DE, SP, 0, 0, 0, PC=pc)
     g.step()
     return g
@@ -235,8 +235,8 @@ def test_golden_register_field_matches_table():
 
     for space, code, row in rows():
         for pc in PC_SITES:
-            img, R, HL, DE, SP, data = case(space, code, row, pc)
-            g = NCP8(img, data=data)
+            img, R, HL, DE, SP, data, cfg = case(space, code, row, pc)
+            g = NCP8(img, data=data, config=cfg)
             g.load_state(R, HL, DE, SP, 0, 0, 0, PC=pc)
             g.step()
             changed = [i for i in range(4) if g.r[i] != R[i]]
@@ -336,6 +336,46 @@ _BY_ALU = {}
 for _space, _code, _row in rows():
     _BY_ALU.setdefault(_row["alu"], dict(_row, space=_space))
 
+def implementation_root():
+
+    return Path(__file__).resolve().parent
+
+def implementation_sources():
+
+    return sorted(p for p in implementation_root().rglob("*.py")
+                  if not p.name.startswith("test_"))
+
+def tick_budget_spellings():
+
+    value = int(ISA.TICK_BUDGET_DEFAULT)
+    return sorted({str(value), "{:,}".format(value).replace(",", "_")},
+                  key=len, reverse=True)
+
+def tick_budget_restatements():
+
+    pattern = re.compile(r"(?<![\d_])(" + "|".join(tick_budget_spellings())
+                         + r")(?![\d_])")
+    root = implementation_root()
+    out = []
+    for path in implementation_sources():
+        if path.name == "isa_table.py":
+            continue
+        for no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if pattern.search(line):
+                out.append(f"{path.relative_to(root)}:{no}: {line.strip()}")
+    return out
+
+def test_tick_budget_is_written_as_a_number_only_in_the_table():
+
+    found = tick_budget_restatements()
+    scanned = implementation_sources()
+    assert scanned, "the scan found no implementation file to read"
+    assert any(p.name == "isa_table.py" for p in scanned), \
+        "the scan does not reach the file that defines the constant"
+    assert not found, (
+        f"isa_table.TICK_BUDGET_DEFAULT states the default tick budget once; these "
+        f"files write the same number as a literal: {found}")
+
 CHECKS = (
     test_torch_module_roms_match_table,
     test_torch_live_tensors_match_table,
@@ -353,6 +393,7 @@ CHECKS = (
     test_golden_refuses_every_unassigned_code_point,
     test_golden_dispatches_every_assigned_selector,
     test_assembler_width_matches_table,
+    test_tick_budget_is_written_as_a_number_only_in_the_table,
 )
 
 def run_all():

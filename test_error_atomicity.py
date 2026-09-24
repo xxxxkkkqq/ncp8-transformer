@@ -21,6 +21,7 @@ enumeration instead.
 from __future__ import annotations
 
 from golden_sim import MachineError, NCP8, asm
+import isa_table as ISA
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
 from test_state_contract import FAULT_WRITES, VIEW_FIELDS, assert_widths, ref_view
@@ -44,17 +45,19 @@ INPUTS = b"\xAB\xCD"
 
 DATA_IMAGE = bytes((i * 7 + 13) & 0xFF for i in range(DATA_SIZE))
 
-def build_code(head, vec0=None, pc=0):
+def build_code(head, pc=0):
 
-    b = bytearray(bytes(head).ljust(max(WHI + 2, pc + len(head) + 2), b"\x00"))
+    b = bytearray(bytes(head).ljust(max(VEC + 2, pc + len(head) + 2), b"\x00"))
     b[pc:pc + len(head)] = bytes(head)
-    if vec0 is not None:
-        b[VEC:VEC + 2] = (vec0 & 0xFFFF).to_bytes(2, "little")
     return bytes(b)
 
-def run_reference(code, sp, hl, de, pc=0):
+def config_for(vec0):
 
-    g = NCP8(code, data=DATA_IMAGE, inputs=INPUTS)
+    return None if vec0 is None else ISA.MachineConfig(vec={0: vec0})
+
+def run_reference(code, sp, hl, de, pc=0, vec0=None):
+
+    g = NCP8(code, data=DATA_IMAGE, inputs=INPUTS, config=config_for(vec0))
     g.load_state(INIT_R, hl, de, sp, INIT_C, INIT_Z, TICK0, PC=pc)
     try:
         g.step()
@@ -63,9 +66,9 @@ def run_reference(code, sp, hl, de, pc=0):
         raised = True
     return raised, ref_view(g), list(g.data), bytes(g.code), bytes(g.out)
 
-def run_circuit(Machine, code, sp, hl, de, pc=0):
+def run_circuit(Machine, code, sp, hl, de, pc=0, vec0=None):
 
-    c = Machine(code, data=DATA_IMAGE, inputs=INPUTS)
+    c = Machine(code, data=DATA_IMAGE, inputs=INPUTS, config=config_for(vec0))
     c.load_state(INIT_R, hl, de, sp, INIT_C, INIT_Z, TICK0, PC=pc)
     try:
         c.step()
@@ -79,11 +82,12 @@ def run_circuit(Machine, code, sp, hl, de, pc=0):
     code_img = bytes(c.CODE.cpu().tolist()[:len(code)])
     return raised, snap, data, code_img, c.out()
 
-def check_case(name, code, sp, hl, de, expect_err, expect_commit=None, pc=0):
+def check_case(name, code, sp, hl, de, expect_err, expect_commit=None, pc=0,
+            vec0=None):
 
-    runs = [("reference", run_reference(code, sp, hl, de, pc)),
-            ("torch", run_circuit(TorchCircuit, code, sp, hl, de, pc)),
-            ("triton", run_circuit(TritonCircuit, code, sp, hl, de, pc))]
+    runs = [("reference", run_reference(code, sp, hl, de, pc, vec0)),
+            ("torch", run_circuit(TorchCircuit, code, sp, hl, de, pc, vec0)),
+            ("triton", run_circuit(TritonCircuit, code, sp, hl, de, pc, vec0))]
     ref_pre = dict(r=list(INIT_R), HL=hl, DE=de, SP=sp, PC=pc, C=INIT_C, Z=INIT_Z,
                    ipos=0, oplen=0, tick=TICK0, status=0, fault_reason=0, fault_addr=0)
     assert set(ref_pre) == set(VIEW_FIELDS), (
@@ -278,13 +282,13 @@ def test_stack_boundaries():
     tot = {"ok": 0, "err": 0}
     for kind, head in STACK_CASES:
         for pc in PC_SITES:
-            code = build_code(head, vec0=VEC_TGT if kind.startswith("EXT") else None,
-                              pc=pc)
+            code = build_code(head, pc=pc)
+            vec0 = VEC_TGT if kind.startswith("EXT") else None
             for sp in STACK_SP:
                 expect_err = STACK_ERR[kind](sp)
                 commit = None if expect_err else legal_expect(kind, sp, 0, 0, pc=pc)
                 tot[check_case(f"{kind} @ SP={sp} PC={pc}", code, sp, 0, 0,
-                               expect_err, commit, pc)] += 1
+                               expect_err, commit, pc, vec0)] += 1
         print(f"  {kind:9s}: SP {STACK_SP} at PC {PC_SITES} -> "
               f"{sum(1 for sp in STACK_SP if STACK_ERR[kind](sp)) * len(PC_SITES)} error / "
               f"{sum(1 for sp in STACK_SP if not STACK_ERR[kind](sp)) * len(PC_SITES)} legal")
