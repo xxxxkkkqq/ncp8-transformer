@@ -2,13 +2,18 @@
 
 NCP-8: a small machine specified in integer bit-planes.
 
-Three independent implementations of one ISA, required to agree bit-for-bit:
+Three implementations of one ISA, required to agree bit-for-bit:
 
 | file | implementation |
 |---|---|
 | `golden_sim.py` | reference simulator, pure Python integers, no floating point |
 | `circuit_torch.py` | datapath built from one-hot gated rows over a decode ROM |
 | `circuit_triton.py` | the same cycle fused into a single Triton kernel |
+
+They share one specification and differ in how the transition is computed. They
+are not independent derivations of it, so agreement between them is evidence
+about transcription and about numeric determinism, not proof that the
+specification is unambiguous; `ISA.md` is the normative text.
 
 Acceptance is recomputation, never inspection: every implementation is compared
 against the reference per tick, field by field (registers, pointers, stack
@@ -19,13 +24,17 @@ error paths. See `ISA.md` for the instruction set.
 
 ```
 pip install torch triton          # triton only needed for circuit_triton.py
-python3 test_isa_v2.py            # instruction semantics (reference only)
-python3 test_arithmetic_bounds.py # bit-width / radix bounds, carry chains
+python3 test_isa_v2.py                # instruction semantics (reference only)
+python3 test_arithmetic_bounds.py     # bit-width / radix bounds, carry chains
+python3 test_asm_strictness.py        # assembler must refuse, never mis-encode
 python3 test_circuit_equivalence.py   # both circuits vs reference, all 256 opcodes
 python3 test_isa_v2_equivalence.py    # escape subcode space + program lockstep
-python3 test_recursion.py         # multiply, nested CALL/RET, stack overflow
-python3 mini_interpreter.py       # a 16-opcode interpreter implemented in NCP-8
-python3 selfread.py               # programs that read their own PC/SP/flags
+python3 test_error_atomicity.py       # every bound case, on the reference too
+python3 test_state_contract.py        # the state contract every path must honour
+python3 test_recursion.py             # multiply, nested CALL/RET, stack overflow
+python3 test_batched_execution.py     # batched/resident executor vs reference
+python3 mini_interpreter.py           # a 16-opcode interpreter implemented in NCP-8
+python3 selfread.py                   # programs that read their own PC/SP/flags
 ```
 
 The reference-only suites run on CPU. The circuit suites need CUDA.
@@ -37,11 +46,20 @@ The reference-only suites run on CPU. The circuit suites need CUDA.
   input, not of numeric precision.
 * **Atomic errors.** A violating tick writes `status = 3` and nothing else: no
   register, memory, flag or PC update. Verified separately for undefined
-  opcodes, out-of-range accesses, stack bounds, division by zero and writes
-  outside the self-modification window.
+  opcodes, out-of-range accesses, stack bounds, division by zero, writes outside
+  the self-modification window, and a program producing more output than the
+  machine can hold.
+* **A bounded, validated state.** `status` is sticky once terminal and stepping a
+  stopped machine commits nothing; the tick budget is enforced before the
+  instruction it stops, identically through `step()` and `run()`; state can only be
+  installed through a constructor that rejects an out-of-width field, and that
+  rejection survives `python -O`. See `ISA.md` section 2.
 * **Exactness across implementations.** Three implementations of the same
   specification, differing in how the transition is computed, agree bit-for-bit
   on every opcode, every escape subcode and on multi-thousand-tick program runs.
+  Agreement is checked per tick and per field, on the error paths as well as the
+  successful ones; `test_state_contract.py` exists because the fields that were
+  *not* compared are exactly where the divergences turned out to be.
 
 ## Extension mechanism
 
@@ -52,13 +70,15 @@ are available:
 
 1. **New opcodes** occupy subcode slots in the escape space.
 2. **User-defined instructions** dispatch through `EXT k`: the machine pushes a
-   return address and jumps to the entry point stored in the vector table, which
-   lives in the read-only code region and is populated at load time. A handler
-   is an ordinary program, so it can be verified by running it.
-3. **Controlled self-modification** through `STC [HL], r`, restricted to a
-   window declared in the read-only code region, so the machine cannot widen its
-   own window. An undeclared window is zero-width, which disables
+   return address and jumps to the entry point stored in the vector table, which is
+   populated at load time and lives in a region of `CODE` that `STC` cannot address
+   (item 3). A handler is an ordinary program, so it can be verified by running it.
+3. **Controlled self-modification** through `STC [HL], r`, restricted to a window
+   declared at load time. An undeclared window is zero-width, which disables
    self-modification entirely. Writes outside the window raise an atomic error.
+   The window bounds are two 8-bit bytes, so the highest address `STC` can reach
+   at all is `0xFE`, which is what keeps it out of the trap vector table at
+   `0x0F00`. See `ISA.md` section 5.1 before widening those bounds.
 
 ## Status
 

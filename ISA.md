@@ -9,12 +9,19 @@
 | `SP` | 16 bit | stack pointer, starts at 4096 and grows down; legal values are `[0, 4096]` |
 | `PC` | 16 bit | program counter |
 | `C`, `Z` | 1 bit each | carry and zero flags |
-| `CODE` | 4096 bytes | program memory, read-only to the machine |
+| `CODE` | 4096 bytes | program memory; readable anywhere, written only by `STC`, and only inside the declared window (see 5) |
 | `DATA` | 4096 bytes | data memory and stack |
-| input / output | byte streams | `IN` / `OUT` |
+| input | byte stream | `IN`, cursor `ipos` |
+| output | byte stream, capacity 8192 | `OUT`; see 2.3 |
 | `tick` | counter | bounded by a tick budget |
 
 Status: `0` running, `1` halted, `2` tick budget exhausted, `3` error.
+
+`CODE_SIZE = DATA_SIZE = 4096` and `OUT_CAP = 8192` are declared once and shared by all
+three implementations. All three sizes are required to be positive powers of two, and the
+requirement is checked at import rather than assumed: the tensor and kernel paths contain
+a write at `address & (SIZE - 1)` to keep a machine's store inside its own buffer, and
+that mask only confines a write when the size is a power of two.
 
 ## 2. Error contract
 
@@ -28,6 +35,43 @@ advances only on a successful tick.
 A 16-bit memory access checks both of its bytes before either one is read or
 written, so a violating tick cannot commit half a word. The same rule applies to
 `PUSHW`/`POPW`, which occupy two stack slots.
+
+### 2.1 Terminal status is sticky
+
+Once `status` is `1`, `2` or `3` it never changes again, and the machine's other fields
+are frozen with it. Stepping a stopped machine is a **no-op, not an error**: `step()`
+returns having committed nothing, and `run()` returns immediately. This is what makes it
+safe for a driver to call `step()` without first asking whether the machine is still
+running, and it is the behaviour the batched executor depends on, because a batch keeps
+stepping machines that halted on different ticks.
+
+### 2.2 The tick budget is checked before the instruction
+
+The budget is tested at the start of a tick, so the tick that exhausts it executes
+nothing: `status` becomes `2`, `PC` stays where it was, and `tick` does not advance. The
+same rule holds through `step()` as through `run()`; a budget is a property of the
+machine, not of one particular driver.
+
+A tick that raises is rolled back rather than left half-applied, including for exceptions
+that are not machine errors: `PC` is restored, so a failed `step()` cannot advance the
+program counter on its own.
+
+### 2.3 Output capacity is an error, not a truncation
+
+A machine may produce at most `OUT_CAP = 8192` bytes. The attempt to produce byte number
+`8193` is an atomic error tick (`status = 3`, and the stream stays at 8192 bytes), rather
+than a run that "succeeds" with a silently shortened output. In the batched path the
+capacity is per machine: one machine overflowing cannot truncate or extend its neighbour's
+stream.
+
+### 2.4 State can only be installed through a validating constructor
+
+`load_state`/`check_state` refuse a value outside a field's declared width and name the
+field, the index and the offending value. This is enforced on every path, including under
+`python -O`: validation that lives in a bare `assert` disappears with the flag, and a
+silently unvalidated state constructor would make the bit-for-bit comparisons in the test
+suites depend on how the interpreter was started.
+
 
 ## 3. Registers and flags
 
@@ -159,22 +203,69 @@ any single-byte opcode not listed in 4.1-4.5.
 
 ## 5. Fixed code-region tables
 
-Both tables live in `CODE`, which the machine cannot write, so they can only be
-established at load time.
-
 | address | contents |
 |---|---|
 | `CODE[0x0F00 + 2k]` | 16-bit little-endian entry point for trap `EXT k`, `k` in 0-15; a zero entry means unregistered |
-| `CODE[0x0F20]`, `CODE[0x0F21]` | lower and upper bound of the self-modification window; the upper bound is exclusive |
+| `CODE[0x0F20]`, `CODE[0x0F21]` | the self-modification window's lower bound (inclusive) and upper bound (exclusive), as two independent 8-bit bytes |
 
 If `WLO >= WHI` the window is empty and every `STC` raises. `EXT` with `k >= 16`
 or with a zero vector raises. Both pushes follow the `CALL` convention (low byte
 first), so handlers may nest and return with `RET`.
 
+### 5.1 Why the machine cannot reach these tables
+
+`STC` writes `CODE`. It is kept out of the tables above by **two declared limits
+that happen to coincide**, and readers must not confuse this with `CODE` being
+write-protected, because it is not:
+
+* the window bounds are 8-bit, so the widest expressible window is `[0x00, 0xFF]`
+  and the highest address `STC` can ever reach is `0xFE`;
+* the tables above start at `0x0F00`, far outside that reach.
+
+An exhaustive sweep of all 65536 declarable `(WLO, WHI)` pairs confirms no `STC`
+lands in `[0x0F00, 0x0F22)`.
+
+**Consequence for anyone widening this.** Because the protection comes from the
+bound *width* and not from read-only-ness, enlarging the window to 16-bit bounds
+without further change would let `STC` reach the trap vector table and the window
+bound cells themselves, so the machine could widen its own window to all of `CODE`.
+Any change to the bound width must therefore be a change to *where the tables live*.
+There are two ways to make that safe, and they are not equivalent: declare a
+protected region that the datapath refuses regardless of the window, or keep the
+constraint tables out of the addressable image so that no window can reach them. The
+first still leaves the machine's own limits inside the memory the machine writes; the
+second removes the reachability. This implementation currently relies on the width
+coincidence described above, which is neither of the two, and is stated here rather
+than presented as a design.
+
+### 5.2 Loaded length is not the address space
+
+`CODE` is a 4096-byte address space, but every bound the machine checks is the
+**length of the loaded image**, not 4096. So an image must be long enough to
+contain the tables it is supposed to have:
+
+* `EXT k` needs the image to reach `0x0F02`, otherwise the vector reads as zero and
+  the trap raises `handler k unregistered` even though the caller believes it wrote
+  one;
+* `STC` and the window declaration need the image to reach `0x0F22`, otherwise the
+  bounds read as zero, the window is empty, and `STC` raises `outside window`
+  reporting the range `[0x0, 0x0)`.
+
+Both failure messages describe the *symptom*, not this cause. A builder placing
+these tables must pad the image to at least `0x0F22` bytes.
+
 ## 6. Invariants
 
 1. Flags change only through instructions that declare it.
-2. Halt happens only through `HALT` or by exhausting the tick budget.
-3. Out-of-range access raises; nothing wraps silently.
-4. A trace recorded from any implementation can be replayed to reproduce the
-   state of the reference simulator exactly.
+2. `status` leaves `0` only through `HALT`, an exhausted tick budget, or an error
+   tick, and never returns: a stopped machine commits nothing further (see 2.1).
+3. Out-of-range access raises; nothing wraps silently, and no write leaves the
+   machine's own buffer.
+4. State is installed only through a validating constructor, and the validation
+   holds under `python -O` as well as normally (see 2.4).
+5. A trace recorded from any implementation can be replayed to reproduce the state
+   of the reference simulator exactly. Of the properties on this list, this one is the
+   least tested: the suites compare implementations tick-by-tick from tick 0, and the
+   debugger replays a recording re-derived from the program image, but resuming a
+   machine from an arbitrary mid-run state and continuing is a separate claim, and it
+   is listed here because it is intended, not because a published test demonstrates it.
