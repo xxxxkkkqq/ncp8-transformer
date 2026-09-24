@@ -30,6 +30,7 @@ python3 test_asm_strictness.py        # assembler must refuse, never mis-encode
 python3 test_circuit_equivalence.py   # both circuits vs reference, all 256 opcodes
 python3 test_isa_v2_equivalence.py    # escape subcode space + program lockstep
 python3 test_error_atomicity.py       # every bound case, on the reference too
+python3 test_state_contract.py        # the state contract every path must honour
 python3 test_recursion.py             # multiply, nested CALL/RET, stack overflow
 python3 test_batched_execution.py     # batched/resident executor vs reference
 python3 mini_interpreter.py           # a 16-opcode interpreter implemented in NCP-8
@@ -60,9 +61,9 @@ are available:
 
 1. **New opcodes** occupy subcode slots in the escape space.
 2. **User-defined instructions** dispatch through `EXT k`: the machine pushes a
-   return address and jumps to the entry point stored in the vector table, which
-   lives in the read-only code region and is populated at load time. A handler
-   is an ordinary program, so it can be verified by running it.
+   return address and jumps to the entry point stored in the vector table, which is
+   populated at load time and lives in a region of `CODE` that `STC` cannot address
+   (item 3). A handler is an ordinary program, so it can be verified by running it.
 3. **Controlled self-modification** through `STC [HL], r`, restricted to a window
    declared at load time. An undeclared window is zero-width, which disables
    self-modification entirely. Writes outside the window raise an atomic error.

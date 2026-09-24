@@ -9,7 +9,7 @@
 | `SP` | 16 bit | stack pointer, starts at 4096 and grows down; legal values are `[0, 4096]` |
 | `PC` | 16 bit | program counter |
 | `C`, `Z` | 1 bit each | carry and zero flags |
-| `CODE` | 4096 bytes | program memory, read-only to the machine |
+| `CODE` | 4096 bytes | program memory; readable anywhere, written only by `STC`, and only inside the declared window (see 5) |
 | `DATA` | 4096 bytes | data memory and stack |
 | input / output | byte streams | `IN` / `OUT` |
 | `tick` | counter | bounded by a tick budget |
@@ -162,7 +162,7 @@ any single-byte opcode not listed in 4.1-4.5.
 | address | contents |
 |---|---|
 | `CODE[0x0F00 + 2k]` | 16-bit little-endian entry point for trap `EXT k`, `k` in 0-15; a zero entry means unregistered |
-| `CODE[0x0F20]`, `CODE[0x0F21]` | lower and inclusive-lower / exclusive-upper bound of the self-modification window, as two independent 8-bit bytes |
+| `CODE[0x0F20]`, `CODE[0x0F21]` | the self-modification window's lower bound (inclusive) and upper bound (exclusive), as two independent 8-bit bytes |
 
 If `WLO >= WHI` the window is empty and every `STC` raises. `EXT` with `k >= 16`
 or with a zero vector raises. Both pushes follow the `CALL` convention (low byte
@@ -183,11 +183,16 @@ lands in `[0x0F00, 0x0F22)`.
 
 **Consequence for anyone widening this.** Because the protection comes from the
 bound *width* and not from read-only-ness, enlarging the window to 16-bit bounds
-without also declaring a protected region would let `STC` reach the trap vector
-table, and the window bound cells themselves, so the machine could then widen its
-own window to all of `CODE`. Any change to the bound width must therefore come
-together with an explicit protected region that the datapath refuses regardless of
-the window.
+without further change would let `STC` reach the trap vector table and the window
+bound cells themselves, so the machine could widen its own window to all of `CODE`.
+Any change to the bound width must therefore be a change to *where the tables live*.
+There are two ways to make that safe, and they are not equivalent: declare a
+protected region that the datapath refuses regardless of the window, or keep the
+constraint tables out of the addressable image so that no window can reach them. The
+first still leaves the machine's own limits inside the memory the machine writes; the
+second removes the reachability. This implementation currently relies on the width
+coincidence described above, which is neither of the two, and is stated here rather
+than presented as a design.
 
 ### 5.2 Loaded length is not the address space
 
