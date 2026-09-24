@@ -11,8 +11,9 @@ tick count, the whole DATA image and the whole CODE image.
      comparison the per-tick path is accepted with;
   2. the same opcode enumeration packed 64 rows to a launch, which checks that
      the rows of one launch stay independent;
-  3. a 77-machine batch of random programs (halting, erroring, escape-space,
-     input-output) with random inputs and random initial states;
+  3. an 83-machine batch of random programs (halting, erroring, escape-space,
+     input-output, and the v3.0 frame-pointer function) with random inputs and
+     random initial states;
   4. a 64-machine batch whose members finish at very different ticks, stepped in
      chunks and compared with the reference after every chunk, so "some halted,
      some still running" is covered directly;
@@ -137,16 +138,25 @@ def op_case(op, seed):
 def esc_case(sub, vec, seed):
 
 
+
+
+
+
+
     rng = random.Random(seed * 977 + sub + (1 << 20 if vec else 0))
     b = bytearray(WLO)
     b[0], b[1], b[2], b[3] = 0x70, sub, 0xAA, 0x55
     if vec:
         for k in range(16):
-            b[VEC + 2 * k:VEC + 2 * k + 2] = (vec & 0xFFFF).to_bytes(2, "little")
+            b[VEC + 2 * k: VEC + 2 * k + 2] = (vec & 0xFFFF).to_bytes(2, "little")
     code = bytes(b)
     data = bytes(rng.randrange(256) for _ in range(4096))
     R = [rng.randrange(256) for _ in range(4)]
-    HL, DE = rng.randrange(4096), rng.randrange(4096)
+    if seed % 4 == 3:
+        HL, DE = (rng.choice([0, 1, 4093, 4094, 4095, 4096, 65535]),
+                  rng.choice([0, 1, 4093, 4094, 4095, 4096, 65535]))
+    else:
+        HL, DE = rng.randrange(4094), rng.randrange(4094)
     SP = rng.choice([0, 1, 2, 3, rng.randrange(16, 4093), 4095, 4096])
     C, Z = rng.randrange(2), rng.randrange(2)
     return code, data, b"", row_of(R[0], R[1], R[2], R[3], HL, DE, 0, SP, C, Z,
@@ -219,7 +229,7 @@ loop:
 """)
 
 ERR_DIV0 = asm("LDI r0, 9\nLDI r1, 0\nDIV r0, r1\nOUT r0\nHALT")
-ERR_RESERVED = bytes([0x70, 0x33, 0x00])
+ERR_RESERVED = bytes([0x70, 0x63, 0x00])
 ERR_OPCODE = bytes([0x7F, 0x00])
 ERR_DATA_OOB = asm("LDI HL, 6000\nMOV r0, [HL]\nOUT r0\nHALT")
 ERR_STACK = asm("recurse:\nCALL recurse\n")
@@ -435,6 +445,11 @@ def mixed_batch_specs(rng):
             ("longadd", programs.LONG_ADD, bytes([8] + [rng.randrange(256) for _ in range(24)])),
         ])
         specs.append((kind, code, data, b"", random_state(rng, tick=rng.randrange(8)), 200_000))
+    for i in range(6):
+        a = rng.randrange(65536)
+        data = bytes([a & 0xFF, a >> 8] + [rng.randrange(256) for _ in range(4)])
+        specs.append(("v3-frame", programs.FRAME_MUL, data, b"",
+                      random_state(rng), 200_000))
     for i in range(12):
         n = rng.randrange(1, 24)
         code = bytes(rng.randrange(256) for _ in range(n))
@@ -454,8 +469,11 @@ def test_mixed_batch():
     for i, (kind, code, data, inputs, row, budget) in enumerate(specs):
         if kind == "overrun":
             assert res.status[i] == 2 and res.ticks[i] == budget, (i, res.status[i], res.ticks[i])
-        if kind in ("halt", "escape-divmod", "escape-stc", "escape-ext", "io-echo"):
+        if kind in ("halt", "escape-divmod", "escape-stc", "escape-ext", "io-echo", "v3-frame"):
             assert res.status[i] in (1, 3), (kind, i, res.status[i])
+        if kind == "v3-frame":
+
+            assert res.status[i] == 1 and res.oplens[i] == 4, (i, res.status[i], res.oplens[i])
         if kind.startswith("err-"):
             assert res.status[i] == 3, (kind, i, res.status[i])
     print(f"[batch B={len(specs)}] mixed random batch: all {len(specs)} machines match the "

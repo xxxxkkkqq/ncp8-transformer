@@ -172,6 +172,163 @@ def run_sumrec(n: int):
     return got, n * (n + 1) // 2, sim
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+FRAME_MUL = asm("""
+  LDI HL, 2
+  LDI DE, 0
+  CALL mulsum
+  OUT r0
+  OUT r1
+  OUT r2
+  OUT r3
+  HALT
+mulsum:
+  PUSHW HL
+  PUSHW DE
+  MOVW HL, SP
+  LDW DE, [HL]
+  MOVW HL, DE
+  LDW DE, [HL]
+  MOVW HL, SP
+  STW [HL], DE
+  MOVW DE, HL
+  LDI r0, 2
+  ADDI DE, r0
+  LDW HL, [DE]
+  MOVW DE, HL
+  MOVW HL, SP
+  ADD SP, -8
+  MOV r0, [DE]
+  STX [HL-4], r0
+  INC DE
+  MOV r0, [DE]
+  STX [HL-3], r0
+  INC DE
+  MOV r0, [DE]
+  STX [HL-2], r0
+  INC DE
+  MOV r0, [DE]
+  STX [HL-1], r0
+  LDI r0, 0
+  STX [HL-8], r0
+  STX [HL-7], r0
+  STX [HL-6], r0
+  STX [HL-5], r0
+  LDX r2, [HL]
+  LDX r3, [HL-4]
+  CALL mul8
+  LDX r2, [HL-8]
+  ADD r2, r0
+  STX [HL-8], r2
+  LDX r2, [HL-7]
+  ADC r2, r1
+  STX [HL-7], r2
+  LDX r2, [HL-6]
+  ADCI r2, 0
+  STX [HL-6], r2
+  LDX r2, [HL-5]
+  ADCI r2, 0
+  STX [HL-5], r2
+  LDX r2, [HL]
+  LDX r3, [HL-3]
+  CALL mul8
+  LDX r2, [HL-7]
+  ADD r2, r0
+  STX [HL-7], r2
+  LDX r2, [HL-6]
+  ADC r2, r1
+  STX [HL-6], r2
+  LDX r2, [HL-5]
+  ADCI r2, 0
+  STX [HL-5], r2
+  LDX r2, [HL+1]
+  LDX r3, [HL-4]
+  CALL mul8
+  LDX r2, [HL-7]
+  ADD r2, r0
+  STX [HL-7], r2
+  LDX r2, [HL-6]
+  ADC r2, r1
+  STX [HL-6], r2
+  LDX r2, [HL-5]
+  ADCI r2, 0
+  STX [HL-5], r2
+  LDX r2, [HL+1]
+  LDX r3, [HL-3]
+  CALL mul8
+  LDX r2, [HL-6]
+  ADD r2, r0
+  STX [HL-6], r2
+  LDX r2, [HL-5]
+  ADC r2, r1
+  STX [HL-5], r2
+  LDX r2, [HL-8]
+  LDX r3, [HL-2]
+  ADD r2, r3
+  STX [HL-8], r2
+  LDX r2, [HL-7]
+  LDX r3, [HL-1]
+  ADC r2, r3
+  STX [HL-7], r2
+  LDX r2, [HL-6]
+  ADCI r2, 0
+  STX [HL-6], r2
+  LDX r2, [HL-5]
+  ADCI r2, 0
+  STX [HL-5], r2
+  LDX r0, [HL-8]
+  LDX r1, [HL-7]
+  LDX r2, [HL-6]
+  LDX r3, [HL-5]
+  MOVW SP, HL
+  POPW DE
+  POPW HL
+  RET
+mul8:
+  MOV r0, r2
+  MULH r2, r3
+  MOV r1, r2
+  MUL r0, r3
+  RET
+""")
+
+
+def frame_mul_model(a, b):
+
+
+    x = a & 0xFFFF
+    y = b[0] | (b[1] << 8)
+    addend = b[2] | (b[3] << 8)
+    return (x * y + addend) & 0xFFFFFFFF
+
+
+def run_frame_mul(a, b):
+
+    data = bytearray(6)
+    data[0] = a & 0xFF
+    data[1] = (a >> 8) & 0xFF
+    data[2:6] = bytes(b)
+    sim = NCP8(FRAME_MUL, data=data)
+    out = sim.run()
+    assert sim.status == "HALT", sim.status
+    assert len(out) == 4, out
+    return out[0] | (out[1] << 8) | (out[2] << 16) | (out[3] << 24), sim
+
+
 if __name__ == "__main__":
     import random
     random.seed(0)
@@ -195,6 +352,16 @@ if __name__ == "__main__":
         assert got == want, (n, got, want)
         assert sim.snapshot()["SP"] == 4096, f"n={n} stack not restored: {sim.snapshot()}"
     print("sumrec: recursion bounds/depth/stack balance all match")
+
+    for _ in range(200):
+        a = random.getrandbits(16)
+        b = [random.randrange(256) for _ in range(4)]
+        got, sim = run_frame_mul(a, b)
+        want = frame_mul_model(a, b)
+        assert got == want, (hex(a), b, hex(got), hex(want))
+        assert sim.snapshot()["SP"] == 4096, f"frame not unwound: {sim.snapshot()}"
+    print("frame_mul: 200 random (a, b) pairs, 16x16->32 widening product + local array, "
+          "frame unwound and result byte-exact against the Python model")
 
 
 

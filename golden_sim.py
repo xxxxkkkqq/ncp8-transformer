@@ -55,6 +55,18 @@ class NCP8:
         if not 0 <= addr < DATA_SIZE:
             raise MachineError(f"DATA out of range: {addr}")
 
+    def _mem16(self, addr):
+
+
+
+
+
+
+
+        if not (0 <= addr and addr + 1 < DATA_SIZE):
+            raise MachineError(f"DATA out of range: {addr}")
+        return addr
+
     def _fetch(self, n):
         if self.PC + n > len(self.code):
             raise MachineError(f"PC out of range: {self.PC}")
@@ -208,6 +220,61 @@ class NCP8:
                     v = a % b; self.r[s0] = v; self.Z = int(v == 0); m = f"MOD r{s0}, r{s1}"
                 else:
                     self.Z = int(a == b); self.C = int(a < b); m = f"CMP r{s0}, r{s1}"
+            elif 0x30 <= sub <= 0x3F:
+                if sub == 0x30:
+                    self.HL = self.DE; m = "MOVW HL, DE"
+                elif sub == 0x31:
+                    self.DE = self.HL; m = "MOVW DE, HL"
+                elif sub == 0x32:
+                    self.HL = self.SP; m = "MOVW HL, SP"
+                elif sub == 0x33:
+                    self.DE = self.SP; m = "MOVW DE, SP"
+                elif sub == 0x34:
+                    if self.HL > DATA_SIZE:
+                        raise MachineError(f"MOVW SP, HL out of range {self.HL} @ {pc0:#04x}")
+                    self.SP = self.HL; m = "MOVW SP, HL"
+                elif sub == 0x35:
+                    if self.DE > DATA_SIZE:
+                        raise MachineError(f"MOVW SP, DE out of range {self.DE} @ {pc0:#04x}")
+                    self.SP = self.DE; m = "MOVW SP, DE"
+                elif sub == 0x38:
+                    self._stack_room(2); self.SP -= 2
+                    self.data[self.SP] = self.HL & 0xFF
+                    self.data[self.SP + 1] = (self.HL >> 8) & 0xFF
+                    m = "PUSHW HL"
+                elif sub == 0x39:
+                    self._stack_room(2); self.SP -= 2
+                    self.data[self.SP] = self.DE & 0xFF
+                    self.data[self.SP + 1] = (self.DE >> 8) & 0xFF
+                    m = "PUSHW DE"
+                elif sub == 0x3A:
+                    self._stack_have(2)
+                    self.HL = self.data[self.SP] | (self.data[self.SP + 1] << 8)
+                    self.SP += 2; m = "POPW HL"
+                elif sub == 0x3B:
+                    self._stack_have(2)
+                    self.DE = self.data[self.SP] | (self.data[self.SP + 1] << 8)
+                    self.SP += 2; m = "POPW DE"
+                elif sub == 0x3C:
+                    self._mem16(self.HL)
+                    self.data[self.HL] = self.DE & 0xFF
+                    self.data[self.HL + 1] = (self.DE >> 8) & 0xFF
+                    m = "STW [HL], DE"
+                elif sub == 0x3D:
+                    self._mem16(self.DE)
+                    self.data[self.DE] = self.HL & 0xFF
+                    self.data[self.DE + 1] = (self.HL >> 8) & 0xFF
+                    m = "STW [DE], HL"
+                elif sub == 0x3E:
+                    self._mem16(self.HL)
+                    self.DE = self.data[self.HL] | (self.data[self.HL + 1] << 8)
+                    m = "LDW DE, [HL]"
+                elif sub == 0x3F:
+                    self._mem16(self.DE)
+                    self.HL = self.data[self.DE] | (self.data[self.DE + 1] << 8)
+                    m = "LDW HL, [DE]"
+                else:
+                    raise MachineError(f"reserved subcode {sub:#04x} (ESC)  @ {pc0:#04x}")
             elif sub & 0xFC in (0x40, 0x44, 0x48, 0x4C):
                 if sub & 0xFC == 0x40:
                     v = (~self.r[rs]) & 0xFF; self.r[rs] = v
@@ -221,6 +288,28 @@ class NCP8:
                 else:
                     v = self.r[rs]; self.C, self.r[rs] = v & 1, ((v >> 1) | (self.C << 7)) & 0xFF
                     self.Z = int(self.r[rs] == 0); m = f"ROR r{rs}"
+            elif 0x50 <= sub <= 0x5F:
+                if sub <= 0x53:
+                    (i,) = self._fetch(1)
+                    sx = (i ^ 0x80) - 0x80
+                    addr = (self.HL + sx) & 0xFFFF
+                    self._mem(addr)
+                    self.r[rs] = self.data[addr]; m = f"LDX r{rs}, [HL{sx:+d}]"
+                elif sub <= 0x57:
+                    (i,) = self._fetch(1)
+                    sx = (i ^ 0x80) - 0x80
+                    addr = (self.HL + sx) & 0xFFFF
+                    self._mem(addr)
+                    self.data[addr] = self.r[rs]; m = f"STX [HL{sx:+d}], r{rs}"
+                elif sub == 0x58:
+                    (i,) = self._fetch(1)
+                    sx = (i ^ 0x80) - 0x80
+                    sp = (self.SP + sx) & 0xFFFF
+                    if sp > DATA_SIZE:
+                        raise MachineError(f"ADD SP out of range {sp} @ {pc0:#04x}")
+                    self.SP = sp; m = f"ADD SP, {sx}"
+                else:
+                    raise MachineError(f"reserved subcode {sub:#04x} (ESC)  @ {pc0:#04x}")
             elif sub == 0x60:
                 t = self.HL + self.DE; self.C = t >> 16; self.HL = t & 0xFFFF; m = "ADD HL, DE"
             elif sub == 0x61:
@@ -244,6 +333,10 @@ class NCP8:
                             f"STC outside window {self.HL:#x} not in [{wl:#x},{wh:#x}) @ {pc0:#04x}")
                     b = bytearray(self.code); b[self.HL] = self.r[rs]; self.code = bytes(b)
                     m = f"STC [HL], r{rs}"
+            elif 0x90 <= sub <= 0x9F:
+                s0, s1 = (sub >> 2) & 3, sub & 3
+                v = ((self.r[s0] * self.r[s1]) >> 8) & 0xFF
+                self.r[s0] = v; self.Z = int(v == 0); m = f"MULH r{s0}, r{s1}"
             elif sub == 0x70:
                 (k,) = self._fetch(1)
                 if k >= 16:
@@ -409,6 +502,59 @@ def asm(src: str) -> bytes:
                 _bad(f"{mnemonic} immediate {v} is out of range 0..255 in {text!r}")
             return v
 
+        def _imm8s(x, mnemonic):
+
+
+
+
+
+
+            if not strict:
+                return 0
+            s = str(x)
+            if s in labels:
+                _bad(f"{mnemonic} needs a numeric signed 8-bit immediate, {s!r} is a label in {text!r}")
+            try:
+                v = int(s, 0)
+            except ValueError:
+                if re.fullmatch(r"[A-Za-z_]\w*", s):
+                    _bad(f"undefined symbol {s!r} in {text!r}")
+                _bad(f"unsupported operand expression {s!r} in {text!r}")
+            if not -128 <= v <= 127:
+                _bad(f"{mnemonic} immediate {v} is out of range -128..127 in {text!r}")
+            return v & 0xFF
+
+        def _frame_off(x, mnemonic):
+
+
+
+
+
+
+
+            if not strict:
+                return 0
+            s = str(x).replace(" ", "")
+            mm = re.fullmatch(r"\[HL(?:([+-])([^+\-\[\]]+))?\]", s)
+            if not mm:
+                _bad(f"{mnemonic} needs an [HL+i8] address operand, {x!r} is not one in {text!r}")
+            sign, num = mm.group(1), mm.group(2)
+            if num is None:
+                return 0
+            if num in labels:
+                _bad(f"{mnemonic} needs a numeric signed 8-bit offset, {num!r} is a label in {text!r}")
+            try:
+                v = int(num, 0)
+            except ValueError:
+                if re.fullmatch(r"[A-Za-z_]\w*", num):
+                    _bad(f"undefined symbol {num!r} in {text!r}")
+                _bad(f"unsupported operand expression {num!r} in {text!r}")
+            if sign == "-":
+                v = -v
+            if not -128 <= v <= 127:
+                _bad(f"{mnemonic} offset {v} is out of range -128..127 in {text!r}")
+            return v & 0xFF
+
         simple = {"HALT": 0x00, "NOP": 0x01, "INC HL": 0x02, "DEC HL": 0x03,
                   "INC DE": 0x04, "CLC": 0x05, "OUTM": 0x06, "OUTDE": 0x07, "RET": 0x08,
                   "LDI HL": 0x0F, "LDI DE": 0x10, "ADDI HL": 0x11, "ADDI DE": 0x12}
@@ -447,6 +593,8 @@ def asm(src: str) -> bytes:
             return bytes([0xDC | _r(args[0]), _imm8(args[1], name)])
         if name in ("ADD", "SUB") and args and args[0] == "HL":
             return bytes([0x70, {"ADD": 0x60, "SUB": 0x61}[name]])
+        if name == "ADD" and args and args[0] == "SP":
+            return bytes([0x70, 0x58, _imm8s(args[1], name)])
         if name == "XCHG":
             return bytes([0x70, 0x62])
         if name == "STC":
@@ -478,6 +626,31 @@ def asm(src: str) -> bytes:
                  "SHL": 0x60, "SHR": 0x64, "TST": 0x68}
         if name in unary:
             return bytes([unary[name] | _r(args[0])])
+
+
+        movw = {("HL", "DE"): 0x30, ("DE", "HL"): 0x31, ("HL", "SP"): 0x32,
+                ("DE", "SP"): 0x33, ("SP", "HL"): 0x34, ("SP", "DE"): 0x35}
+        if name == "MOVW":
+            if tuple(args) not in movw:
+                raise AssemblyError(f"unknown operand combination {args!r} in {text!r}", lineno)
+            return bytes([0x70, movw[tuple(args)]])
+        if name in ("PUSHW", "POPW"):
+            if args not in (["HL"], ["DE"]):
+                raise AssemblyError(f"{name} needs HL or DE in {text!r}", lineno)
+            return bytes([0x70, {"PUSHW": 0x38, "POPW": 0x3A}[name] + (args == ["DE"])])
+        if name in ("STW", "LDW"):
+            wide = {("STW", "[HL]", "DE"): 0x3C, ("STW", "[DE]", "HL"): 0x3D,
+                    ("LDW", "DE", "[HL]"): 0x3E, ("LDW", "HL", "[DE]"): 0x3F}
+            key = tuple([name] + args)
+            if key not in wide:
+                raise AssemblyError(f"unknown operand combination {args!r} in {text!r}", lineno)
+            return bytes([0x70, wide[key]])
+        if name == "LDX":
+            return bytes([0x70, 0x50 | _r(args[0]), _frame_off(args[1], name)])
+        if name == "STX":
+            return bytes([0x70, 0x54 | _r(args[1]), _frame_off(args[0], name)])
+        if name == "MULH":
+            return bytes([0x70, 0x90 | (_r(args[0]) << 2) | _r(args[1])])
         raise AssemblyError(f"unknown instruction {name!r} in {text!r}", lineno)
 
     labels, addr = {}, 0

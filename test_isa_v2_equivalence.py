@@ -7,9 +7,18 @@ Companion to test_circuit_equivalence.py:
   * this file covers the 256 subcodes behind 0x70, plus program-level lockstep
     for the extended instructions. The reserved subcodes and the error paths are
     required to be bit-exact as well.
+
+The v3.0 additions (pointer-pair moves, pair spill/restore, 16-bit memory,
+frame-relative access, stack-pointer adjustment, MULH) are subcodes of the same
+space, so the scan covers them without a skip list. Two properties are asserted
+rather than assumed: every v3.0 encoding has at least one legal single-step case
+(an instruction that only ever errors would hide a wrong result), and the
+lockstepped programs execute every v3.0 encoding, measured off the reference
+trace.
 """
 from __future__ import annotations
 import random
+import re
 
 from golden_sim import NCP8, MachineError, asm
 from circuit_torch import TorchCircuit
@@ -34,12 +43,22 @@ def _golden_view(g):
                 status={"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}[g.status])
 
 
+def _ptr(rng, boundary):
+
+
+
+
+    if boundary:
+        return rng.choice([0, 1, 4093, 4094, 4095, 4096, 4097, 65535])
+    return rng.randrange(4094)
+
+
 def one_esc_step(Machine, sub, seed, vec=0):
     rng = random.Random(seed * 977 + sub)
     code = _code_esc(sub, vec)
     data_g = bytearray(rng.randrange(256) for _ in range(4096))
     R = [rng.randrange(256) for _ in range(4)]
-    HL, DE = rng.randrange(4096), rng.randrange(4096)
+    HL, DE = _ptr(rng, seed % 4 == 3), _ptr(rng, seed % 4 == 3)
     SP = rng.choice([0, 1, 2, 3, rng.randrange(16, 4093), 4095, 4096])
     C0, Z0 = rng.randrange(2), rng.randrange(2)
     g = NCP8(code, data=data_g)
@@ -78,18 +97,59 @@ def one_esc_step(Machine, sub, seed, vec=0):
     return "ok"
 
 
+
+
+
+NEW_SUBCODES = {
+    0x30: "MOVW HL, DE", 0x31: "MOVW DE, HL", 0x32: "MOVW HL, SP", 0x33: "MOVW DE, SP",
+    0x34: "MOVW SP, HL", 0x35: "MOVW SP, DE",
+    0x38: "PUSHW HL", 0x39: "PUSHW DE", 0x3A: "POPW HL", 0x3B: "POPW DE",
+    0x3C: "STW [HL], DE", 0x3D: "STW [DE], HL", 0x3E: "LDW DE, [HL]", 0x3F: "LDW HL, [DE]",
+    0x58: "ADD SP, ",
+}
+NEW_SUBCODES.update({0x50 | r: re.compile(rf"LDX r{r}, \[HL[-+]?\d+\]") for r in range(4)})
+NEW_SUBCODES.update({0x54 | r: re.compile(rf"STX \[HL[-+]?\d+\], r{r}") for r in range(4)})
+NEW_SUBCODES.update({0x90 | f: re.compile(rf"MULH r{f >> 2}, r{f & 3}") for f in range(16)})
+
+
+def _executed_new_subcodes(trace):
+
+
+
+
+
+
+
+    seen = set()
+    for line in trace:
+        for sub, pat in NEW_SUBCODES.items():
+            if (pat.search(line) if hasattr(pat, "search") else pat in line):
+                seen.add(sub)
+    return seen
+
+
 def test_esc_subcodes(Machine, name):
     import torch
     tot = {"ok": 0, "err": 0}
+    legal = set()
     for sub in range(256):
         for vec in (0, 0x1234):
             for seed in range(4):
-                tot[one_esc_step(Machine, sub, seed, vec)] += 1
+                verdict = one_esc_step(Machine, sub, seed, vec)
+                tot[verdict] += 1
+                if verdict == "ok":
+                    legal.add(sub)
     torch.cuda.synchronize()
-    print(f"[{name}] escape subcode single step: 2048 cases match (ok {tot['ok']} + error {tot['err']})")
 
 
-def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=None):
+    missing = sorted(set(NEW_SUBCODES) - legal)
+    assert not missing, ("v3.0 subcodes with no legal single-step case",
+                         [hex(s) for s in missing])
+    print(f"[{name}] escape subcode single step: 2048 cases match (ok {tot['ok']} + error {tot['err']}); "
+          f"all {len(NEW_SUBCODES)} v3.0 subcodes have a legal case")
+
+
+def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=None, trace_out=None):
     g = NCP8(code, data=data, inputs=inputs, tick_budget=max_tick)
     c = Machine(code, data=data, inputs=inputs, tick_budget=max_tick)
     n = 0
@@ -123,6 +183,8 @@ def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=N
     assert c.out() == bytes(g.out), (name, "output mismatch", c.out(), bytes(g.out))
     if expect is not None:
         assert bytes(g.out) == expect, (name, "expected output mismatch", bytes(g.out).hex(), expect.hex())
+    if trace_out is not None:
+        trace_out.extend(g.trace)
     return n
 
 
@@ -236,10 +298,150 @@ zero:
     print(f"[{name}] divide-by-zero / modulo-by-zero: both implementations atomic ERR at the same tick")
 
 
+def _golden_verdict(code, data=b"", inputs=b""):
+
+
+    g = NCP8(code, data=data, inputs=inputs)
+    raised = False
+    while g.status == "RUNNING":
+        try:
+            g.step()
+        except MachineError:
+            raised = True
+            break
+    return ("ERR" if raised else g.status), bytes(g.out)
+
+
+
+
+
+
+
+
+
+
+
+
+MEDLEY = asm("""
+  LDI HL, 4088
+  LDI DE, 4090
+  PUSHW HL
+  PUSHW DE
+  POPW HL
+  POPW DE
+  STW [HL], DE
+  STW [DE], HL
+  LDW DE, [HL]
+  LDW HL, [DE]
+  OUTDE
+  OUTDE
+  MOVW HL, DE
+  MOVW DE, HL
+  MOVW HL, SP
+  MOVW DE, SP
+  GETSP r0
+  OUT r0
+  MOVW SP, HL
+  MOVW SP, DE
+  ADD SP, -4
+  MOVW HL, SP
+  GETSP r0
+  OUT r0
+  MOVW SP, HL
+  LDI r0, 0x11
+  STX [HL], r0
+  LDI r1, 0x22
+  STX [HL+1], r1
+  LDI r2, 0x33
+  STX [HL+2], r2
+  LDI r3, 0x44
+  STX [HL+3], r3
+  LDX r0, [HL+3]
+  OUT r0
+  LDX r1, [HL+2]
+  OUT r1
+  LDX r2, [HL+1]
+  OUT r2
+  LDX r3, [HL]
+  OUT r3
+  ADD SP, 4
+  GETSP r0
+  OUT r0
+""" + "\n".join(
+
+
+    f"  LDI r{f >> 2}, 200\n  LDI r{f & 3}, 200\n"
+    f"  MULH r{f >> 2}, r{f & 3}\n  OUT r{f >> 2}"
+    for f in range(16)) + "\n  HALT\n")
+
+MEDLEY_EXPECT = (bytes([4090 & 0xFF, 4090 >> 8])
+                 + bytes([4096 & 0xFF, 4092 & 0xFF])
+                 + bytes([0x44, 0x33, 0x22, 0x11])
+                 + bytes([4096 & 0xFF])
+                 + bytes([(200 * 200) >> 8]) * 16)
+
+
+def test_v3_programs(Machine, name):
+
+
+    trace = []
+    n = _lockstep(Machine, "v3.0 medley", MEDLEY, expect=MEDLEY_EXPECT, trace_out=trace)
+    print(f"[{name}] v3.0 medley lockstep {n} ticks (pair moves/spill/16-bit memory/frame "
+          f"access/MULH, output recomputed by hand)")
+
+
+
+
+
+    import programs
+    cases = [(0, [0, 0, 0, 0]), (0xFFFF, [255, 255, 255, 255]),
+             (0xFFFF, [255, 255, 0, 0]), (1, [1, 0, 0, 0]),
+             (0x1234, [0x56, 0x78, 0x9A, 0xBC]), (0xFFFF, [255, 255, 254, 255])]
+    rng = random.Random(99)
+    cases += [(rng.randrange(65536), [rng.randrange(256) for _ in range(4)]) for _ in range(4)]
+    ticks = 0
+    for a, b in cases:
+        data = bytearray(6)
+        data[0] = a & 0xFF
+        data[1] = (a >> 8) & 0xFF
+        data[2:6] = bytes(b)
+        want = programs.frame_mul_model(a, b)
+        out = bytes([want & 0xFF, (want >> 8) & 0xFF, (want >> 16) & 0xFF, (want >> 24) & 0xFF])
+        ticks += _lockstep(Machine, "frame-pointer demo", programs.FRAME_MUL,
+                           data=bytes(data), expect=out, trace_out=trace)
+    print(f"[{name}] frame-pointer demo lockstep {ticks} ticks over {len(cases)} cases "
+          f"(16x16->32 via MUL+MULH + local array, output == independent model)")
+
+
+    seen = _executed_new_subcodes(trace)
+    missing = sorted(set(NEW_SUBCODES) - seen)
+    assert not missing, ("v3.0 subcodes missing from the program lockstep",
+                         [hex(s) for s in missing])
+    print(f"[{name}] program lockstep executes all {len(NEW_SUBCODES)} v3.0 encodings "
+          f"({len(trace)} traced instructions)")
+
+
+
+
+    for src, nm, pre in (
+            ("LDI HL, 4095\nLDI DE, 1\nSTW [HL], DE\nHALT", "16-bit store at the last byte", 2),
+            ("LDI HL, 0\nLDX r0, [HL-1]\nHALT", "frame access below DATA", 1),
+            ("ADD SP, 1\nPUSHW HL\nHALT", "stack pointer past the end", 0),
+            ("LDI HL, 0x4000\nMOVW SP, HL\nPUSHW HL\nHALT", "MOVW SP above DATA", 1)):
+        code = asm(src)
+        verdict, out = _golden_verdict(code)
+        assert verdict == "ERR", (nm, "expected an error program", verdict)
+        assert out == b"", (nm, "the error program wrote output", out)
+        n = _lockstep(Machine, nm, code)
+        assert n == pre, (nm, "error tick", n, pre)
+    print(f"[{name}] v3.0 error paths: 4 programs, atomic ERR at the same tick in both implementations")
+
+
 if __name__ == "__main__":
     print("ISA v2.0 equivalence acceptance (subcode space + program lockstep):")
     for Machine, name in ((TorchCircuit, "torch"), (TritonCircuit, "triton")):
         test_esc_subcodes(Machine, name)
         test_programs(Machine, name)
         test_selfmod_lockstep(Machine, name)
+        test_v3_programs(Machine, name)
     print("ISA v2.0 equivalence: all passed")

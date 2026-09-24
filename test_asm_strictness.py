@@ -31,6 +31,21 @@ MUST_FAIL = (
     ("FOO r0, r1", 1, ("unknown instruction", "FOO")),
     ("JMP 0xZZ", 1, ("0xZZ",)),
     ("; a comment line\n\nNOP\n\nJMP oops", 5, ("undefined symbol", "oops")),
+
+
+
+    ("LDX r0, [DE+1]", 1, ("LDX", "[HL+i8]", "[DE+1]")),
+    ("LDX r0, 5", 1, ("LDX", "[HL+i8]")),
+    ("STX [HL+1], r0\nNOP\nSTX [HL-129], r0", 3, ("STX", "-129", "-128..127")),
+    ("LDX r0, [HL+128]", 1, ("LDX", "128", "-128..127")),
+    ("LDX r0, [HL+zz]", 1, ("undefined symbol", "zz")),
+    ("lab:\nLDX r0, [HL+lab]", 2, ("label", "lab")),
+    ("ADD SP, 128", 1, ("ADD", "128", "-128..127")),
+    ("ADD SP, lbl", 1, ("undefined symbol", "lbl")),
+    ("MOVW HL, HL", 1, ("MOVW", "unknown operand")),
+    ("PUSHW SP", 1, ("PUSHW", "HL or DE")),
+    ("LDW DE, [DE]", 1, ("LDW", "unknown operand")),
+    ("STW [HL], HL", 1, ("STW", "unknown operand")),
 )
 
 
@@ -49,6 +64,21 @@ MUST_PASS = (
      bytes([0x09, 0x10, 0x00]) * 4),
     ("comments and blank lines", "; header\n\nNOP ; inline\n\nHALT",
      bytes([0x01, 0x00])),
+
+
+    ("pair moves", "MOVW HL, DE\nMOVW DE, HL\nMOVW HL, SP\nMOVW DE, SP\nMOVW SP, HL\nMOVW SP, DE",
+     bytes([0x70, 0x30, 0x70, 0x31, 0x70, 0x32, 0x70, 0x33, 0x70, 0x34, 0x70, 0x35])),
+    ("pair spill and restore", "PUSHW HL\nPUSHW DE\nPOPW HL\nPOPW DE",
+     bytes([0x70, 0x38, 0x70, 0x39, 0x70, 0x3A, 0x70, 0x3B])),
+    ("16-bit memory forms", "STW [HL], DE\nSTW [DE], HL\nLDW DE, [HL]\nLDW HL, [DE]",
+     bytes([0x70, 0x3C, 0x70, 0x3D, 0x70, 0x3E, 0x70, 0x3F])),
+    ("frame access with signed offsets",
+     "LDX r2, [HL+5]\nSTX [HL-8], r3\nLDX r0, [HL+0x7F]\nSTX [HL-128], r1",
+     bytes([0x70, 0x52, 0x05, 0x70, 0x57, 0xF8, 0x70, 0x50, 0x7F, 0x70, 0x55, 0x80])),
+    ("stack pointer adjustment", "ADD SP, -8\nADD SP, 0\nADD SP, 127",
+     bytes([0x70, 0x58, 0xF8, 0x70, 0x58, 0x00, 0x70, 0x58, 0x7F])),
+    ("widening multiply high byte", "MULH r0, r1\nMULH r1, r3\nMULH r3, r3",
+     bytes([0x70, 0x91, 0x70, 0x97, 0x70, 0x9F])),
 )
 
 

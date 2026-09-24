@@ -17,6 +17,15 @@ Two execution paths share the same per-tick body:
 Error contract: a violating tick writes status = 3 only; all other state and the
 tick counter stay unchanged.
 
+The escape-prefix dispatch chain assigns the carry explicitly in the operations
+that leave it alone, written as C & 1 rather than a plain copy. With this many
+branches the Triton frontend can otherwise yield a branch's computed value into
+the carry the branch is supposed to leave untouched - a wrong flag with a correct
+data path - and an explicit assignment is what keeps it out. C is one bit wide,
+so C & 1 is C. The subcode enumeration in test_isa_v2_equivalence.py reports
+exactly that failure mode, which is how the DIV/MOD, NOT and MULH sites were
+found.
+
 State tensor layout: [r0,r1,r2,r3, HL, DE, PC, SP, C, Z, ipos, oplen, tick, status]
 """
 import torch
@@ -46,6 +55,25 @@ ESC_STC = tl.constexpr(0x10B)
 ESC_LDC = tl.constexpr(0x10C)
 ESC_BAD = tl.constexpr(0x10D)
 
+ESC_MOVW_HL_DE = tl.constexpr(0x10E)
+ESC_MOVW_DE_HL = tl.constexpr(0x10F)
+ESC_MOVW_HL_SP = tl.constexpr(0x110)
+ESC_MOVW_DE_SP = tl.constexpr(0x111)
+ESC_MOVW_SP_HL = tl.constexpr(0x112)
+ESC_MOVW_SP_DE = tl.constexpr(0x113)
+ESC_PUSHW_HL = tl.constexpr(0x114)
+ESC_PUSHW_DE = tl.constexpr(0x115)
+ESC_POPW_HL = tl.constexpr(0x116)
+ESC_POPW_DE = tl.constexpr(0x117)
+ESC_STW_HLDE = tl.constexpr(0x118)
+ESC_STW_DEHL = tl.constexpr(0x119)
+ESC_LDW_DEHL = tl.constexpr(0x11A)
+ESC_LDW_HLDE = tl.constexpr(0x11B)
+ESC_LDX = tl.constexpr(0x11C)
+ESC_STX = tl.constexpr(0x11D)
+ESC_ADD_SP = tl.constexpr(0x11E)
+ESC_MULH = tl.constexpr(0x11F)
+
 
 @triton.jit
 def _get4(v0, v1, v2, v3, idx):
@@ -70,16 +98,32 @@ def _dec_esc(sub):
 
 
 
+
+
+
+
     if sub <= 0x2F:
         eop = ESC_DIV + (sub >> 4); d = (sub >> 2) & 3; s = sub & 3; lx = 0
+    elif sub >= 0x30 and sub <= 0x35:
+        eop = ESC_MOVW_HL_DE + (sub - 0x30); d = 0; s = 0; lx = 0
+    elif sub >= 0x38 and sub <= 0x3F:
+        eop = ESC_PUSHW_HL + (sub - 0x38); d = 0; s = 0; lx = 0
     elif sub >= 0x40 and sub <= 0x4F:
         eop = ESC_NOT + ((sub >> 2) & 3); d = sub & 3; s = sub & 3; lx = 0
+    elif sub >= 0x50 and sub <= 0x53:
+        eop = ESC_LDX; d = sub & 3; s = sub & 3; lx = 1
+    elif sub >= 0x54 and sub <= 0x57:
+        eop = ESC_STX; d = sub & 3; s = sub & 3; lx = 1
+    elif sub == 0x58:
+        eop = ESC_ADD_SP; d = 0; s = 0; lx = 1
     elif sub >= 0x60 and sub <= 0x62:
         eop = ESC_ADD_HLDE + (sub - 0x60); d = 0; s = 0; lx = 0
     elif sub == 0x70:
         eop = ESC_EXT; d = 0; s = 0; lx = 1
     elif sub >= 0x80 and sub <= 0x87:
         eop = ESC_STC + ((sub >> 2) & 1); d = sub & 3; s = sub & 3; lx = 0
+    elif sub >= 0x90 and sub <= 0x9F:
+        eop = ESC_MULH; d = (sub >> 2) & 3; s = sub & 3; lx = 0
     else:
         eop = ESC_BAD; d = 0; s = 0; lx = 0
     return eop, d, s, lx
@@ -134,6 +178,11 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                 eop, ed, es, elx = _dec_esc(sub)
                 elen = 2 + elx
                 nPC = PC + elen
+                if PC + elen > CODELEN:
+
+
+                    eop = 0xFFFF
+                    err = 1
 
         if eop <= 0x1F:
             if eop == 0x00:
@@ -342,6 +391,13 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
             nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
         elif eop >= 0x100:
 
+
+
+
+
+
+
+
             if eop == ESC_DIV or eop == ESC_MOD:
                 a = _get4(r0, r1, r2, r3, ed)
                 b = _get4(r0, r1, r2, r3, es)
@@ -353,6 +409,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                     else:
                         v = a % b
                     nZ = (v == 0).to(tl.int32)
+                    nC = C & 1
                     nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
             elif eop == ESC_CMP:
 
@@ -365,6 +422,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                 v = (~rr) & 255
                 nZ = (v == 0).to(tl.int32)
                 nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
+                nC = C & 1
             elif eop == ESC_NEG:
                 rr = _get4(r0, r1, r2, r3, ed)
                 v = (-rr) & 255
@@ -434,6 +492,107 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                 else:
                     v = tl.load(CODE + HL)
                     nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
+            elif eop == ESC_MOVW_HL_DE:
+                nHL = DE
+            elif eop == ESC_MOVW_DE_HL:
+                nDE = HL
+            elif eop == ESC_MOVW_HL_SP:
+                nHL = SP
+            elif eop == ESC_MOVW_DE_SP:
+                nDE = SP
+            elif eop == ESC_MOVW_SP_HL:
+
+
+                if HL > DS:
+                    err = 1
+                else:
+                    nSP = HL
+            elif eop == ESC_MOVW_SP_DE:
+                if DE > DS:
+                    err = 1
+                else:
+                    nSP = DE
+            elif eop == ESC_PUSHW_HL or eop == ESC_PUSHW_DE:
+
+
+                if SP < 2:
+                    err = 1
+                else:
+                    if eop == ESC_PUSHW_HL:
+                        v = HL
+                    else:
+                        v = DE
+                    A1 = SP - 1; V1 = (v >> 8) & 0xFF; E1 = 1
+                    A2 = SP - 2; V2 = v & 0xFF; E2 = 1
+                    nSP = SP - 2
+            elif eop == ESC_POPW_HL or eop == ESC_POPW_DE:
+                if SP + 2 > DS:
+                    err = 1
+                else:
+                    v = tl.load(DATA + SP) | (tl.load(DATA + SP + 1) << 8)
+                    if eop == ESC_POPW_HL:
+                        nHL = v
+                    else:
+                        nDE = v
+                    nSP = SP + 2
+            elif eop == ESC_STW_HLDE or eop == ESC_STW_DEHL:
+
+                if eop == ESC_STW_HLDE:
+                    adr = HL
+                    v = DE
+                else:
+                    adr = DE
+                    v = HL
+                if adr + 1 >= DS:
+                    err = 1
+                else:
+                    A1 = adr; V1 = v & 0xFF; E1 = 1
+                    A2 = adr + 1; V2 = (v >> 8) & 0xFF; E2 = 1
+            elif eop == ESC_LDW_DEHL or eop == ESC_LDW_HLDE:
+
+                if eop == ESC_LDW_DEHL:
+                    adr = HL
+                else:
+                    adr = DE
+                if adr + 1 >= DS:
+                    err = 1
+                else:
+                    v = tl.load(DATA + adr) | (tl.load(DATA + adr + 1) << 8)
+                    if eop == ESC_LDW_DEHL:
+                        nDE = v
+                    else:
+                        nHL = v
+            elif eop == ESC_LDX or eop == ESC_STX:
+
+
+                sx = tl.load(CODE + PC + 2)
+                sx = sx - 256 * (sx >> 7)
+                adr = (HL + sx) & 0xFFFF
+                if adr >= DS:
+                    err = 1
+                elif eop == ESC_LDX:
+                    v = tl.load(DATA + adr)
+                    nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
+                else:
+                    A1 = adr; V1 = _get4(r0, r1, r2, r3, ed); E1 = 1
+            elif eop == ESC_ADD_SP:
+
+                sx = tl.load(CODE + PC + 2)
+                sx = sx - 256 * (sx >> 7)
+                v = (SP + sx) & 0xFFFF
+                if v > DS:
+                    err = 1
+                else:
+                    nSP = v
+            elif eop == ESC_MULH:
+
+
+
+
+                v = ((_get4(r0, r1, r2, r3, ed) * _get4(r0, r1, r2, r3, es)) >> 8) & 255
+                nZ = (v == 0).to(tl.int32)
+                nC = C & 1
+                nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
             else:
                 err = 1
         else:
