@@ -33,40 +33,34 @@ import torch
 import programs
 from circuit_triton import CODE_SIZE, DATA_SIZE, TritonBatch, TritonCircuit, run_batch
 from golden_sim import NCP8, MachineError, asm
+from test_state_contract import assert_widths
 
 STATUS = {"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}
 VEC = 0x0F00
 WLO, WHI = 0x0F20, 0x0F21
 STATE_LEN = 14
 
-
 def golden_view(g):
     return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
                 ipos=g.ipos, oplen=len(g.out), tick=g.tick, status=STATUS[g.status])
 
-
 def golden_machine(code, data=b"", inputs=b"", row=None, budget=200_000):
+
     g = NCP8(code, data=data, inputs=inputs, tick_budget=budget)
     if row is not None:
-        g.r = list(row[0:4])
-        g.HL, g.DE, g.PC, g.SP = row[4], row[5], row[6], row[7]
-        g.C, g.Z, g.ipos, g.tick = row[8], row[9], row[10], row[12]
+        g.load_state(row[0:4], row[4], row[5], row[7], row[8], row[9], row[12], PC=row[6])
+        g.ipos = row[10]
         assert row[11] == 0 and row[13] == 0, "a fresh machine starts with no output"
+        assert_widths(golden_view(g), ("golden machine", row))
     return g
 
-
 def golden_step(g):
-
-
-
-
-
-
 
     pre, pre_data = golden_view(g), list(g.data)
     pre_code, pre_out = bytes(g.code), bytes(g.out)
     try:
         g.step()
+        assert_widths(golden_view(g), ("reference post-tick", pre["tick"]))
         return False
     except MachineError:
         assert golden_view(g) == pre, ("reference error tick was not atomic", pre, golden_view(g))
@@ -75,10 +69,7 @@ def golden_step(g):
         assert bytes(g.out) == pre_out, "reference wrote output before raising"
         return True
 
-
 def golden_run(code, data=b"", inputs=b"", row=None, budget=200_000):
-
-
 
     g = golden_machine(code, data, inputs, row, budget)
     raised = False
@@ -92,35 +83,29 @@ def golden_run(code, data=b"", inputs=b"", row=None, budget=200_000):
         g.status = "OVERRUN"
     return g
 
-
 def golden_advance(g, steps):
 
-
     for _ in range(steps):
-        if g.status != "RUNNING" or g.tick >= g.tb:
+        if g.status != "RUNNING":
             break
         if golden_step(g):
             g.status = "ERR"
             break
     return g
 
-
 def padded(code):
     return bytes(code).ljust(CODE_SIZE, b"\x00")
-
 
 def row_of(r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos=0, oplen=0, tick=0, status=0):
     return [r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos, oplen, tick, status]
 
-
 def push_row(batch, i, row):
-    batch.STATE[i] = torch.tensor(row, dtype=torch.int32, device=batch.dev)
 
-
-
+    batch.set_state(i, r=row[0:4], HL=row[4], DE=row[5], PC=row[6], SP=row[7],
+                    C=row[8], Z=row[9], ipos=row[10], oplen=row[11], tick=row[12],
+                    status=row[13])
 
 def op_case(op, seed):
-
 
     rng = random.Random(seed)
     code = bytes([op, rng.randrange(256), rng.randrange(256)])
@@ -134,14 +119,7 @@ def op_case(op, seed):
     tick = rng.randrange(100)
     return code, data, inputs, row_of(R[0], R[1], R[2], R[3], HL, DE, 0, SP, C, Z, tick=tick)
 
-
 def esc_case(sub, vec, seed):
-
-
-
-
-
-
 
     rng = random.Random(seed * 977 + sub + (1 << 20 if vec else 0))
     b = bytearray(WLO)
@@ -162,7 +140,6 @@ def esc_case(sub, vec, seed):
     return code, data, b"", row_of(R[0], R[1], R[2], R[3], HL, DE, 0, SP, C, Z,
                                    tick=rng.randrange(100))
 
-
 DELAY_SRC = """
   LDI r0, {j}
   LDI r1, {k}
@@ -177,9 +154,7 @@ inner:
   HALT
 """
 
-
 def delay_prog(j, k):
-
 
     return asm(DELAY_SRC.format(j=j, k=k))
 
@@ -234,9 +209,7 @@ ERR_OPCODE = bytes([0x7F, 0x00])
 ERR_DATA_OOB = asm("LDI HL, 6000\nMOV r0, [HL]\nOUT r0\nHALT")
 ERR_STACK = asm("recurse:\nCALL recurse\n")
 
-
 def stc_program(wlo=0x00, whi=0x08):
-
 
     src = """
       JMP main
@@ -257,9 +230,7 @@ def stc_program(wlo=0x00, whi=0x08):
     b[WLO], b[WHI] = wlo, whi
     return bytes(b)
 
-
 def ext_program():
-
 
     main = bytes([0x70, 0x70, 0x00, 0xF8 | 0, 0xD0 | 3, 0x7E, 0x00])
     h0 = bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x08])
@@ -269,12 +240,7 @@ def ext_program():
         b[VEC + 2 * k:VEC + 2 * k + 2] = addr.to_bytes(2, "little")
     return bytes(b)
 
-
-
-
 def check_solo_step(batch, code, data, inputs, row, kind):
-
-
 
     batch.set_program(0, code, data, inputs)
     push_row(batch, 0, row)
@@ -283,6 +249,7 @@ def check_solo_step(batch, code, data, inputs, row, kind):
     raised = golden_step(g)
     batch.step(1)
     got = batch.snapshot(0)
+    assert_widths(got, ("batch solo", kind))
     if raised:
         assert got["status"] == 3, (kind, "expected ERR", got)
         for k in pre:
@@ -299,7 +266,6 @@ def check_solo_step(batch, code, data, inputs, row, kind):
     assert batch.out(0) == bytes(g.out), (kind, "out")
     return "ok"
 
-
 def test_opcode_enumeration_solo():
     batch = TritonBatch(1, max_in=3)
     tot = {"ok": 0, "err": 0}
@@ -310,7 +276,6 @@ def test_opcode_enumeration_solo():
     print(f"[batch B=1] opcode single step: {256 * 6} cases match "
           f"(ok {tot['ok']} + error {tot['err']})")
     return tot
-
 
 def test_escape_enumeration_solo():
     batch = TritonBatch(1, max_in=3)
@@ -325,10 +290,7 @@ def test_escape_enumeration_solo():
           f"(ok {tot['ok']} + error {tot['err']})")
     return tot
 
-
 def test_opcode_enumeration_packed(width=64):
-
-
 
     cases = [op_case(op, seed) for op in range(256) for seed in range(6)]
     batch = TritonBatch(width, max_in=3)
@@ -347,6 +309,7 @@ def test_opcode_enumeration_packed(width=64):
             pre, pre_data = golden_view(g), list(g.data)
             raised = golden_step(g)
             got = batch.snapshot(i)
+            assert_widths(got, ("packed", base + i))
             if raised:
                 assert got["status"] == 3, (base + i, "expected ERR", got)
                 for k in pre:
@@ -364,11 +327,7 @@ def test_opcode_enumeration_packed(width=64):
           f"launches match (ok {tot['ok']} + error {tot['err']})")
     return tot
 
-
-
-
 def build_batch(specs, **kw):
-
 
     max_in = max(1, max(len(inp) for _, _, _, inp, _, _ in specs))
     batch = TritonBatch(len(specs), max_in=max_in, **kw)
@@ -378,9 +337,7 @@ def build_batch(specs, **kw):
         batch.set_budget(i, budget)
     return batch
 
-
 def compare_batch(tag, batch, specs, res=None):
-
 
     if res is None:
         res = batch.run()
@@ -390,6 +347,7 @@ def compare_batch(tag, batch, specs, res=None):
         g = golden_run(code, data, inputs, row, budget)
         want_status = STATUS[g.status]
         got_status, got_tick = res.status[i], res.ticks[i]
+        assert_widths(batch.snapshot(i), (tag, kind, i, "batch snapshot"))
         assert res.outs[i] == bytes(g.out), (tag, kind, i, "out", res.outs[i], bytes(g.out))
         assert got_status == want_status, (tag, kind, i, "status", got_status, want_status)
         assert got_tick == g.tick, (tag, kind, i, "tick", got_tick, g.tick)
@@ -398,7 +356,6 @@ def compare_batch(tag, batch, specs, res=None):
         assert bytes(batch.code(i)) == padded(g.code), (tag, kind, i, "CODE")
         counts[want_status] = counts.get(want_status, 0) + 1
     return counts, res
-
 
 def random_state(rng, pc=0, sp=None, hl=None, de=None, tick=None):
     return row_of(rng.randrange(256), rng.randrange(256), rng.randrange(256),
@@ -410,10 +367,7 @@ def random_state(rng, pc=0, sp=None, hl=None, de=None, tick=None):
                   rng.randrange(2), rng.randrange(2),
                   tick=rng.randrange(64) if tick is None else tick)
 
-
 def mixed_batch_specs(rng):
-
-
 
     specs = []
     for i in range(24):
@@ -456,7 +410,6 @@ def mixed_batch_specs(rng):
         specs.append(("raw", code, bytes(4096), b"", random_state(rng, pc=0), rng.randrange(80, 400)))
     return specs
 
-
 def test_mixed_batch():
     rng = random.Random(20260923)
     specs = mixed_batch_specs(rng)
@@ -481,9 +434,7 @@ def test_mixed_batch():
           f"inputs and initial states random)")
     return batch, specs, res
 
-
 def varied_finish_specs():
-
 
     specs = []
     for i in range(64):
@@ -493,15 +444,11 @@ def varied_finish_specs():
                       random_state(random.Random(i), tick=0), 200_000))
     return specs
 
-
 def test_varied_finish_and_incremental():
     specs = varied_finish_specs()
     batch = build_batch(specs)
     refs = [golden_machine(code, data, inputs, row, budget)
             for kind, code, data, inputs, row, budget in specs]
-
-
-
 
     total = 0
     mixed_chunks = 0
@@ -513,6 +460,7 @@ def test_varied_finish_and_incremental():
         for i, g in enumerate(refs):
             golden_advance(g, chunk)
             got = batch.snapshot(i)
+            assert_widths(got, ("step", chunk, i, "batch snapshot"))
             assert golden_view(g) == got, ("step", chunk, i, golden_view(g), got)
             assert batch.data(i) == list(g.data), ("step DATA", chunk, i)
             if got["status"] == 0:
@@ -540,9 +488,7 @@ def test_varied_finish_and_incremental():
           f"(halt {counts.get(1, 0)} + error {counts.get(3, 0)})")
     return batch, specs, res
 
-
 def test_large_batch(n=1024):
-
 
     specs = []
     for i in range(n):
@@ -556,14 +502,11 @@ def test_large_batch(n=1024):
           f"in one launch")
     return batch, specs, res
 
-
 def default_row():
 
     return row_of(0, 0, 0, 0, 0, 0, 0, 4096, 0, 0)
 
-
 def test_resident_vs_per_tick():
-
 
     cases = [
         programs.MUL, programs.FIB, programs.SUMREC, programs.LONG_ADD, DIVMOD,
@@ -588,6 +531,7 @@ def test_resident_vs_per_tick():
         old = TritonCircuit(code, data=data, inputs=inp, tick_budget=budget)
         old_out = old.run()
         snap = old.snapshot()
+        assert_widths(snap, ("per-tick path", i))
         assert res.outs[i] == old_out, (i, "resident output differs from the per-tick path")
         assert res.status[i] == snap["status"], (i, res.status[i], snap["status"])
         assert res.ticks[i] == snap["tick"], (i, res.ticks[i], snap["tick"])
@@ -605,9 +549,7 @@ def test_resident_vs_per_tick():
           f"tick and memory on the same {len(cases)} programs (incl. atomic ERR and "
           f"OVERRUN); run() == run_resident()")
 
-
 def test_one_shot_run_batch():
-
 
     cases = [(programs.MUL, bytes([200, 30]), 200_000),
              (DIVMOD, bytes(4096), 200_000),
@@ -621,14 +563,13 @@ def test_one_shot_run_batch():
                     budgets=[b for _, _, b in cases], states=rows)
     for i, (code, data, budget) in enumerate(cases):
         g = golden_run(code, data, b"", rows[i], budget)
+        assert_widths(golden_view(g), ("run_batch reference", i))
         assert res.outs[i] == bytes(g.out), (i, res.outs[i], bytes(g.out))
         assert res.status[i] == STATUS[g.status], (i, res.status[i], g.status)
         assert res.ticks[i] == g.tick, (i, res.ticks[i], g.tick)
     assert res.status[3] == 2 and res.ticks[3] == 250, (res.status[3], res.ticks[3])
     print(f"[batch B={len(cases)}] one-shot run_batch(): per-machine budgets, initial "
           f"states and outputs all match the reference (budget exhaustion included)")
-
-
 
 BENCH_ROWS = [
     (programs.MUL, bytes([200, 30]), b""),
@@ -637,16 +578,7 @@ BENCH_ROWS = [
     (delay_prog(128, 8), bytes(64), b""),
 ] * 8
 
-
 def benchmark(reps=5):
-
-
-
-
-
-
-
-
 
     codes = [c for c, _, _ in BENCH_ROWS]
     datas = [d for _, d, _ in BENCH_ROWS]
@@ -659,7 +591,6 @@ def benchmark(reps=5):
     images = [torch.tensor(list(d), dtype=torch.int32, device=batch.dev) for d in datas]
 
     def reset(b, first):
-
 
         b.STATE.zero_()
         b.STATE[:, 7] = DATA_SIZE
@@ -717,7 +648,6 @@ def benchmark(reps=5):
           f"run_resident() wraps this path)")
     return best_old, best_batch, total_ticks
 
-
 def run_all():
     print("resident batched executor acceptance:")
     test_opcode_enumeration_solo()
@@ -729,7 +659,6 @@ def run_all():
     test_resident_vs_per_tick()
     test_one_shot_run_batch()
     print("batched execution: all passed")
-
 
 if __name__ == "__main__":
     if "--bench" in sys.argv:

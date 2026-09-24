@@ -13,10 +13,8 @@ from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
 from test_circuit_equivalence import golden_view, lockstep
 
-
 def _both(code, data, inputs=b""):
     return NCP8(code, data=data, inputs=inputs), TorchCircuit(code, data=data, inputs=inputs)
-
 
 def test_mul():
     rng = random.Random(3)
@@ -31,7 +29,6 @@ def test_mul():
         assert g == want, (a, b, g, want)
     print("multiply: 200 random pairs, reference == Python truth, both circuits lockstep")
 
-
 def test_nested():
     for n in range(0, 125):
         data = bytearray(1); data[0] = n
@@ -43,13 +40,7 @@ def test_nested():
         assert got == want, (n, got, want)
     print("three-level nested CALL/RET: stack depth up to 124, all bit-exact")
 
-
 def test_overflow_atomic():
-
-
-
-
-
 
     for Mach in (TorchCircuit, TritonCircuit):
         g = NCP8(programs.OVERFLOW, data=bytearray(4))
@@ -84,7 +75,6 @@ def test_overflow_atomic():
         assert raised, "the reference never raised the stack error"
         print(f"  stack overflow captured at tick {n}: violating tick atomic in both implementations")
     print("stack overflow capture: violating tick atomic and identical (no silent wraparound)")
-
 
 if __name__ == "__main__":
     test_mul()

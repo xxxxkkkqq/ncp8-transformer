@@ -45,9 +45,7 @@ STW_HLDE, STW_DEHL, LDW_DEHL, LDW_HLDE = 72, 73, 74, 75
 LDX, STX, ADD_SP, MULH = 76, 77, 78, 79
 K = 80
 
-
 def _rom2():
-
 
     alu = [BAD] * 256; s0 = [0] * 256; s1 = [0] * 256; lx = [0] * 256
 
@@ -81,9 +79,7 @@ def _rom2():
     t = lambda xs: torch.tensor(xs, dtype=torch.int32)
     return t(alu), t(s0), t(s1), t(lx)
 
-
 _ALU2, _S02, _S12, _LX2 = _rom2()
-
 
 def _rom():
     alu = [BAD] * 256; s0 = [0] * 256; s1 = [0] * 256; ln = [1] * 256
@@ -135,13 +131,39 @@ def _rom():
     t = lambda xs: torch.tensor(xs, dtype=torch.int32)
     return t(alu), t(s0), t(s1), t(ln)
 
-
 _ALU, _S0, _S1, _LEN = _rom()
 
+def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, where=""):
+
+    def outside(field, value, lo, hi):
+        raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
+
+    for i, v in enumerate(list(R)):
+        if not 0 <= v < 256:
+            outside(f"r[{i}]", v, 0, 255)
+    for field, v in (("HL", HL), ("DE", DE), ("PC", PC)):
+        if not 0 <= v < 65536:
+            outside(field, v, 0, 65535)
+    if not 0 <= SP <= DATA_SIZE:
+        outside("SP", SP, 0, DATA_SIZE)
+    for field, v in (("C", C), ("Z", Z)):
+        if v not in (0, 1):
+            outside(field, v, 0, 1)
+    if not 0 <= oplen <= OUT_CAP:
+        outside("oplen", oplen, 0, OUT_CAP)
+    for field, v in (("ipos", ipos), ("tick", tick)):
+        if v < 0:
+            outside(field, v, 0, "unbounded")
+    if status not in (0, 1, 2, 3):
+        outside("status", status, 0, 3)
 
 class TorchCircuit:
     def __init__(self, code, data=None, inputs=b"", tick_budget=200_000, device="cuda", rom_override=None):
 
+        if len(code) > CODE_SIZE:
+            raise ValueError(f"code image is {len(code)} bytes, above CODE_SIZE {CODE_SIZE}")
+        if data and len(data) > DATA_SIZE:
+            raise ValueError(f"data image is {len(data)} bytes, above DATA_SIZE {DATA_SIZE}")
         dev = torch.device(device)
         self.dev = dev
         i32 = torch.int32
@@ -160,7 +182,8 @@ class TorchCircuit:
             setattr(self, n, torch.zeros(1, dtype=i32, device=dev))
         self.SP += DATA_SIZE
         self.status = torch.zeros(1, dtype=i32, device=dev)
-        self.tb = tick_budget
+        self.TB = torch.tensor([int(tick_budget)], dtype=i32, device=dev)
+        self.tb = int(tick_budget)
         if rom_override is not None:
             alu_v, s0_v, s1_v, ln_v = [v.cpu() for v in rom_override]
         else:
@@ -201,7 +224,6 @@ class TorchCircuit:
         dev, i32 = self.dev, torch.int32
         w = lambda m, a, b: m * a + (1 - m) * b
 
-
         zero = torch.zeros((), dtype=i32, device=dev)
         fetch_ok = (self.PC < self.codelen).to(i32)
         op = self.CODE.index_select(0, self.PC.clamp(0, CODE_SIZE - 1).reshape(1)).reshape(())
@@ -227,7 +249,6 @@ class TorchCircuit:
         ln_e = _lnt * (1 - esc) + (2 + self.lx2_t) * esc
         t16 = imm0 | (imm1 << 8)
 
-
         a = (self.R * (ind[:, None] * oh_s0).sum(0)).sum()
         b = (self.R * (ind[:, None] * oh_s1).sum(0)).sum()
         rr = (self.R * (ind[:, None] * self.OH_R).sum(0)).sum()
@@ -247,16 +268,11 @@ class TorchCircuit:
         inb = self._g(self.INPUTS, self.ipos)
         eof = (self.ipos >= self.inlen).to(i32)
 
-
-
-
-
         sx = imm0 - ((imm0 >> 7) & 1) * 256
         fr = (self.HL + sx) & 0xFFFF
         dfr = self._g(self.DATA, fr)
         dhl1 = self._g(self.DATA, self.HL + 1)
         dde1 = self._g(self.DATA, self.DE + 1)
-
 
         t_add = a + b; v_add = t_add & 255; c_add = t_add >> 8
         t_adc = a + b + self.C; v_adc = t_adc & 255; c_adc = t_adc >> 8
@@ -295,7 +311,6 @@ class TorchCircuit:
         v_ldw_de = dl | (dhl1 << 8)
         v_ldw_hl = der | (dde1 << 8)
         v_sp_add = (self.SP + sx) & 0xFFFF
-
 
         RHL_EN = oh(MOV_R_HL) + oh(MOV_HL_R)
         rows_R_val = (
@@ -406,12 +421,10 @@ class TorchCircuit:
         rows_out_val = oh(OUT) * rr + oh(OUTM) * dl + oh(OUTDE) * der
         rows_out_en = oh(OUT) + oh(OUTM) + oh(OUTDE)
 
-
         fetch_ok_rows = (self.PC + ln_e <= self.codelen).to(i32)
         hl_ok = (self.HL < DATA_SIZE).to(i32); de_ok = (self.DE < DATA_SIZE).to(i32)
         sp_lo = (self.SP > 0).to(i32); sp_lo2 = (self.SP >= 2).to(i32); sp_hi = (self.SP < DATA_SIZE).to(i32)
         sp_hi1 = ((self.SP + 1) < DATA_SIZE).to(i32)
-
 
         hl_ok2 = ((self.HL + 1) < DATA_SIZE).to(i32)
         de_ok2 = ((self.DE + 1) < DATA_SIZE).to(i32)
@@ -435,14 +448,19 @@ class TorchCircuit:
                   + oh(LDC) * (1 - code_ok) + oh(STC) * (1 - sc_ok))
         v3_err = (oh(MOVW_SP_HL) * (1 - hl_sp_ok) + oh(MOVW_SP_DE) * (1 - de_sp_ok)
                   + oh(ADD_SP) * (1 - sp_add_ok))
-        err = (ind * (oh(BAD) + (1 - fetch_ok_rows) + rd_rows + st_rows + v2_err + v3_err)).sum() + (1 - fetch_ok)
 
+        out_ovf = (ind * rows_out_en * (self.oplen >= OUT_CAP).to(i32)).sum()
+        err = (ind * (oh(BAD) + (1 - fetch_ok_rows) + rd_rows + st_rows + v2_err + v3_err)).sum() \
+            + out_ovf + (1 - fetch_ok)
 
         sel = lambda rows: (ind * rows).sum()
         R_w = (ind[:, None] * oh_s0 * rows_R_en[:, None]).sum(0)
         R_v = (ind[:, None] * oh_s0 * (rows_R_en * rows_R_val)[:, None]).sum(0)
         ok = (err == 0).to(i32)
 
+        running = (self.status == 0).to(i32)
+        over = running * (self.tick >= self.TB).to(i32)
+        m = ok * running * (1 - over)
 
         a1 = sel(oh(MOV_HL_R) * self.HL + oh(MOV_DE_R) * self.DE
                  + oh(PUSH) * (self.SP - 1) + oh(CALL) * (self.SP - 1)
@@ -456,7 +474,7 @@ class TorchCircuit:
                  + oh(STW_HLDE) * (self.DE & 255) + oh(STW_DEHL) * (self.HL & 255)
                  + oh(STX) * rr)
         e1 = sel(oh(MOV_HL_R) + oh(MOV_DE_R) + oh(PUSH) + oh(CALL) + oh(EXT)
-                 + oh(PUSHW_HL) + oh(PUSHW_DE) + oh(STW_HLDE) + oh(STW_DEHL) + oh(STX)) * ok
+                 + oh(PUSHW_HL) + oh(PUSHW_DE) + oh(STW_HLDE) + oh(STW_DEHL) + oh(STX)) * m
         oh1 = ((self.RD == a1).to(i32)) * e1
         self.DATA = oh1 * v1 + (1 - oh1) * self.DATA
         a2 = sel(oh(CALL) * (self.SP - 2) + oh(EXT) * (self.SP - 2)
@@ -466,17 +484,16 @@ class TorchCircuit:
                  + oh(PUSHW_HL) * (self.HL & 255) + oh(PUSHW_DE) * (self.DE & 255)
                  + oh(STW_HLDE) * ((self.DE >> 8) & 255) + oh(STW_DEHL) * ((self.HL >> 8) & 255))
         e2 = sel(oh(CALL) + oh(EXT) + oh(PUSHW_HL) + oh(PUSHW_DE)
-                 + oh(STW_HLDE) + oh(STW_DEHL)) * ok
+                 + oh(STW_HLDE) + oh(STW_DEHL)) * m
         oh2 = ((self.RD == a2).to(i32)) * e2
         self.DATA = oh2 * v2 + (1 - oh2) * self.DATA
 
-
-        a3 = sel(oh(STC) * self.HL); v3 = sel(oh(STC) * rr); e3 = sel(oh(STC)) * ok
+        a3 = sel(oh(STC) * self.HL); v3 = sel(oh(STC) * rr); e3 = sel(oh(STC)) * m
         oh3 = ((self.RC == a3).to(i32)) * e3
         self.CODE = oh3 * v3 + (1 - oh3) * self.CODE
 
-        ov = sel(rows_out_val) * ok
-        oe = sel(rows_out_en) * ok
+        ov = sel(rows_out_val) * m
+        oe = sel(rows_out_en) * m
         oh_out = (self.RO == self.oplen).to(i32) * oe
         self.OUTBUF = oh_out * ov + (1 - oh_out) * self.OUTBUF
         self.oplen = self.oplen + oe
@@ -485,11 +502,10 @@ class TorchCircuit:
         new_status = torch.where(err > 0, 3 * torch.ones(1, dtype=i32, device=dev),
                                  torch.where(halt_en > 0, torch.ones(1, dtype=i32, device=dev),
                                              torch.zeros(1, dtype=i32, device=dev)))
-        self.status = new_status
+        new_status = torch.where(over > 0, 2 * torch.ones(1, dtype=i32, device=dev), new_status)
+        self.status = running * new_status + (1 - running) * self.status
 
-
-        m = ok
-        self.R = m * (R_w * R_v + (1 - R_w) * self.R) + (1 - m) * self.R
+        self.R = m * ((R_w * R_v + (1 - R_w) * self.R) & 255) + (1 - m) * self.R
         self.HL = (m * sel(rows_HL) + (1 - m) * self.HL) & 0xFFFF
         self.DE = (m * sel(rows_DE) + (1 - m) * self.DE) & 0xFFFF
         self.PC = m * sel(rows_PC) + (1 - m) * self.PC
@@ -502,7 +518,9 @@ class TorchCircuit:
     def _g(self, buf, idx):
         return buf.index_select(0, idx.clamp(0, buf.numel() - 1).reshape(1)).reshape(()).to(torch.int32)
 
-    def load_state(self, R, HL, DE, SP, C, Z, tick):
+    def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0):
+
+        check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC)
         t = torch.tensor
         self.R = t(R, dtype=torch.int32, device=self.dev)
         self.HL = t([HL], dtype=torch.int32, device=self.dev)
@@ -511,6 +529,7 @@ class TorchCircuit:
         self.C = t([C], dtype=torch.int32, device=self.dev)
         self.Z = t([Z], dtype=torch.int32, device=self.dev)
         self.tick = t([tick], dtype=torch.int32, device=self.dev)
+        self.PC = t([PC], dtype=torch.int32, device=self.dev)
 
     def snapshot(self):
         return dict(r=self.R.tolist(), HL=self.HL.item(), DE=self.DE.item(),
@@ -519,12 +538,12 @@ class TorchCircuit:
                     status=int(self.status.item()))
 
     def out(self):
-        n = self.oplen.item()
+
+        n = min(int(self.oplen.item()), OUT_CAP)
         return bytes(self.OUTBUF[:n].cpu().tolist())
 
     def run(self):
-        while int(self.status.item()) == 0 and int(self.tick.item()) < self.tb:
+
+        while int(self.status.item()) == 0:
             self.step()
-        if int(self.status.item()) == 0 and int(self.tick.item()) >= self.tb:
-            self.status = torch.tensor([2], dtype=torch.int32, device=self.dev)
         return self.out()
