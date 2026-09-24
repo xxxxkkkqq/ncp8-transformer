@@ -40,11 +40,9 @@ VEC = 0x0F00
 WLO, WHI = 0x0F20, 0x0F21
 STATE_LEN = 14
 
-
 def golden_view(g):
     return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
                 ipos=g.ipos, oplen=len(g.out), tick=g.tick, status=STATUS[g.status])
-
 
 def golden_machine(code, data=b"", inputs=b"", row=None, budget=200_000):
 
@@ -56,14 +54,7 @@ def golden_machine(code, data=b"", inputs=b"", row=None, budget=200_000):
         assert_widths(golden_view(g), ("golden machine", row))
     return g
 
-
 def golden_step(g):
-
-
-
-
-
-
 
     pre, pre_data = golden_view(g), list(g.data)
     pre_code, pre_out = bytes(g.code), bytes(g.out)
@@ -78,10 +69,7 @@ def golden_step(g):
         assert bytes(g.out) == pre_out, "reference wrote output before raising"
         return True
 
-
 def golden_run(code, data=b"", inputs=b"", row=None, budget=200_000):
-
-
 
     g = golden_machine(code, data, inputs, row, budget)
     raised = False
@@ -95,14 +83,7 @@ def golden_run(code, data=b"", inputs=b"", row=None, budget=200_000):
         g.status = "OVERRUN"
     return g
 
-
 def golden_advance(g, steps):
-
-
-
-
-
-
 
     for _ in range(steps):
         if g.status != "RUNNING":
@@ -112,14 +93,11 @@ def golden_advance(g, steps):
             break
     return g
 
-
 def padded(code):
     return bytes(code).ljust(CODE_SIZE, b"\x00")
 
-
 def row_of(r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos=0, oplen=0, tick=0, status=0):
     return [r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos, oplen, tick, status]
-
 
 def push_row(batch, i, row):
 
@@ -127,11 +105,7 @@ def push_row(batch, i, row):
                     C=row[8], Z=row[9], ipos=row[10], oplen=row[11], tick=row[12],
                     status=row[13])
 
-
-
-
 def op_case(op, seed):
-
 
     rng = random.Random(seed)
     code = bytes([op, rng.randrange(256), rng.randrange(256)])
@@ -145,14 +119,7 @@ def op_case(op, seed):
     tick = rng.randrange(100)
     return code, data, inputs, row_of(R[0], R[1], R[2], R[3], HL, DE, 0, SP, C, Z, tick=tick)
 
-
 def esc_case(sub, vec, seed):
-
-
-
-
-
-
 
     rng = random.Random(seed * 977 + sub + (1 << 20 if vec else 0))
     b = bytearray(WLO)
@@ -173,7 +140,6 @@ def esc_case(sub, vec, seed):
     return code, data, b"", row_of(R[0], R[1], R[2], R[3], HL, DE, 0, SP, C, Z,
                                    tick=rng.randrange(100))
 
-
 DELAY_SRC = """
   LDI r0, {j}
   LDI r1, {k}
@@ -188,9 +154,7 @@ inner:
   HALT
 """
 
-
 def delay_prog(j, k):
-
 
     return asm(DELAY_SRC.format(j=j, k=k))
 
@@ -245,9 +209,7 @@ ERR_OPCODE = bytes([0x7F, 0x00])
 ERR_DATA_OOB = asm("LDI HL, 6000\nMOV r0, [HL]\nOUT r0\nHALT")
 ERR_STACK = asm("recurse:\nCALL recurse\n")
 
-
 def stc_program(wlo=0x00, whi=0x08):
-
 
     src = """
       JMP main
@@ -268,9 +230,7 @@ def stc_program(wlo=0x00, whi=0x08):
     b[WLO], b[WHI] = wlo, whi
     return bytes(b)
 
-
 def ext_program():
-
 
     main = bytes([0x70, 0x70, 0x00, 0xF8 | 0, 0xD0 | 3, 0x7E, 0x00])
     h0 = bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x08])
@@ -280,12 +240,7 @@ def ext_program():
         b[VEC + 2 * k:VEC + 2 * k + 2] = addr.to_bytes(2, "little")
     return bytes(b)
 
-
-
-
 def check_solo_step(batch, code, data, inputs, row, kind):
-
-
 
     batch.set_program(0, code, data, inputs)
     push_row(batch, 0, row)
@@ -311,7 +266,6 @@ def check_solo_step(batch, code, data, inputs, row, kind):
     assert batch.out(0) == bytes(g.out), (kind, "out")
     return "ok"
 
-
 def test_opcode_enumeration_solo():
     batch = TritonBatch(1, max_in=3)
     tot = {"ok": 0, "err": 0}
@@ -322,7 +276,6 @@ def test_opcode_enumeration_solo():
     print(f"[batch B=1] opcode single step: {256 * 6} cases match "
           f"(ok {tot['ok']} + error {tot['err']})")
     return tot
-
 
 def test_escape_enumeration_solo():
     batch = TritonBatch(1, max_in=3)
@@ -337,10 +290,7 @@ def test_escape_enumeration_solo():
           f"(ok {tot['ok']} + error {tot['err']})")
     return tot
 
-
 def test_opcode_enumeration_packed(width=64):
-
-
 
     cases = [op_case(op, seed) for op in range(256) for seed in range(6)]
     batch = TritonBatch(width, max_in=3)
@@ -377,11 +327,7 @@ def test_opcode_enumeration_packed(width=64):
           f"launches match (ok {tot['ok']} + error {tot['err']})")
     return tot
 
-
-
-
 def build_batch(specs, **kw):
-
 
     max_in = max(1, max(len(inp) for _, _, _, inp, _, _ in specs))
     batch = TritonBatch(len(specs), max_in=max_in, **kw)
@@ -391,9 +337,7 @@ def build_batch(specs, **kw):
         batch.set_budget(i, budget)
     return batch
 
-
 def compare_batch(tag, batch, specs, res=None):
-
 
     if res is None:
         res = batch.run()
@@ -413,7 +357,6 @@ def compare_batch(tag, batch, specs, res=None):
         counts[want_status] = counts.get(want_status, 0) + 1
     return counts, res
 
-
 def random_state(rng, pc=0, sp=None, hl=None, de=None, tick=None):
     return row_of(rng.randrange(256), rng.randrange(256), rng.randrange(256),
                   rng.randrange(256),
@@ -424,10 +367,7 @@ def random_state(rng, pc=0, sp=None, hl=None, de=None, tick=None):
                   rng.randrange(2), rng.randrange(2),
                   tick=rng.randrange(64) if tick is None else tick)
 
-
 def mixed_batch_specs(rng):
-
-
 
     specs = []
     for i in range(24):
@@ -470,7 +410,6 @@ def mixed_batch_specs(rng):
         specs.append(("raw", code, bytes(4096), b"", random_state(rng, pc=0), rng.randrange(80, 400)))
     return specs
 
-
 def test_mixed_batch():
     rng = random.Random(20260923)
     specs = mixed_batch_specs(rng)
@@ -495,9 +434,7 @@ def test_mixed_batch():
           f"inputs and initial states random)")
     return batch, specs, res
 
-
 def varied_finish_specs():
-
 
     specs = []
     for i in range(64):
@@ -507,15 +444,11 @@ def varied_finish_specs():
                       random_state(random.Random(i), tick=0), 200_000))
     return specs
 
-
 def test_varied_finish_and_incremental():
     specs = varied_finish_specs()
     batch = build_batch(specs)
     refs = [golden_machine(code, data, inputs, row, budget)
             for kind, code, data, inputs, row, budget in specs]
-
-
-
 
     total = 0
     mixed_chunks = 0
@@ -555,9 +488,7 @@ def test_varied_finish_and_incremental():
           f"(halt {counts.get(1, 0)} + error {counts.get(3, 0)})")
     return batch, specs, res
 
-
 def test_large_batch(n=1024):
-
 
     specs = []
     for i in range(n):
@@ -571,14 +502,11 @@ def test_large_batch(n=1024):
           f"in one launch")
     return batch, specs, res
 
-
 def default_row():
 
     return row_of(0, 0, 0, 0, 0, 0, 0, 4096, 0, 0)
 
-
 def test_resident_vs_per_tick():
-
 
     cases = [
         programs.MUL, programs.FIB, programs.SUMREC, programs.LONG_ADD, DIVMOD,
@@ -621,9 +549,7 @@ def test_resident_vs_per_tick():
           f"tick and memory on the same {len(cases)} programs (incl. atomic ERR and "
           f"OVERRUN); run() == run_resident()")
 
-
 def test_one_shot_run_batch():
-
 
     cases = [(programs.MUL, bytes([200, 30]), 200_000),
              (DIVMOD, bytes(4096), 200_000),
@@ -645,8 +571,6 @@ def test_one_shot_run_batch():
     print(f"[batch B={len(cases)}] one-shot run_batch(): per-machine budgets, initial "
           f"states and outputs all match the reference (budget exhaustion included)")
 
-
-
 BENCH_ROWS = [
     (programs.MUL, bytes([200, 30]), b""),
     (programs.FIB, bytes([13]), b""),
@@ -654,16 +578,7 @@ BENCH_ROWS = [
     (delay_prog(128, 8), bytes(64), b""),
 ] * 8
 
-
 def benchmark(reps=5):
-
-
-
-
-
-
-
-
 
     codes = [c for c, _, _ in BENCH_ROWS]
     datas = [d for _, d, _ in BENCH_ROWS]
@@ -676,7 +591,6 @@ def benchmark(reps=5):
     images = [torch.tensor(list(d), dtype=torch.int32, device=batch.dev) for d in datas]
 
     def reset(b, first):
-
 
         b.STATE.zero_()
         b.STATE[:, 7] = DATA_SIZE
@@ -734,7 +648,6 @@ def benchmark(reps=5):
           f"run_resident() wraps this path)")
     return best_old, best_batch, total_ticks
 
-
 def run_all():
     print("resident batched executor acceptance:")
     test_opcode_enumeration_solo()
@@ -746,7 +659,6 @@ def run_all():
     test_resident_vs_per_tick()
     test_one_shot_run_batch()
     print("batched execution: all passed")
-
 
 if __name__ == "__main__":
     if "--bench" in sys.argv:

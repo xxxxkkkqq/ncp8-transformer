@@ -10,11 +10,9 @@ import random
 
 from sympy import primerange
 
-
 def W_star(p):
     X = 3 * p - 2
     return X.bit_length() - (1 if (X & (X - 1)) == 0 else 0)
-
 
 def test_bitwidth_formula():
     ps = list(primerange(2, 2048))
@@ -31,7 +29,6 @@ def test_bitwidth_formula():
     assert W_star(7) == 5 and 2 ** 4 <= 3 * 7 - 3 < 2 ** 5
     print("p=7 tightness counterexample: W*=5, W=4 overflows (18 > 16)")
 
-
     for p in [2, 3, 7, 101, 997]:
         for R in [2, 4, 10, 256]:
             zmax = (2 * R - 1) * (p - 1)
@@ -40,7 +37,6 @@ def test_bitwidth_formula():
             s = p - 1; d = R - 1; b = p - 1
             assert R * s + d * b == zmax, "z_max is reachable"
     print("radix-R bound z <= (2R-1)(p-1) and reachable (R in {2,4,10,256})")
-
 
 def test_p6_roundtrip():
 
@@ -55,7 +51,6 @@ def test_p6_roundtrip():
 
         assert "".join(chr(c) for c in s.encode()) == s
     print("radix conversion: 200,000 random bigints string<->int<->bytes round trip identity")
-
 
 def test_ncp_bytes_semantics_vs_python():
 
@@ -75,7 +70,6 @@ def test_ncp_bytes_semantics_vs_python():
         if s >= 1 << (8 * n):
             assert carry == 1
     print("ADC carry-chain semantics == Python big integer (2000 random pairs)")
-
 
 if __name__ == "__main__":
     test_bitwidth_formula()

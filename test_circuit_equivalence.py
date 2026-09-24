@@ -15,24 +15,14 @@ from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
 from test_state_contract import assert_widths
 
-
-
 PC_SITES = (0, 256)
-
 
 def golden_view(g):
     return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
                 ipos=g.ipos, oplen=len(g.out), tick=g.tick,
                 status={"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}[g.status])
 
-
 def one_step_agreement(Machine, op, seed, pc=0):
-
-
-
-
-
-
 
     rng = random.Random(seed)
     code = bytes(pc) + bytes([op, rng.randrange(256), rng.randrange(256)])
@@ -63,10 +53,6 @@ def one_step_agreement(Machine, op, seed, pc=0):
 
     if g_err:
 
-
-
-
-
         assert golden_view(g) == pre_g, (op, seed, "reference error tick was not atomic",
                                          pre_g, golden_view(g))
         assert list(g.data) == pre_data, (op, seed, "reference modified DATA before raising")
@@ -90,14 +76,7 @@ def one_step_agreement(Machine, op, seed, pc=0):
         assert c.out() == bytes(g.out), (op, seed, "out")
         return "ok"
 
-
 def test_all_opcodes(Machine, name):
-
-
-
-
-
-
 
     import torch
     total = {"ok": 0, "err": 0}
@@ -115,7 +94,6 @@ def test_all_opcodes(Machine, name):
     print(f"        single step executed at PC in {PC_SITES} (wider than 8-bit sources"
           f" are only visible away from address 0): {n // len(PC_SITES)} cases per site")
 
-
 def lockstep(g, c):
     n = 0
     while g.status == "RUNNING" and g.tick < g.tb and int(c.status.item()) == 0:
@@ -131,7 +109,6 @@ def lockstep(g, c):
     assert c.out() == bytes(g.out)
     return n
 
-
 def lockstep(g, c):
     n = 0
     while g.status == "RUNNING" and g.tick < g.tb and int(c.status.item()) == 0:
@@ -143,7 +120,6 @@ def lockstep(g, c):
     assert int(c.status.item()) == 1
     assert c.out() == bytes(g.out)
     return n
-
 
 def test_programs(Machine, name):
     import programs
@@ -169,7 +145,6 @@ def test_programs(Machine, name):
         data = bytearray(n + 16); data[0] = n
         t += lockstep(NCP8(programs.SUMREC, data=data), Machine(programs.SUMREC, data=data))
     print(f"[{name}] sumrec lockstep: 5 cases {t} tick ")
-
 
 if __name__ == "__main__":
     test_all_opcodes(TorchCircuit, "torch")

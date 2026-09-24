@@ -29,22 +29,13 @@ DATA_SIZE = 4096
 CODE_SIZE = 4096
 OUT_CAP = 8192
 
-
 R_BITS = 8
 PTR_BITS = 16
-
 
 class MachineError(Exception):
     pass
 
-
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, where=""):
-
-
-
-
-
-
 
     def outside(field, value, lo, hi):
         raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
@@ -67,7 +58,6 @@ def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, wh
             outside(field, v, 0, "unbounded")
     if status not in (0, 1, 2, 3):
         outside("status", status, 0, 3)
-
 
 class NCP8:
     def __init__(self, code, data=None, inputs=b"", tick_budget=200_000):
@@ -108,12 +98,6 @@ class NCP8:
 
     def _mem16(self, addr):
 
-
-
-
-
-
-
         if not (0 <= addr and addr + 1 < DATA_SIZE):
             raise MachineError(f"DATA out of range: {addr}")
         return addr
@@ -127,30 +111,15 @@ class NCP8:
 
     def _stack_room(self, n):
 
-
-
-
-
-
-
-
         if not (0 <= self.SP - n and self.SP <= DATA_SIZE):
             raise MachineError("stack underflow")
 
     def _stack_have(self, n):
 
-
-
-
-
         if not (0 <= self.SP and self.SP + n <= DATA_SIZE):
             raise MachineError("stack overflow")
 
     def _emit(self, v):
-
-
-
-
 
         if len(self.out) >= self.out_cap:
             raise MachineError(f"output capacity {self.out_cap} exhausted")
@@ -168,10 +137,6 @@ class NCP8:
         return v
 
     def step(self):
-
-
-
-
 
         pc0 = self.PC
         try:
@@ -473,25 +438,12 @@ class NCP8:
         return dict(r=list(self.r), HL=self.HL, DE=self.DE, SP=self.SP, PC=self.PC,
                     C=self.C, Z=self.Z, tick=self.tick, status=self.status)
 
-
-
-
 class AssemblyError(Exception):
-
-
-
-
-
-
-
-
-
 
     def __init__(self, msg, line=None):
         self.msg = msg
         self.line = line
         super().__init__(f"line {line}: {msg}" if line is not None else msg)
-
 
 def asm(src: str) -> bytes:
     pat = re.compile(r"^(\w+):$")
@@ -514,20 +466,11 @@ def asm(src: str) -> bytes:
 
         def _reg(x):
 
-
-
-
-
-
             if not isinstance(x, str) or x not in ("r0", "r1", "r2", "r3"):
                 _bad(f"invalid register operand {x!r} in {text!r}")
             return int(x[1])
 
         def _value(x):
-
-
-
-
 
             s = str(x)
             if s in labels:
@@ -544,9 +487,6 @@ def asm(src: str) -> bytes:
 
             if not strict:
 
-
-
-
                 return 0
             v = _value(x)
             if not 0 <= v <= 0xFFFF:
@@ -554,12 +494,6 @@ def asm(src: str) -> bytes:
             return v
 
         def _imm8(x, mnemonic):
-
-
-
-
-
-
 
             if not strict:
                 return 0
@@ -578,11 +512,6 @@ def asm(src: str) -> bytes:
 
         def _imm8s(x, mnemonic):
 
-
-
-
-
-
             if not strict:
                 return 0
             s = str(x)
@@ -599,12 +528,6 @@ def asm(src: str) -> bytes:
             return v & 0xFF
 
         def _frame_off(x, mnemonic):
-
-
-
-
-
-
 
             if not strict:
                 return 0
@@ -700,7 +623,6 @@ def asm(src: str) -> bytes:
                  "SHL": 0x60, "SHR": 0x64, "TST": 0x68}
         if name in unary:
             return bytes([unary[name] | _reg(args[0])])
-
 
         movw = {("HL", "DE"): 0x30, ("DE", "HL"): 0x31, ("HL", "SP"): 0x32,
                 ("DE", "SP"): 0x33, ("SP", "HL"): 0x34, ("SP", "DE"): 0x35}

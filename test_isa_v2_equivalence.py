@@ -29,7 +29,6 @@ VEC = 0x0F00
 
 PC_SITES = (0, 256)
 
-
 def _code_esc(sub, vec=0, pc=0, tail=(0xAA, 0x55)):
 
     b = bytearray(max(0x0F20, pc + 4))
@@ -39,23 +38,16 @@ def _code_esc(sub, vec=0, pc=0, tail=(0xAA, 0x55)):
             b[VEC + 2 * k: VEC + 2 * k + 2] = (vec & 0xFFFF).to_bytes(2, "little")
     return bytes(b)
 
-
-
 def _golden_view(g):
     return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
                 ipos=g.ipos, oplen=len(g.out), tick=g.tick,
                 status={"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}[g.status])
 
-
 def _ptr(rng, boundary):
-
-
-
 
     if boundary:
         return rng.choice([0, 1, 4093, 4094, 4095, 4096, 4097, 65535])
     return rng.randrange(4094)
-
 
 def one_esc_step(Machine, sub, seed, vec=0, pc=0):
 
@@ -83,8 +75,6 @@ def one_esc_step(Machine, sub, seed, vec=0, pc=0):
     assert_widths(cv, (Machine.__name__, "post-tick", sub, seed, pc))
     if g_err:
 
-
-
         assert _golden_view(g) == pre, (sub, seed, pc, "reference error tick was not atomic",
                                         pre, _golden_view(g))
         assert list(g.data) == pre_data, (sub, seed, "reference modified DATA before raising")
@@ -104,10 +94,6 @@ def one_esc_step(Machine, sub, seed, vec=0, pc=0):
     assert list(g.data) == list(c.DATA.cpu().tolist()), (sub, seed, "DATA")
     return "ok"
 
-
-
-
-
 NEW_SUBCODES = {
     0x30: "MOVW HL, DE", 0x31: "MOVW DE, HL", 0x32: "MOVW HL, SP", 0x33: "MOVW DE, SP",
     0x34: "MOVW SP, HL", 0x35: "MOVW SP, DE",
@@ -119,14 +105,7 @@ NEW_SUBCODES.update({0x50 | r: re.compile(rf"LDX r{r}, \[HL[-+]?\d+\]") for r in
 NEW_SUBCODES.update({0x54 | r: re.compile(rf"STX \[HL[-+]?\d+\], r{r}") for r in range(4)})
 NEW_SUBCODES.update({0x90 | f: re.compile(rf"MULH r{f >> 2}, r{f & 3}") for f in range(16)})
 
-
 def _executed_new_subcodes(trace):
-
-
-
-
-
-
 
     seen = set()
     for line in trace:
@@ -134,7 +113,6 @@ def _executed_new_subcodes(trace):
             if (pat.search(line) if hasattr(pat, "search") else pat in line):
                 seen.add(sub)
     return seen
-
 
 def test_esc_subcodes(Machine, name):
     import torch
@@ -152,13 +130,11 @@ def test_esc_subcodes(Machine, name):
     n = 256 * 2 * 4 * len(PC_SITES)
     assert sum(tot.values()) == n, (tot, n)
 
-
     missing = sorted(set(NEW_SUBCODES) - legal)
     assert not missing, ("v3.0 subcodes with no legal single-step case",
                          [hex(s) for s in missing])
     print(f"[{name}] escape subcode single step: {n} cases match (ok {tot['ok']} + error {tot['err']}); "
           f"all {len(NEW_SUBCODES)} v3.0 subcodes have a legal case; executed at PC in {PC_SITES}")
-
 
 def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=None, trace_out=None):
     g = NCP8(code, data=data, inputs=inputs, tick_budget=max_tick)
@@ -178,7 +154,6 @@ def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=N
             c.step()
             assert c.snapshot()["status"] == 3, (name, "circuit did not report ERR on the error tick")
 
-
             assert _golden_view(g) == gs, (name, "reference error tick was not atomic", gs, _golden_view(g))
             assert list(g.data) == gdata, (name, "reference modified DATA before raising")
             assert bytes(g.out) == gout, (name, "reference wrote output before raising")
@@ -188,7 +163,6 @@ def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=N
         c.step(); n += 1
         assert_widths(c.snapshot(), (name, "circuit after tick", n))
     if not raised:
-
 
         gs = _golden_view(g); cv = c.snapshot()
         assert_widths(gs, (name, "reference final"))
@@ -203,22 +177,15 @@ def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=N
         trace_out.extend(g.trace)
     return n
 
-
 def _with_vec(code, table):
     b = bytearray(bytes(code).ljust(max(VEC + 2 * (k + 1) for k in table), b"\x00"))
     for k, addr in table.items():
         b[VEC + 2 * k: VEC + 2 * k + 2] = (addr & 0xFFFF).to_bytes(2, "little")
     return bytes(b)
 
-
 WLO, WHI = 0x0F20, 0x0F21
 
-
 def test_selfmod_lockstep(Machine, name):
-
-
-
-
 
     src = """    JMP main
 sub:
@@ -239,8 +206,6 @@ main:
         b[WLO], b[WHI] = wlo, whi
         return bytes(b)
 
-
-
     n = _lockstep(Machine, "self-modification takes effect", build(0x00, 0x08), expect=bytes([42]))
     print(f"[{name}] controlled self-modification lockstep {n} ticks (immediate 7 -> 42 patched, output matches)")
 
@@ -251,7 +216,6 @@ main:
     code = asm("LDI HL, 0\nLDC r0, [HL]\nOUT r0\nLDI HL, 4\nLDC r0, [HL]\nOUT r0\nHALT")
     n = _lockstep(Machine, "LDC self-read", code, expect=bytes([code[0], code[4]]))
     print(f"[{name}] LDC self-read lockstep {n} ticks (read-back bytes match the truth)")
-
 
 def test_programs(Machine, name):
 
@@ -266,7 +230,6 @@ def test_programs(Machine, name):
         g.step()
     assert g.r[0] == 6 and g.r[3] == 0x7E and g.SP == 4096 and g.status == "HALT", g.snapshot()
     print(f"[{name}] EXT trap lockstep {n} ticks (nested call r0=6 / stack restored / HALT)")
-
 
     prog = """
     LDI r0, 37
@@ -302,20 +265,15 @@ zero:
     n = _lockstep(Machine, "extended arithmetic", asm(prog), expect=bytes([0xB9, 0x25, 0x00, 0x03, 0x01]))
     print(f"[{name}] extended arithmetic program lockstep {n} ticks (MUL/DIV/MOD/bitwise/rotate/CMP output matches)")
 
-
     n = _lockstep(Machine, "pointer family", asm("LDI HL, 100\nLDI DE, 7\nADD HL, DE\nSUB HL, DE\nXCHG\nOUTDE\nHALT"),
                   data=bytes(range(256)), expect=bytes([100]))
     print(f"[{name}] 16-bit pointer family lockstep {n} ticks (ADD/SUB HL,DE + XCHG)")
-
-
 
     n = _lockstep(Machine, "divide-by-zero atomic", asm("LDI r0, 9\nLDI r1, 0\nDIV r0, r1\nOUT r0\nHALT"))
     n = _lockstep(Machine, "modulo-by-zero atomic", asm("LDI r0, 9\nLDI r1, 0\nMOD r0, r1\nHALT"))
     print(f"[{name}] divide-by-zero / modulo-by-zero: both implementations atomic ERR at the same tick")
 
-
 def _golden_verdict(code, data=b"", inputs=b""):
-
 
     g = NCP8(code, data=data, inputs=inputs)
     raised = False
@@ -326,17 +284,6 @@ def _golden_verdict(code, data=b"", inputs=b""):
             raised = True
             break
     return ("ERR" if raised else g.status), bytes(g.out)
-
-
-
-
-
-
-
-
-
-
-
 
 MEDLEY = asm("""
   LDI HL, 4088
@@ -385,7 +332,6 @@ MEDLEY = asm("""
   OUT r0
 """ + "\n".join(
 
-
     f"  LDI r{f >> 2}, 200\n  LDI r{f & 3}, 200\n"
     f"  MULH r{f >> 2}, r{f & 3}\n  OUT r{f >> 2}"
     for f in range(16)) + "\n  HALT\n")
@@ -396,18 +342,12 @@ MEDLEY_EXPECT = (bytes([4090 & 0xFF, 4090 >> 8])
                  + bytes([4096 & 0xFF])
                  + bytes([(200 * 200) >> 8]) * 16)
 
-
 def test_v3_programs(Machine, name):
-
 
     trace = []
     n = _lockstep(Machine, "v3.0 medley", MEDLEY, expect=MEDLEY_EXPECT, trace_out=trace)
     print(f"[{name}] v3.0 medley lockstep {n} ticks (pair moves/spill/16-bit memory/frame "
           f"access/MULH, output recomputed by hand)")
-
-
-
-
 
     import programs
     cases = [(0, [0, 0, 0, 0]), (0xFFFF, [255, 255, 255, 255]),
@@ -428,16 +368,12 @@ def test_v3_programs(Machine, name):
     print(f"[{name}] frame-pointer demo lockstep {ticks} ticks over {len(cases)} cases "
           f"(16x16->32 via MUL+MULH + local array, output == independent model)")
 
-
     seen = _executed_new_subcodes(trace)
     missing = sorted(set(NEW_SUBCODES) - seen)
     assert not missing, ("v3.0 subcodes missing from the program lockstep",
                          [hex(s) for s in missing])
     print(f"[{name}] program lockstep executes all {len(NEW_SUBCODES)} v3.0 encodings "
           f"({len(trace)} traced instructions)")
-
-
-
 
     for src, nm, pre in (
             ("LDI HL, 4095\nLDI DE, 1\nSTW [HL], DE\nHALT", "16-bit store at the last byte", 2),
@@ -451,7 +387,6 @@ def test_v3_programs(Machine, name):
         n = _lockstep(Machine, nm, code)
         assert n == pre, (nm, "error tick", n, pre)
     print(f"[{name}] v3.0 error paths: 4 programs, atomic ERR at the same tick in both implementations")
-
 
 if __name__ == "__main__":
     print("ISA v2.0 equivalence acceptance (subcode space + program lockstep):")

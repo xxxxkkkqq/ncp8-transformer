@@ -13,7 +13,6 @@ import random
 
 from golden_sim import AssemblyError, MachineError, asm
 
-
 MUST_FAIL = (
     ("JMP looop\nHALT", 1, ("undefined symbol", "looop")),
     ("NOP\nNOP\nJMP looop", 3, ("undefined symbol", "looop")),
@@ -32,8 +31,6 @@ MUST_FAIL = (
     ("JMP 0xZZ", 1, ("0xZZ",)),
     ("; a comment line\n\nNOP\n\nJMP oops", 5, ("undefined symbol", "oops")),
 
-
-
     ("LDX r0, [DE+1]", 1, ("LDX", "[HL+i8]", "[DE+1]")),
     ("LDX r0, 5", 1, ("LDX", "[HL+i8]")),
     ("STX [HL+1], r0\nNOP\nSTX [HL-129], r0", 3, ("STX", "-129", "-128..127")),
@@ -47,7 +44,6 @@ MUST_FAIL = (
     ("LDW DE, [DE]", 1, ("LDW", "unknown operand")),
     ("STW [HL], HL", 1, ("STW", "unknown operand")),
 
-
     ("MOV r5, r0", 1, ("invalid register operand", "r5")),
     ("LDI r7, 3", 1, ("invalid register operand", "r7")),
     ("ADD r4, r0", 1, ("invalid register operand", "r4")),
@@ -55,7 +51,6 @@ MUST_FAIL = (
     ("DJNZ r8, here\nhere:\nHALT", 1, ("invalid register operand", "r8")),
     ("NOP\nMULH r0, r7", 2, ("invalid register operand", "r7")),
 )
-
 
 MUST_PASS = (
     ("forward jump", "JMP done\nLDI r0, 1\ndone:\nHALT",
@@ -73,7 +68,6 @@ MUST_PASS = (
     ("comments and blank lines", "; header\n\nNOP ; inline\n\nHALT",
      bytes([0x01, 0x00])),
 
-
     ("pair moves", "MOVW HL, DE\nMOVW DE, HL\nMOVW HL, SP\nMOVW DE, SP\nMOVW SP, HL\nMOVW SP, DE",
      bytes([0x70, 0x30, 0x70, 0x31, 0x70, 0x32, 0x70, 0x33, 0x70, 0x34, 0x70, 0x35])),
     ("pair spill and restore", "PUSHW HL\nPUSHW DE\nPOPW HL\nPOPW DE",
@@ -88,7 +82,6 @@ MUST_PASS = (
     ("widening multiply high byte", "MULH r0, r1\nMULH r1, r3\nMULH r3, r3",
      bytes([0x70, 0x91, 0x70, 0x97, 0x70, 0x9F])),
 )
-
 
 def test_must_fail():
     for src, line, frags in MUST_FAIL:
@@ -106,12 +99,10 @@ def test_must_fail():
           f"(undefined symbol / unsupported expression / out-of-range immediate / unknown mnemonic), "
           f"each naming the symbol or instruction and the source line")
 
-
 def test_must_pass():
     for name, src, want in MUST_PASS:
         got = asm(src)
         assert got == want, (name, got.hex(), want.hex())
-
 
     labelled = "LDI r0, 3\nloop:\nSUBI r0, 1\nJNZ loop\nCALL sub\nHALT\nsub:\nRET\n"
     literal = "LDI r0, 3\nSUBI r0, 1\nJNZ 2\nCALL 11\nHALT\nRET\n"
@@ -121,13 +112,7 @@ def test_must_pass():
     print(f"  assembler keeps {len(MUST_PASS) + 2} working cases byte-exact "
           f"(forward/backward labels, DJNZ, 0x/0b/0o/decimal literals, comments)")
 
-
 def test_error_type():
-
-
-
-
-
 
     assert not issubclass(AssemblyError, MachineError), \
         "AssemblyError must not be a MachineError"
@@ -153,7 +138,6 @@ def test_error_type():
             raise AssertionError((src, "undefined symbol assembled silently"))
     print("  errors are AssemblyError (never caught as MachineError) with the line number; "
           "50 generated undefined symbols all refused")
-
 
 def test_validation_survives_optimise():
 
@@ -190,7 +174,6 @@ print(fired)
     assert outs == ["4", "4"], outs
     print("  the four input guards (two bad register operands, two over-capacity images)"
           " fire identically under python and python -O")
-
 
 if __name__ == "__main__":
     print("assembler strictness:")

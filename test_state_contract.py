@@ -30,14 +30,10 @@ from circuit_triton import TritonBatch, TritonCircuit, run_batch
 from golden_sim import CODE_SIZE, DATA_SIZE as REF_DATA_SIZE
 from golden_sim import AssemblyError, MachineError, NCP8, asm
 
-
-
 REF_OUT_CAP = getattr(golden_sim, "OUT_CAP", None)
 CAP = REF_OUT_CAP if REF_OUT_CAP else TRITON_OUT_CAP
 
 STATUS_NAMES = {0: "RUNNING", 1: "HALT", 2: "OVERRUN", 3: "ERR"}
-
-
 
 WIDTHS = {
     "r": (0, 256),
@@ -49,13 +45,11 @@ WIDTHS = {
     "Z": (0, 2),
 }
 
-
 def ref_view(g):
 
     return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
                 ipos=g.ipos, oplen=len(g.out), tick=g.tick,
                 status={"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}[g.status])
-
 
 def width_violations(view):
 
@@ -70,19 +64,16 @@ def width_violations(view):
                 bad.append((k if i < 0 else f"{k}[{i}]", x))
     return bad
 
-
 def assert_widths(view, where):
 
     bad = width_violations(view)
     assert not bad, (where, "state field outside its declared width", bad, view)
-
 
 def step_reference(g, where):
 
     g.step()
     assert_widths(ref_view(g), ("reference", where, g.tick))
     return ref_view(g)
-
 
 def refuse(fn, *args, **kw):
 
@@ -92,30 +83,18 @@ def refuse(fn, *args, **kw):
         return f"{type(e).__name__}: {e}"
     return None
 
-
 def state_args(**over):
 
     a = dict(R=[0, 0, 0, 0], HL=0, DE=0, SP=DATA_SIZE, C=0, Z=0, tick=0)
     a.update(over)
     return [a["R"], a["HL"], a["DE"], a["SP"], a["C"], a["Z"], a["tick"]]
 
-
-
-
-
 def getpc_at(pc0):
-
-
-
-
-
-
 
     b = bytearray(pc0 + 3)
     b[0], b[1], b[2] = 0x09, pc0 & 0xFF, pc0 >> 8
     b[pc0], b[pc0 + 1], b[pc0 + 2] = 0x14, 0x81, 0x00
     return bytes(b)
-
 
 def test_d1_register_write_port_masks():
     for Mach in (TorchCircuit, TritonCircuit):
@@ -139,7 +118,6 @@ def test_d1_register_write_port_masks():
     print("  D1 register write port: GETPC at PC=300 commits r0=44 and the next ADD keeps"
           " C=0 on both circuits, matching the reference")
 
-
 def test_d1_width_conformance_on_the_bundled_programs():
 
     cases = [(programs.MUL, bytes([200, 30])), (programs.FIB, bytes([13])),
@@ -162,10 +140,6 @@ def test_d1_width_conformance_on_the_bundled_programs():
             assert view()["status"] == 1, (code[:4], view())
     print(f"  D1 width conformance: {ticks} ticks of the bundled programs keep every state"
           " field inside its declared width in all three implementations")
-
-
-
-
 
 def test_d2_halt_is_sticky():
     code = asm("HALT\nNOP\nNOP\nHALT")
@@ -193,7 +167,6 @@ def test_d2_halt_is_sticky():
     print("  D2 terminal status is sticky: HALT then three more steps changes nothing in"
           " all three implementations and raises nothing")
 
-
 def test_d2_overrun_is_sticky():
     code = asm("loop:\nNOP\nJMP loop\n")
     for Mach in (TorchCircuit, TritonCircuit):
@@ -207,7 +180,6 @@ def test_d2_overrun_is_sticky():
             assert c.snapshot() == frozen, (Mach.__name__, "step past OVERRUN", frozen,
                                             c.snapshot())
     print("  D2 OVERRUN is sticky: further steps leave the marked machine untouched")
-
 
 def test_d2_run_on_a_stopped_machine_returns():
 
@@ -223,10 +195,6 @@ def test_d2_run_on_a_stopped_machine_returns():
     g.run()
     assert g.run() == bytes(g.out) and g.tick == 2, g.snapshot()
     print("  D2 run() on a stopped machine returns immediately without ticking")
-
-
-
-
 
 def test_d3_budget_is_per_step_state():
     code = asm("loop:\nNOP\nJMP loop\n")
@@ -254,7 +222,6 @@ def test_d3_budget_is_per_step_state():
     print("  D3 tick budget: step() past the budget latches OVERRUN and freezes the tick in"
           " the reference, both circuits and the batch step")
 
-
 def test_d3_budget_outranks_the_error_of_its_own_tick():
 
     code = asm("DIV r0, r1\nHALT")
@@ -268,10 +235,6 @@ def test_d3_budget_outranks_the_error_of_its_own_tick():
     assert g.status == "OVERRUN", g.status
     print("  D3 precedence: the budget is checked before the instruction executes")
 
-
-
-
-
 def test_d4_reference_reports_illegal_sp_as_machine_error():
     code = asm("PUSH r0\nHALT")
     for sp in (4112, 5000, 65535):
@@ -283,7 +246,6 @@ def test_d4_reference_reports_illegal_sp_as_machine_error():
         assert (g.SP, g.PC, g.tick) == (sp, 0, 0), ("error tick moved state", g.snapshot())
     print("  D4 reference stack accessors bound-check: an illegal SP raises MachineError"
           " and the tick stays atomic")
-
 
 def test_d4_state_constructors_reject_illegal_states():
 
@@ -321,12 +283,7 @@ def test_d4_state_constructors_reject_illegal_states():
     print("  D4 state constructors: r/SP/C/Z/HL/DE/PC violations are refused with the"
           " offending index and value on the reference and both circuits")
 
-
 def test_d4_store_address_stays_inside_its_own_machine():
-
-
-
-
 
     code = asm("PUSH r0\nHALT")
     b = TritonBatch(2)
@@ -351,9 +308,7 @@ def test_d4_store_address_stays_inside_its_own_machine():
     print("  D4 store masking: an out-of-range SP cannot write outside its own row in the"
           " batch, and cannot leave DATA in the single-machine kernel")
 
-
 def test_d4_store_masks_require_power_of_two_sizes():
-
 
     import circuit_triton as CT
     for name, size in (("CODE_SIZE", CT.CODE_SIZE), ("DATA_SIZE", CT.DATA_SIZE),
@@ -367,7 +322,6 @@ def test_d4_store_masks_require_power_of_two_sizes():
             refuse.append(bad)
     assert len(refuse) == 6, ("the guard accepted non-power-of-two sizes", refuse)
 
-
 def test_d4_step_rolls_back_on_any_exception():
 
     g = NCP8(asm("NOP\nNOP\nHALT"))
@@ -376,7 +330,6 @@ def test_d4_step_rolls_back_on_any_exception():
     assert msg is not None and "AttributeError" in msg, ("the injected failure must propagate", msg)
     assert (g.PC, g.tick) == (0, 0), ("a tick that raised left state behind", g.PC, g.tick)
     print("  D4 atomicity: step() rolls back PC on any exception, not only MachineError")
-
 
 def test_d4_image_guards_are_raises():
     msg = refuse(NCP8, bytes(CODE_SIZE + 1))
@@ -392,10 +345,6 @@ def test_d4_image_guards_are_raises():
     assert refuse(TritonCircuit, b"\x00", data=bytes(REF_DATA_SIZE + 1)) is not None
     print("  D4 image guards: an over-capacity CODE/DATA image is refused by every path")
 
-
-
-
-
 def emitter(outer, inner, extra=1):
 
     src = ["  LDI r0, 0x5A", f"  LDI r3, {outer}", "outer:", f"  LDI r2, {inner}",
@@ -403,13 +352,11 @@ def emitter(outer, inner, extra=1):
     src += ["  OUT r0"] * extra + ["  HALT"]
     return asm("\n".join(src))
 
-
 def test_d5_one_capacity_constant():
     assert REF_OUT_CAP == TORCH_OUT_CAP == TRITON_OUT_CAP, (
         REF_OUT_CAP, TORCH_OUT_CAP, TRITON_OUT_CAP)
     assert REF_DATA_SIZE == DATA_SIZE == CODE_SIZE == 4096
     print(f"  D5 one output capacity constant shared by all three implementations: {CAP} bytes")
-
 
 def test_d5_reference_stream_is_bounded():
 
@@ -429,7 +376,6 @@ def test_d5_reference_stream_is_bounded():
     assert (len(g.out), g.tick) == before, "the error tick was not atomic"
     print(f"  D5 reference output stream refuses the byte past capacity, atomically at"
           f" exactly {CAP} bytes")
-
 
 def test_d5_circuits_error_instead_of_truncating():
 
@@ -454,7 +400,6 @@ def test_d5_circuits_error_instead_of_truncating():
     print(f"  D5 circuits: the byte past capacity is an atomic error tick and the stream"
           f" stays at {CAP} bytes (was: silent truncation with oplen past the buffer)")
 
-
 def test_d5_batch_and_resident_report_the_overflow():
     code = emitter(CAP // 128, 128)
     res = run_batch([code], [bytes(8)])
@@ -468,10 +413,6 @@ def test_d5_batch_and_resident_report_the_overflow():
     assert bytes(g.out) == out == res.outs[0], "the three overflow streams differ"
     print(f"  D5 end to end: reference, resident batch and run_resident() agree on the"
           f" {CAP}-byte stream and the error status")
-
-
-
-
 
 UNDER_O = r"""
 import sys
@@ -490,7 +431,6 @@ except ValueError:
 print(",".join(out) or "none")
 """
 
-
 def test_d6_validation_survives_python_O():
     root = os.path.dirname(os.path.abspath(__file__))
     opt = subprocess.run([sys.executable, "-O", "-c", UNDER_O, root],
@@ -502,7 +442,6 @@ def test_d6_validation_survives_python_O():
     assert plain.stdout.strip() == want, ("a normal run differs", plain.stdout.strip())
     print("  D6 validation is a raise: python -O refuses a bad register operand and an"
           " over-capacity image exactly as a normal run does")
-
 
 def test_d6_assembly_error_is_not_a_machine_error():
     assert not issubclass(AssemblyError, MachineError), (
@@ -517,7 +456,6 @@ def test_d6_assembly_error_is_not_a_machine_error():
         raise AssertionError("an unknown mnemonic assembled silently")
     print("  D6 AssemblyError is decoupled from MachineError: a run's error handler cannot"
           " swallow a bad program text")
-
 
 CHECKS = (
     test_d1_register_write_port_masks,
@@ -541,13 +479,11 @@ CHECKS = (
     test_d6_assembly_error_is_not_a_machine_error,
 )
 
-
 def run_all():
     print("state-contract acceptance:")
     for fn in CHECKS:
         fn()
     print(f"state-contract acceptance: all {len(CHECKS)} checks passed")
-
 
 if __name__ == "__main__":
     run_all()

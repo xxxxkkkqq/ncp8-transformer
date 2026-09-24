@@ -41,9 +41,6 @@ DATA_SIZE = 4096
 CODE_SIZE = 4096
 OUT_CAP = 8192
 
-
-
-
 ESC_DIV = tl.constexpr(0x100)
 ESC_MOD = tl.constexpr(0x101)
 ESC_CMP = tl.constexpr(0x102)
@@ -80,25 +77,16 @@ ESC_MULH = tl.constexpr(0x11F)
 
 def _power_of_two_or_die(name, size):
 
-
     if size <= 0 or size & (size - 1):
         raise ValueError(f"{name}={size} is not a positive power of two; the store "
                          f"masks would let a write leave its machine's own buffer")
-
-
 
 for _name, _size in (("CODE_SIZE", CODE_SIZE), ("DATA_SIZE", DATA_SIZE),
                      ("OUT_CAP", OUT_CAP)):
     _power_of_two_or_die(_name, _size)
 CODE_MASK = tl.constexpr(CODE_SIZE - 1)
 
-
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, where=""):
-
-
-
-
-
 
     def outside(field, value, lo, hi):
         raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
@@ -122,39 +110,19 @@ def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, wh
     if status not in (0, 1, 2, 3):
         outside("status", status, 0, 3)
 
-
 @triton.jit
 def _get4(v0, v1, v2, v3, idx):
     return tl.where(idx == 0, v0, tl.where(idx == 1, v1, tl.where(idx == 2, v2, v3)))
 
-
 @triton.jit
 def _wr(r0, r1, r2, r3, d, v):
-
-
-
-
 
     w = v & 255
     return (tl.where(d == 0, w, r0), tl.where(d == 1, w, r1),
             tl.where(d == 2, w, r2), tl.where(d == 3, w, r3))
 
-
-
 @triton.jit
 def _dec_esc(sub):
-
-
-
-
-
-
-
-
-
-
-
-
 
     if sub <= 0x2F:
         eop = ESC_DIV + (sub >> 4); d = (sub >> 2) & 3; s = sub & 3; lx = 0
@@ -182,25 +150,8 @@ def _dec_esc(sub):
         eop = ESC_BAD; d = 0; s = 0; lx = 0
     return eop, d, s, lx
 
-
 @triton.jit
 def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     r0 = tl.load(S + 0); r1 = tl.load(S + 1); r2 = tl.load(S + 2); r3 = tl.load(S + 3)
     HL = tl.load(S + 4); DE = tl.load(S + 5); PC = tl.load(S + 6); SP = tl.load(S + 7)
@@ -218,8 +169,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
     A3 = 0; V3 = 0; E3 = 0
     err = 0
 
-
-
     eop = 0xFFFF
     ed = 0; es = 0; elen = 1
 
@@ -230,7 +179,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
         es = op & 3
         if op == 0x70:
 
-
             if PC + 2 > CODELEN:
                 err = 1
             else:
@@ -239,7 +187,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 elen = 2 + elx
                 nPC = PC + elen
                 if PC + elen > CODELEN:
-
 
                     eop = 0xFFFF
                     err = 1
@@ -451,13 +398,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
             nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
         elif eop >= 0x100:
 
-
-
-
-
-
-
-
             if eop == ESC_DIV or eop == ESC_MOD:
                 a = _get4(r0, r1, r2, r3, ed)
                 b = _get4(r0, r1, r2, r3, es)
@@ -514,8 +454,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 nDE = HL
             elif eop == ESC_EXT:
 
-
-
                 if PC + 3 > CODELEN:
                     err = 1
                 else:
@@ -533,8 +471,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                             A2 = SP - 2; V2 = (ret >> 8) & 0xFF; E2 = 1
                             nSP = SP - 2; nPC = tgt
             elif eop == ESC_STC:
-
-
 
                 if HL >= CODELEN:
                     err = 1
@@ -562,7 +498,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 nDE = SP
             elif eop == ESC_MOVW_SP_HL:
 
-
                 if HL > DS:
                     err = 1
                 else:
@@ -573,7 +508,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 else:
                     nSP = DE
             elif eop == ESC_PUSHW_HL or eop == ESC_PUSHW_DE:
-
 
                 if SP < 2:
                     err = 1
@@ -624,7 +558,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                         nHL = v
             elif eop == ESC_LDX or eop == ESC_STX:
 
-
                 sx = tl.load(CODE + PC + 2)
                 sx = sx - 256 * (sx >> 7)
                 adr = (HL + sx) & 0xFFFF
@@ -646,9 +579,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                     nSP = v
             elif eop == ESC_MULH:
 
-
-
-
                 v = ((_get4(r0, r1, r2, r3, ed) * _get4(r0, r1, r2, r3, es)) >> 8) & 255
                 nZ = (v == 0).to(tl.int32)
                 nC = C & 1
@@ -667,7 +597,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
 
         err = 1
     if ST != 0:
-
 
         RST = ST
         RTK = OT
@@ -689,7 +618,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
         tl.store(S + 12, NT)
         tl.store(S + 13, NST)
 
-
         if OEN == 1:
             tl.store(OUTBUF + (OL & (OC - 1)), OVAL)
         if E1 == 1:
@@ -702,36 +630,17 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
         RTK = NT
     return RST, RTK
 
-
 @triton.jit
 def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, BUDGET, CODELEN, INLEN, DS, OC):
 
-
-
-
-
     BD = tl.load(BUDGET + 0)
     _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC)
-
 
 @triton.jit
 def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BUDGETS,
                         STEP_LIMIT,
                         CS: tl.constexpr, DS: tl.constexpr, INS: tl.constexpr,
                         OCS: tl.constexpr):
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     pid = tl.program_id(0)
     CP = CODE + pid * CS
@@ -749,36 +658,14 @@ def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BU
         st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, BD, DS, OCS)
         n += 1
 
-
 class BatchResult(NamedTuple):
-
-
-
-
-
-
 
     outs: list
     status: list
     ticks: list
     oplens: list
 
-
 class TritonBatch:
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     def __init__(self, n, device="cuda", max_in=1, tick_budget=200_000, num_warps=1):
         if n < 1:
@@ -805,10 +692,6 @@ class TritonBatch:
             raise ValueError(f"machine index {i} is outside a batch of {self.n} machines")
 
     def set_program(self, i, code, data=None, inputs=None):
-
-
-
-
 
         self._row(i)
         cb = bytes(code)
@@ -839,11 +722,6 @@ class TritonBatch:
     def set_state(self, i, r=(0, 0, 0, 0), HL=0, DE=0, PC=0, SP=DATA_SIZE,
                   C=0, Z=0, ipos=0, oplen=0, tick=0, status=0):
 
-
-
-
-
-
         self._row(i)
         check_state(r, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=ipos, oplen=oplen,
                     status=status, where=f"machine {i}: ")
@@ -866,18 +744,10 @@ class TritonBatch:
 
     def run(self):
 
-
-
-
-
         self._launch(0)
         return self.results()
 
     def step(self, steps=1):
-
-
-
-
 
         self._launch(int(steps))
         return self.results()
@@ -932,19 +802,8 @@ class TritonBatch:
         self._row(i)
         return self.CODE[i].cpu().tolist()
 
-
 def run_batch(codes, datas=None, inputs=None, budgets=None, states=None,
               tick_budget=200_000, device="cuda", num_warps=1):
-
-
-
-
-
-
-
-
-
-
 
     n = len(codes)
     max_in = 1
@@ -970,9 +829,7 @@ def run_batch(codes, datas=None, inputs=None, budgets=None, states=None,
                         status=row[13])
     return b.run()
 
-
 class TritonCircuit:
-
 
     def __init__(self, code, data=None, inputs=b"", tick_budget=200_000, device="cuda"):
         if len(code) > CODE_SIZE:
@@ -1032,21 +889,11 @@ class TritonCircuit:
 
     def run(self):
 
-
-
-
-
         while int(self.status.item()) == 0:
             self.step()
         return self.out()
 
     def run_resident(self):
-
-
-
-
-
-
 
         b = TritonBatch(1, device=self.dev, max_in=max(1, int(self.INP.numel())))
         b.CODE[0].copy_(self.CODE)

@@ -45,9 +45,7 @@ STW_HLDE, STW_DEHL, LDW_DEHL, LDW_HLDE = 72, 73, 74, 75
 LDX, STX, ADD_SP, MULH = 76, 77, 78, 79
 K = 80
 
-
 def _rom2():
-
 
     alu = [BAD] * 256; s0 = [0] * 256; s1 = [0] * 256; lx = [0] * 256
 
@@ -81,9 +79,7 @@ def _rom2():
     t = lambda xs: torch.tensor(xs, dtype=torch.int32)
     return t(alu), t(s0), t(s1), t(lx)
 
-
 _ALU2, _S02, _S12, _LX2 = _rom2()
-
 
 def _rom():
     alu = [BAD] * 256; s0 = [0] * 256; s1 = [0] * 256; ln = [1] * 256
@@ -135,16 +131,9 @@ def _rom():
     t = lambda xs: torch.tensor(xs, dtype=torch.int32)
     return t(alu), t(s0), t(s1), t(ln)
 
-
 _ALU, _S0, _S1, _LEN = _rom()
 
-
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, where=""):
-
-
-
-
-
 
     def outside(field, value, lo, hi):
         raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
@@ -167,7 +156,6 @@ def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, wh
             outside(field, v, 0, "unbounded")
     if status not in (0, 1, 2, 3):
         outside("status", status, 0, 3)
-
 
 class TorchCircuit:
     def __init__(self, code, data=None, inputs=b"", tick_budget=200_000, device="cuda", rom_override=None):
@@ -236,7 +224,6 @@ class TorchCircuit:
         dev, i32 = self.dev, torch.int32
         w = lambda m, a, b: m * a + (1 - m) * b
 
-
         zero = torch.zeros((), dtype=i32, device=dev)
         fetch_ok = (self.PC < self.codelen).to(i32)
         op = self.CODE.index_select(0, self.PC.clamp(0, CODE_SIZE - 1).reshape(1)).reshape(())
@@ -262,7 +249,6 @@ class TorchCircuit:
         ln_e = _lnt * (1 - esc) + (2 + self.lx2_t) * esc
         t16 = imm0 | (imm1 << 8)
 
-
         a = (self.R * (ind[:, None] * oh_s0).sum(0)).sum()
         b = (self.R * (ind[:, None] * oh_s1).sum(0)).sum()
         rr = (self.R * (ind[:, None] * self.OH_R).sum(0)).sum()
@@ -282,16 +268,11 @@ class TorchCircuit:
         inb = self._g(self.INPUTS, self.ipos)
         eof = (self.ipos >= self.inlen).to(i32)
 
-
-
-
-
         sx = imm0 - ((imm0 >> 7) & 1) * 256
         fr = (self.HL + sx) & 0xFFFF
         dfr = self._g(self.DATA, fr)
         dhl1 = self._g(self.DATA, self.HL + 1)
         dde1 = self._g(self.DATA, self.DE + 1)
-
 
         t_add = a + b; v_add = t_add & 255; c_add = t_add >> 8
         t_adc = a + b + self.C; v_adc = t_adc & 255; c_adc = t_adc >> 8
@@ -330,7 +311,6 @@ class TorchCircuit:
         v_ldw_de = dl | (dhl1 << 8)
         v_ldw_hl = der | (dde1 << 8)
         v_sp_add = (self.SP + sx) & 0xFFFF
-
 
         RHL_EN = oh(MOV_R_HL) + oh(MOV_HL_R)
         rows_R_val = (
@@ -441,12 +421,10 @@ class TorchCircuit:
         rows_out_val = oh(OUT) * rr + oh(OUTM) * dl + oh(OUTDE) * der
         rows_out_en = oh(OUT) + oh(OUTM) + oh(OUTDE)
 
-
         fetch_ok_rows = (self.PC + ln_e <= self.codelen).to(i32)
         hl_ok = (self.HL < DATA_SIZE).to(i32); de_ok = (self.DE < DATA_SIZE).to(i32)
         sp_lo = (self.SP > 0).to(i32); sp_lo2 = (self.SP >= 2).to(i32); sp_hi = (self.SP < DATA_SIZE).to(i32)
         sp_hi1 = ((self.SP + 1) < DATA_SIZE).to(i32)
-
 
         hl_ok2 = ((self.HL + 1) < DATA_SIZE).to(i32)
         de_ok2 = ((self.DE + 1) < DATA_SIZE).to(i32)
@@ -475,17 +453,14 @@ class TorchCircuit:
         err = (ind * (oh(BAD) + (1 - fetch_ok_rows) + rd_rows + st_rows + v2_err + v3_err)).sum() \
             + out_ovf + (1 - fetch_ok)
 
-
         sel = lambda rows: (ind * rows).sum()
         R_w = (ind[:, None] * oh_s0 * rows_R_en[:, None]).sum(0)
         R_v = (ind[:, None] * oh_s0 * (rows_R_en * rows_R_val)[:, None]).sum(0)
         ok = (err == 0).to(i32)
 
-
         running = (self.status == 0).to(i32)
         over = running * (self.tick >= self.TB).to(i32)
         m = ok * running * (1 - over)
-
 
         a1 = sel(oh(MOV_HL_R) * self.HL + oh(MOV_DE_R) * self.DE
                  + oh(PUSH) * (self.SP - 1) + oh(CALL) * (self.SP - 1)
@@ -513,11 +488,9 @@ class TorchCircuit:
         oh2 = ((self.RD == a2).to(i32)) * e2
         self.DATA = oh2 * v2 + (1 - oh2) * self.DATA
 
-
         a3 = sel(oh(STC) * self.HL); v3 = sel(oh(STC) * rr); e3 = sel(oh(STC)) * m
         oh3 = ((self.RC == a3).to(i32)) * e3
         self.CODE = oh3 * v3 + (1 - oh3) * self.CODE
-
 
         ov = sel(rows_out_val) * m
         oe = sel(rows_out_en) * m
@@ -531,8 +504,6 @@ class TorchCircuit:
                                              torch.zeros(1, dtype=i32, device=dev)))
         new_status = torch.where(over > 0, 2 * torch.ones(1, dtype=i32, device=dev), new_status)
         self.status = running * new_status + (1 - running) * self.status
-
-
 
         self.R = m * ((R_w * R_v + (1 - R_w) * self.R) & 255) + (1 - m) * self.R
         self.HL = (m * sel(rows_HL) + (1 - m) * self.HL) & 0xFFFF
@@ -572,10 +543,6 @@ class TorchCircuit:
         return bytes(self.OUTBUF[:n].cpu().tolist())
 
     def run(self):
-
-
-
-
 
         while int(self.status.item()) == 0:
             self.step()
