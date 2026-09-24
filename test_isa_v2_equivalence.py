@@ -23,7 +23,7 @@ import re
 from golden_sim import NCP8, MachineError, asm
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
-from test_state_contract import assert_widths
+from test_state_contract import FAULT_WRITES, assert_widths, circuit_view, ref_view
 
 VEC = 0x0F00
 
@@ -39,9 +39,8 @@ def _code_esc(sub, vec=0, pc=0, tail=(0xAA, 0x55)):
     return bytes(b)
 
 def _golden_view(g):
-    return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
-                ipos=g.ipos, oplen=len(g.out), tick=g.tick,
-                status={"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}[g.status])
+
+    return ref_view(g)
 
 def _ptr(rng, boundary):
 
@@ -71,20 +70,27 @@ def one_esc_step(Machine, sub, seed, vec=0, pc=0):
     except MachineError:
         g_err = True
     c.step()
-    cv = c.snapshot()
+    cv = circuit_view(c)
     assert_widths(cv, (Machine.__name__, "post-tick", sub, seed, pc))
     if g_err:
 
-        assert _golden_view(g) == pre, (sub, seed, pc, "reference error tick was not atomic",
-                                        pre, _golden_view(g))
+        gv = _golden_view(g)
+        assert gv["status"] == 3, (sub, seed, pc, "the reference left no error status", gv)
+        assert gv["fault_reason"] != 0, (sub, seed, pc,
+                                         "the reference stopped without naming a cause", gv)
+        assert gv["fault_addr"] == pre["PC"], (sub, seed, pc,
+                                               "fault_addr is not the faulting instruction",
+                                               pre["PC"], gv["fault_addr"])
         assert list(g.data) == pre_data, (sub, seed, "reference modified DATA before raising")
         assert bytes(g.code) == pre_code, (sub, seed, "reference modified CODE before raising")
         assert bytes(g.out) == pre_out, (sub, seed, "reference wrote output before raising")
-        assert cv["status"] == 3, (sub, seed, pc, "expected ERR", cv)
         for k in pre:
-            if k == "status":
+            if k in FAULT_WRITES:
                 continue
-            assert pre[k] == cv[k], (sub, seed, pc, "error path not atomic", k, pre[k], cv[k])
+            assert gv[k] == pre[k], (sub, seed, pc, "reference error tick was not atomic",
+                                     k, pre[k], gv[k])
+        assert cv == gv, (sub, seed, pc, "the circuit's fault tick differs from the reference",
+                          gv, cv)
         assert list(c.DATA.cpu().tolist()) == pre_data, (sub, seed, "DATA was modified")
         assert bytes(c.CODE.cpu().tolist()[:len(code)]) == pre_code, (sub, seed, "CODE was modified")
         return "err"
@@ -152,13 +158,21 @@ def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=N
         except MachineError:
             raised = True
             c.step()
-            assert c.snapshot()["status"] == 3, (name, "circuit did not report ERR on the error tick")
 
-            assert _golden_view(g) == gs, (name, "reference error tick was not atomic", gs, _golden_view(g))
+            gv, cv = _golden_view(g), c.snapshot()
+            assert cv["status"] == 3 == gv["status"], (
+                name, "the faulting tick's status differs", gs, gv, cv)
+            assert cv["tick"] == gs["tick"] == gv["tick"], (name, "error tick mismatch",
+                                                            gs, gv, cv)
+            for k in gs:
+                if k in FAULT_WRITES:
+                    assert cv[k] == gv[k], (name, "fault field differs", k, gv[k], cv[k])
+                else:
+                    assert gs[k] == gv[k] == cv[k], (
+                        name, "the error tick was not atomic in both", k, gs[k], gv[k], cv[k])
             assert list(g.data) == gdata, (name, "reference modified DATA before raising")
             assert bytes(g.out) == gout, (name, "reference wrote output before raising")
             assert bytes(g.code) == gcode, (name, "reference modified CODE before raising")
-            assert c.snapshot()["tick"] == gs["tick"], (name, "error tick mismatch")
             break
         c.step(); n += 1
         assert_widths(c.snapshot(), (name, "circuit after tick", n))

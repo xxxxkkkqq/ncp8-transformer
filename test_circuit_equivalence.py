@@ -13,14 +13,13 @@ import random
 from golden_sim import NCP8, MachineError
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
-from test_state_contract import assert_widths
+from test_state_contract import FAULT_WRITES, assert_widths, circuit_view, ref_view
 
 PC_SITES = (0, 256)
 
 def golden_view(g):
-    return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
-                ipos=g.ipos, oplen=len(g.out), tick=g.tick,
-                status={"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}[g.status])
+
+    return ref_view(g)
 
 def one_step_agreement(Machine, op, seed, pc=0):
 
@@ -53,23 +52,28 @@ def one_step_agreement(Machine, op, seed, pc=0):
 
     if g_err:
 
-        assert golden_view(g) == pre_g, (op, seed, "reference error tick was not atomic",
-                                         pre_g, golden_view(g))
+        gv = golden_view(g)
+        assert gv["status"] == 3, (op, seed, "the reference left no error status", gv)
+        assert gv["fault_reason"] != 0, (op, seed, "the reference stopped without a cause", gv)
+        assert gv["fault_addr"] == pre_g["PC"], (
+            op, seed, "fault_addr is not the faulting instruction", pre_g["PC"], gv)
+        for k in pre_g:
+            if k in FAULT_WRITES:
+                continue
+            assert gv[k] == pre_g[k], (op, seed, "reference error tick was not atomic",
+                                       k, pre_g[k], gv[k])
         assert list(g.data) == pre_data, (op, seed, "reference modified DATA before raising")
         assert bytes(g.code) == pre_code, (op, seed, "reference modified CODE before raising")
         assert bytes(g.out) == pre_out, (op, seed, "reference wrote output before raising")
-        cv = c.snapshot()
-        assert cv["status"] == 3, (op, seed, "expect ERR", cv)
-        for k in pre_g:
-            if k == "status":
-                continue
-            assert pre_g[k] == cv[k], (op, seed, k, pre_g[k], cv[k])
+        cv = circuit_view(c)
+        assert cv == gv, (op, seed, pc, "the circuit's fault tick differs from the reference",
+                          gv, cv)
         assert list(c.DATA.cpu().tolist()) == pre_data, (op, seed, "DATA was modified")
         assert bytes(c.CODE.cpu().tolist()[:len(code)]) == pre_code, (op, seed, "CODE")
         assert c.out() == bytes(g.out), (op, seed, "out")
         return "err"
     else:
-        cv = c.snapshot()
+        cv = circuit_view(c)
         assert_widths(golden_view(g), (Machine.__name__, "reference post-tick", op, seed, pc))
         assert golden_view(g) == cv, (op, seed, pc, golden_view(g), cv)
         assert list(g.data) == list(c.DATA.cpu().tolist()), (op, seed, "DATA")

@@ -31,26 +31,39 @@ import time
 import torch
 
 import programs
+import circuit_triton
 from circuit_triton import CODE_SIZE, DATA_SIZE, TritonBatch, TritonCircuit, run_batch
-from golden_sim import NCP8, MachineError, asm
-from test_state_contract import assert_widths
+from golden_sim import NCP8, MachineError, STATUS_CODE, asm
+from test_state_contract import (FAULT_WRITES, VIEW_FIELDS, assert_widths,
+                                 circuit_view, ref_view)
 
-STATUS = {"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}
+STATE_LEN = circuit_triton.STATE_ROWS
 VEC = 0x0F00
 WLO, WHI = 0x0F20, 0x0F21
-STATE_LEN = 14
 
 def golden_view(g):
-    return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
-                ipos=g.ipos, oplen=len(g.out), tick=g.tick, status=STATUS[g.status])
+
+    return ref_view(g)
+
+def row_view(batch, i):
+
+    snap = batch.snapshot(i)
+    missing = [k for k in VIEW_FIELDS if k not in snap]
+    assert not missing, ("batch row", i, "snapshot does not report", missing)
+    extra = [k for k in snap if k not in VIEW_FIELDS]
+    assert not extra, ("batch row", i, "snapshot reports unknown fields", extra)
+    return snap
 
 def golden_machine(code, data=b"", inputs=b"", row=None, budget=200_000):
 
     g = NCP8(code, data=data, inputs=inputs, tick_budget=budget)
     if row is not None:
-        g.load_state(row[0:4], row[4], row[5], row[7], row[8], row[9], row[12], PC=row[6])
+        assert len(row) == STATE_LEN, ("state row width", len(row), STATE_LEN)
+        g.load_state(row[0:4], row[4], row[5], row[7], row[8], row[9], row[12], PC=row[6],
+                     fault_reason=row[14], fault_addr=row[15])
         g.ipos = row[10]
         assert row[11] == 0 and row[13] == 0, "a fresh machine starts with no output"
+        assert row[14] == 0 and row[15] == 0, "a fresh machine starts with no fault"
         assert_widths(golden_view(g), ("golden machine", row))
     return g
 
@@ -63,7 +76,15 @@ def golden_step(g):
         assert_widths(golden_view(g), ("reference post-tick", pre["tick"]))
         return False
     except MachineError:
-        assert golden_view(g) == pre, ("reference error tick was not atomic", pre, golden_view(g))
+        gv = golden_view(g)
+        assert gv["status"] == 3, ("the reference left no error status", pre, gv)
+        assert gv["fault_reason"] != 0, ("the reference stopped without a cause", pre, gv)
+        assert gv["fault_addr"] == pre["PC"], (
+            "fault_addr must be the faulting instruction", pre["PC"], gv["fault_addr"])
+        for k in pre:
+            if k in FAULT_WRITES:
+                continue
+            assert gv[k] == pre[k], ("reference error tick was not atomic", k, pre[k], gv[k])
         assert list(g.data) == pre_data, "reference modified DATA before raising"
         assert bytes(g.code) == pre_code, "reference modified CODE before raising"
         assert bytes(g.out) == pre_out, "reference wrote output before raising"
@@ -77,9 +98,8 @@ def golden_run(code, data=b"", inputs=b"", row=None, budget=200_000):
         if golden_step(g):
             raised = True
             break
-    if raised:
-        g.status = "ERR"
-    elif g.status == "RUNNING":
+    if not raised and g.status == "RUNNING":
+
         g.status = "OVERRUN"
     return g
 
@@ -88,22 +108,23 @@ def golden_advance(g, steps):
     for _ in range(steps):
         if g.status != "RUNNING":
             break
-        if golden_step(g):
-            g.status = "ERR"
-            break
+        golden_step(g)
     return g
 
 def padded(code):
     return bytes(code).ljust(CODE_SIZE, b"\x00")
 
-def row_of(r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos=0, oplen=0, tick=0, status=0):
-    return [r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos, oplen, tick, status]
+def row_of(r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos=0, oplen=0, tick=0, status=0,
+           fault_reason=0, fault_addr=0):
+    return [r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos, oplen, tick, status,
+            fault_reason, fault_addr]
 
 def push_row(batch, i, row):
 
+    assert len(row) == STATE_LEN, ("state row width", len(row), STATE_LEN)
     batch.set_state(i, r=row[0:4], HL=row[4], DE=row[5], PC=row[6], SP=row[7],
                     C=row[8], Z=row[9], ipos=row[10], oplen=row[11], tick=row[12],
-                    status=row[13])
+                    status=row[13], fault_reason=row[14], fault_addr=row[15])
 
 def op_case(op, seed):
 
@@ -248,14 +269,19 @@ def check_solo_step(batch, code, data, inputs, row, kind):
     pre, pre_data, pre_code = golden_view(g), list(g.data), padded(g.code)
     raised = golden_step(g)
     batch.step(1)
-    got = batch.snapshot(0)
+    got = row_view(batch, 0)
     assert_widths(got, ("batch solo", kind))
     if raised:
+        gv = golden_view(g)
         assert got["status"] == 3, (kind, "expected ERR", got)
         for k in pre:
-            if k == "status":
+            if k in FAULT_WRITES:
+                assert got[k] == gv[k], (kind, "fault field differs from the reference",
+                                         k, gv[k], got[k])
                 continue
-            assert pre[k] == got[k], (kind, "error tick not atomic", k, pre[k], got[k])
+            assert pre[k] == got[k] == gv[k], (kind, "error tick not atomic", k, pre[k],
+                                               got[k])
+        assert got["fault_reason"] != 0, (kind, "a stopped batch machine names no cause", got)
         assert batch.data(0) == pre_data, (kind, "DATA was modified by an error tick")
         assert bytes(batch.code(0)) == pre_code, (kind, "CODE was modified by an error tick")
         assert batch.out(0) == bytes(g.out), (kind, "out")
@@ -308,14 +334,19 @@ def test_opcode_enumeration_packed(width=64):
         for i, g in enumerate(mine):
             pre, pre_data = golden_view(g), list(g.data)
             raised = golden_step(g)
-            got = batch.snapshot(i)
+            got = row_view(batch, i)
             assert_widths(got, ("packed", base + i))
             if raised:
+                gv = golden_view(g)
                 assert got["status"] == 3, (base + i, "expected ERR", got)
                 for k in pre:
-                    if k == "status":
+                    if k in FAULT_WRITES:
+                        assert got[k] == gv[k], (base + i, "fault field differs", k,
+                                                 gv[k], got[k])
                         continue
-                    assert pre[k] == got[k], (base + i, "error tick not atomic", k, pre[k], got[k])
+                    assert pre[k] == got[k] == gv[k], (base + i, "error tick not atomic",
+                                                       k, pre[k], got[k])
+                assert got["fault_reason"] != 0, (base + i, "no cause named", got)
                 assert batch.data(i) == pre_data, (base + i, "DATA was modified")
                 tot["err"] += 1
             else:
@@ -345,9 +376,15 @@ def compare_batch(tag, batch, specs, res=None):
     counts = {}
     for i, (kind, code, data, inputs, row, budget) in enumerate(specs):
         g = golden_run(code, data, inputs, row, budget)
-        want_status = STATUS[g.status]
+        want_status = STATUS_CODE[g.status]
         got_status, got_tick = res.status[i], res.ticks[i]
-        assert_widths(batch.snapshot(i), (tag, kind, i, "batch snapshot"))
+        snap = row_view(batch, i)
+        assert_widths(snap, (tag, kind, i, "batch snapshot"))
+        assert snap["fault_reason"] == g.fault_reason and \
+            snap["fault_addr"] == g.fault_addr, (
+                tag, kind, i, "fault registers differ from the reference",
+                (snap["fault_reason"], snap["fault_addr"]),
+                (g.fault_reason, g.fault_addr))
         assert res.outs[i] == bytes(g.out), (tag, kind, i, "out", res.outs[i], bytes(g.out))
         assert got_status == want_status, (tag, kind, i, "status", got_status, want_status)
         assert got_tick == g.tick, (tag, kind, i, "tick", got_tick, g.tick)
@@ -459,8 +496,8 @@ def test_varied_finish_and_incremental():
         stopped_now = running_now = 0
         for i, g in enumerate(refs):
             golden_advance(g, chunk)
-            got = batch.snapshot(i)
-            assert_widths(got, ("step", chunk, i, "batch snapshot"))
+            got = row_view(batch, i)
+            assert_widths(row_view(batch, i), ("step", chunk, i, "batch snapshot"))
             assert golden_view(g) == got, ("step", chunk, i, golden_view(g), got)
             assert batch.data(i) == list(g.data), ("step DATA", chunk, i)
             if got["status"] == 0:
@@ -565,7 +602,7 @@ def test_one_shot_run_batch():
         g = golden_run(code, data, b"", rows[i], budget)
         assert_widths(golden_view(g), ("run_batch reference", i))
         assert res.outs[i] == bytes(g.out), (i, res.outs[i], bytes(g.out))
-        assert res.status[i] == STATUS[g.status], (i, res.status[i], g.status)
+        assert res.status[i] == STATUS_CODE[g.status], (i, res.status[i], g.status)
         assert res.ticks[i] == g.tick, (i, res.ticks[i], g.tick)
     assert res.status[3] == 2 and res.ticks[3] == 250, (res.status[3], res.ticks[3])
     print(f"[batch B={len(cases)}] one-shot run_batch(): per-machine budgets, initial "

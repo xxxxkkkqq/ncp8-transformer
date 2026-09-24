@@ -11,6 +11,7 @@ changes) and instruction-length/PC bookkeeping around the escape prefix.
 """
 import random
 
+import isa_table as ISA
 from golden_sim import NCP8, MachineError, asm
 from test_state_contract import assert_widths
 
@@ -24,18 +25,31 @@ def run_code(code, data=None, inputs=b"", r0=None, budget=5000):
     drive(g)
     return g
 
-def expect_err(code, data=None, r0=None, r1=None):
+def expect_err(code, data=None, r0=None, r1=None, cause=None, addr=0, sp=None, hl=None):
 
     g = NCP8(code, data=data, tick_budget=5000)
     if r0 is not None:
         g.r[0] = r0 & 0xFF
     if r1 is not None:
         g.r[1] = r1 & 0xFF
+    if sp is not None:
+        g.SP = sp
+    if hl is not None:
+        g.HL = hl
     try:
         g.step()
-        return False, g.snapshot()
+        raised, snap = False, g.snapshot()
     except MachineError:
-        return True, g.snapshot()
+        raised, snap = True, g.snapshot()
+    if cause is not None:
+        assert raised, f"expected a fault with cause {cause}, got none"
+        assert snap["status"] == "ERROR", (cause, snap)
+        assert snap["fault_reason"] == ISA.CAUSE[cause], (
+            cause, "the machine named", ISA.fault_name(snap["fault_reason"]), snap)
+        assert snap["fault_addr"] == addr, (
+            cause, "fault_addr must be the faulting instruction", addr, snap)
+        assert snap["tick"] == 0, (cause, "a faulting tick must not commit a tick", snap)
+    return raised, snap
 
 def drive(g):
 
@@ -252,7 +266,7 @@ def test_div_mod():
 
     for src in ("DIV r0, r1\nHALT", "MOD r0, r1\nHALT"):
         code = asm(src)
-        err, snap = expect_err(code, r0=10, r1=0)
+        err, snap = expect_err(code, r0=10, r1=0, cause="DIV_ZERO")
         assert err, f"divide by zerodid not raise: {src}"
         assert snap["r"] == [10, 0, 0, 0] and snap["tick"] == 0, ("divide by zero was not atomic", snap)
     print("  DIV/MOD (500 pairs + identity + divide-by-zero atomic ERR)")
@@ -316,17 +330,17 @@ def test_ptr16():
 def test_esc_and_trap():
 
     for sub in (0x36, 0x37, 0x59, 0x63, 0x6F, 0x71, 0x7F, 0x88, 0x8F, 0xA0, 0xFF):
-        err, snap = expect_err(bytes([0x70, sub]), r0=7)
+        err, snap = expect_err(bytes([0x70, sub]), r0=7, cause="BAD_SUBCODE")
         assert err, f"reserved subcode {sub:#04x} did not raise"
         assert snap["r"][0] == 7 and snap["PC"] == 0, ("reserved subcode was not atomic", sub)
 
     for op in (0x71, 0x75, 0x7F):
-        err, _ = expect_err(bytes([op]))
+        err, _ = expect_err(bytes([op]), cause="BAD_OPCODE")
         assert err, f"reserved opcode {op:#04x} did not raise"
 
-    err, _ = expect_err(bytes([0x70, 0x70, 0x10]))
+    err, _ = expect_err(bytes([0x70, 0x70, 0x10]), cause="TRAP_UNREG")
     assert err, "EXT with k=16 did not raise"
-    err, _ = expect_err(place_vector(bytes([0x70, 0x70, 0x00]), 0, 0))
+    err, _ = expect_err(place_vector(bytes([0x70, 0x70, 0x00]), 0, 0), cause="TRAP_UNREG")
     assert err, "EXT with an unregistered vector did not raise"
 
     main = bytes([0x70, 0x70, 0x00, 0x00])
@@ -406,12 +420,17 @@ main:
         err, snap = True, g3.snapshot()
     assert err and snap["PC"] == stc_pc and snap["r"][0] == 42, ("out-of-window write was not atomic", stc_pc, snap)
 
+    assert snap["status"] == "ERROR" and snap["fault_reason"] == ISA.CAUSE["WINDOW"], \
+        ("outside window", snap)
+    assert snap["fault_addr"] == stc_pc, ("outside window", stc_pc, snap)
+
     code = asm("LDI HL, 0\nLDC r0, [HL]\nOUT r0\nLDI HL, 1\nLDC r0, [HL]\nOUT r0\nHALT")
     g4 = NCP8(code)
     drive(g4)
     assert bytes(g4.out) == bytes([code[0], code[1]]), ("LDC code read mismatch", bytes(g4.out), code[:2])
 
-    for src2 in ("LDI HL, 4000\nLDC r0, [HL]\nHALT", "LDI HL, 4000\nSTC [HL], r0\nHALT"):
+    for n, src2 in enumerate(("LDI HL, 4000\nLDC r0, [HL]\nHALT",
+                              "LDI HL, 4000\nSTC [HL], r0\nHALT")):
         g5 = NCP8(asm(src2))
         err = False
         try:
@@ -419,6 +438,9 @@ main:
         except MachineError:
             err = True
         assert err, f"out of rangedid not raise: {src2}"
+        snap = g5.snapshot()
+        assert snap["fault_reason"] == ISA.CAUSE["CODE_OOB"], (src2, snap)
+        assert snap["fault_addr"] == 3 and snap["tick"] == 1, (src2, snap)
     print("  controlled self-modification (write takes effect / out-of-window and zero-width window atomic ERR / self-read byte-exact / out-of-range ERR)")
 
 if __name__ == "__main__":

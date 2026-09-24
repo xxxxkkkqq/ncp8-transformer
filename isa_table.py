@@ -9,6 +9,13 @@ will load.
 
 Self-test: `python3 isa_table.py` compares the table against the ROMs and dispatch of the
 implementations as they are actually loaded, and reports the escape subcodes still free.
+
+The fault causes live here too: `FAULT_CAUSES` numbers every cause a machine can name
+(dense from 0, where 0 means no fault) and `FAULT_SITE_ORDER` states the sites in
+precedence order, so the tick that stops a machine names exactly one cause and every
+implementation reads that order from this module rather than restating it.
+`fault_state_error` is the single legality rule the three `check_state()`s share: widths,
+cause-in-table, and the pairing `fault_reason != 0` if and only if `status == 3`.
 """
 
 DATA_SIZE = 4096
@@ -152,6 +159,102 @@ for _f in range(16):
 
 V4_RESERVED = tuple(range(0xB0, 0xBE))
 
+FAULT_CAUSES = (
+    ("OK", "no fault"),
+    ("BAD_OPCODE", "unassigned single-byte opcode"),
+    ("BAD_SUBCODE", "reserved escape subcode"),
+    ("FETCH_OOB", "instruction bytes past the image end"),
+    ("DATA_OOB", "address outside [0, DATA_SIZE), from a read/write either byte of a "
+                  "pair, or from a pointer value that left the span (an SP write)"),
+    ("STACK_UNDERFLOW", "pop/RET with no stored slots"),
+    ("STACK_OVERFLOW", "push/CALL with no room"),
+    ("DIV_ZERO", "DIV/MOD divisor zero"),
+    ("CODE_OOB", "LDC/STC address past the image"),
+    ("WINDOW", "STC outside the declared window"),
+    ("TRAP_UNREG", "EXT k with zero vector, or k >= 16"),
+    ("TRAP_DEPTH", "EXT k with TDEPTH == TDLIM, before any push"),
+    ("TRAP_FRAME", "TRAPRET read a tag that is not 0xA5"),
+    ("TRAP_UNBALANCED", "TRAPRET with TDEPTH == 0"),
+    ("OUT_CAP", "producing byte number OUT_CAP+1"),
+    ("BAD_OPERAND", "non-canonical encoding (must-be-zero operand bits set)"),
+    ("BANK_OOB", "MB >= NBANKS"),
+    ("BANK_BUSY", "cross-bank access while the owner is running"),
+    ("PC_ILLEGAL", "committed PC outside the image"),
+)
+CAUSE = {name: code for code, (name, _d) in enumerate(FAULT_CAUSES)}
+CAUSE_NAME = {code: name for code, (name, _d) in enumerate(FAULT_CAUSES)}
+CAUSE_DESC = {name: desc for name, desc in FAULT_CAUSES}
+FAULT_CODES = tuple(range(len(FAULT_CAUSES)))
+
+CAUSES_AWAITING_FEATURE = {
+    "TRAP_DEPTH": "TDEPTH/TDLIM are wave F state; EXT has no depth check",
+    "TRAP_FRAME": "TRAPRET (subcode 0xA8) is a wave F instruction",
+    "TRAP_UNBALANCED": "TRAPRET (subcode 0xA8) is a wave F instruction",
+    "BAD_OPERAND": "the must-be-zero refusal of spec 5 is wave F",
+    "BANK_OOB": "MB and the bank family are wave D",
+    "BANK_BUSY": "MB, NBANKS and the group driver are wave D",
+    "PC_ILLEGAL": "spec 4.3 moves the branch-target bound onto the writing tick",
+}
+
+FAULT_SITE_ORDER = (
+    ("FETCH_CODE", "FETCH_OOB"),
+    ("BAD_OPCODE", "BAD_OPCODE"),
+    ("BAD_SUBCODE", "BAD_SUBCODE"),
+    ("FETCH_OPERAND", "FETCH_OOB"),
+    ("TRAP_UNREG", "TRAP_UNREG"),
+    ("DATA_OOB", "DATA_OOB"),
+    ("STACK_PUSH", "STACK_OVERFLOW"),
+    ("STACK_POP", "STACK_UNDERFLOW"),
+    ("DIV_ZERO", "DIV_ZERO"),
+    ("CODE_OOB", "CODE_OOB"),
+    ("WINDOW", "WINDOW"),
+    ("SP_RANGE", "DATA_OOB"),
+    ("OUT_CAP", "OUT_CAP"),
+)
+FAULT_SITE_NAMES = tuple(site for site, _cause in FAULT_SITE_ORDER)
+FAULT_SITE_CAUSE = {site: CAUSE[cause] for site, cause in FAULT_SITE_ORDER}
+SITE_RANK = {site: i for i, site in enumerate(FAULT_SITE_NAMES)}
+
+def fault_name(code):
+
+    if code not in CAUSE_NAME:
+        raise DecodeTableError(f"fault code {code} is not in the cause table")
+    return CAUSE_NAME[code]
+
+def fault_code(name):
+
+    if name not in CAUSE:
+        raise DecodeTableError(f"fault cause {name!r} is not in the cause table")
+    return CAUSE[name]
+
+FAULT_BITS = 8
+FAULT_ADDR_BITS = 16
+
+def fault_state_error(status, fault_reason, fault_addr=0, where=""):
+
+    def outside(field, value, lo, hi):
+        return f"{where}state field {field} is {value}, outside [{lo}, {hi}]"
+
+    if not isinstance(fault_reason, int) or isinstance(fault_reason, bool):
+        return (f"{where}state field fault_reason is {fault_reason!r}, which is not an "
+                f"integer cause code")
+    if not 0 <= fault_reason < (1 << FAULT_BITS):
+        return outside("fault_reason", fault_reason, 0, (1 << FAULT_BITS) - 1)
+    if fault_reason not in CAUSE_NAME:
+        return (f"{where}state field fault_reason is {fault_reason}, which the "
+                f"{len(FAULT_CAUSES)}-entry cause table does not assign")
+    if not 0 <= fault_addr < (1 << FAULT_ADDR_BITS):
+        return outside("fault_addr", fault_addr, 0, (1 << FAULT_ADDR_BITS) - 1)
+    if fault_reason != 0 and status != 3:
+        return (f"{where}fault cause {fault_reason} "
+                f"({CAUSE_NAME.get(fault_reason, 'unknown')}) is recorded while status "
+                f"is {status}, which is not the error status 3: a cause is recorded "
+                f"exactly when the machine stopped for it")
+    if status == 3 and fault_reason == 0:
+        return (f"{where}status is the error status 3 while fault_reason is 0 (OK): an "
+                f"error tick must name the cause it stopped for")
+    return None
+
 def single_row(op):
 
     row = SINGLE.get(op)
@@ -284,6 +387,30 @@ def check_structure():
         raise DecodeTableError("Triton escape vocabulary has duplicate names")
     if max(ESC_EOP_ID.values()) > 0x1FF:
         raise DecodeTableError("Triton escape effective opcodes exceed the 9-bit range")
+    check_fault_table()
+    return True
+
+def check_fault_table():
+
+    names = [name for name, _d in FAULT_CAUSES]
+    if len(names) != len(set(names)):
+        raise DecodeTableError("the cause table has a duplicate cause name")
+    if [fault_code(n) for n in names] != list(FAULT_CODES):
+        raise DecodeTableError("the cause table is not dense from 0")
+    if names[0] != "OK" or CAUSE["OK"] != 0:
+        raise DecodeTableError("cause 0 must be OK")
+    if max(FAULT_CODES) > 255:
+        raise DecodeTableError("the cause table exceeds the 8-bit fault_reason field")
+    if len(FAULT_SITE_NAMES) != len(set(FAULT_SITE_NAMES)):
+        raise DecodeTableError("the fault precedence list names a site twice")
+    for site, cause in FAULT_SITE_ORDER:
+        if cause not in CAUSE:
+            raise DecodeTableError(f"fault site {site} names unknown cause {cause!r}")
+        if cause == "OK":
+            raise DecodeTableError(f"fault site {site} names OK, which is not a fault")
+    for name in CAUSES_AWAITING_FEATURE:
+        if name not in CAUSE:
+            raise DecodeTableError(f"waiting list names unknown cause {name!r}")
     return True
 
 check_structure()

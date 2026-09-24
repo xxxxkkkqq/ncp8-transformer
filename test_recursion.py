@@ -12,6 +12,7 @@ from golden_sim import NCP8
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
 from test_circuit_equivalence import golden_view, lockstep
+from test_state_contract import FAULT_WRITES
 
 def _both(code, data, inputs=b""):
     return NCP8(code, data=data, inputs=inputs), TorchCircuit(code, data=data, inputs=inputs)
@@ -66,7 +67,16 @@ def test_overflow_atomic():
                 raised = True
                 assert int(c.status.item()) == 3, (n, "reference overflowed but the circuit did not report ERR")
 
-                assert golden_view(g) == pre, (n, "reference error tick was not atomic", pre, golden_view(g))
+                gv = golden_view(g)
+                assert gv["status"] == 3, (n, "reference left no error status", pre, gv)
+                assert gv["fault_reason"] != 0, (n, "reference stopped with no cause", pre, gv)
+                assert gv["fault_addr"] == pre["PC"], (
+                    n, "fault_addr is not the faulting instruction", pre["PC"], gv)
+                for k in pre:
+                    if k in FAULT_WRITES:
+                        continue
+                    assert gv[k] == pre[k], (
+                        n, "reference error tick was not atomic", k, pre[k], gv[k])
                 assert list(g.data) == pre_data, (n, "reference modified DATA before raising")
                 assert bytes(g.out) == pre_out, (n, "reference wrote output before raising")
                 assert g.SP == 0, (n, "the failure must happen exactly on the last free slot", g.SP)

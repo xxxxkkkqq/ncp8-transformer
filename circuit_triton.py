@@ -54,6 +54,18 @@ def _escape_effective_opcodes():
 
 globals().update(_escape_effective_opcodes())
 
+def _fault_code_consts():
+
+    return {("F_" + name): tl.constexpr(code)
+            for name, code in sorted(ISA.CAUSE.items())}
+
+globals().update(_fault_code_consts())
+
+STATE_ROWS = 16
+S_FAULT_REASON = tl.constexpr(14)
+S_FAULT_ADDR = tl.constexpr(15)
+STATE_ROWS_C = tl.constexpr(STATE_ROWS)
+
 class DecodeTableMismatch(Exception):
 
     pass
@@ -136,7 +148,8 @@ for _name, _size in (("CODE_SIZE", CODE_SIZE), ("DATA_SIZE", DATA_SIZE),
     _power_of_two_or_die(_name, _size)
 CODE_MASK = tl.constexpr(CODE_SIZE - 1)
 
-def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, where=""):
+def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
+                fault_reason=0, fault_addr=0, where=""):
 
     def outside(field, value, lo, hi):
         raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
@@ -159,6 +172,9 @@ def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, wh
             outside(field, v, 0, "unbounded")
     if status not in (0, 1, 2, 3):
         outside("status", status, 0, 3)
+    bad = ISA.fault_state_error(status, fault_reason, fault_addr, where)
+    if bad is not None:
+        raise ValueError(bad)
 
 @triton.jit
 def _get4(v0, v1, v2, v3, idx):
@@ -203,6 +219,18 @@ def _dec_esc(sub):
 _check_decode_against_table()
 
 @triton.jit
+def _decode_refusal(eop):
+
+    return tl.where(eop >= _ESC_EOP_BASE, F_BAD_SUBCODE, F_BAD_OPCODE)
+
+@triton.jit
+def _name_cause(errc, code):
+
+    if errc == 0:
+        errc = code
+    return errc
+
+@triton.jit
 def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
 
     r0 = tl.load(S + 0); r1 = tl.load(S + 1); r2 = tl.load(S + 2); r3 = tl.load(S + 3)
@@ -221,6 +249,8 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
     A3 = 0; V3 = 0; E3 = 0
     err = 0
 
+    errc = 0
+
     eop = 0xFFFF
     ed = 0; es = 0; elen = 1
 
@@ -232,6 +262,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
 
             if PC + elen > CODELEN:
                 err = 1
+                errc = _name_cause(errc, F_FETCH_OOB)
             else:
                 sub = tl.load(CODE + PC + 1)
                 eop, ed, es, elx = _dec_esc(sub)
@@ -241,6 +272,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
 
                     eop = 0xFFFF
                     err = 1
+                    errc = _name_cause(errc, F_FETCH_OOB)
 
         if eop <= 0x1F:
             if eop == 0x00:
@@ -258,22 +290,26 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
             elif eop == 0x06:
                 if HL >= DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 else:
                     OVAL = tl.load(DATA + HL); OEN = 1; nHL = (HL + 1) & 0xFFFF
             elif eop == 0x07:
                 if DE >= DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 else:
                     OVAL = tl.load(DATA + DE); OEN = 1; nDE = (DE + 1) & 0xFFFF
             elif eop == 0x08:
                 if SP + 1 >= DS:
                     err = 1
+                    errc = _name_cause(errc, F_STACK_UNDERFLOW)
                 else:
                     nPC = (tl.load(DATA + SP) << 8) | tl.load(DATA + SP + 1)
                     nSP = SP + 2
             elif eop >= 0x09 and eop <= 0x0D:
                 if PC + elen > CODELEN:
                     err = 1
+                    errc = _name_cause(errc, F_FETCH_OOB)
                 else:
                     t = tl.load(CODE + PC + 1) | (tl.load(CODE + PC + 2) << 8)
                     if eop == 0x09:
@@ -287,8 +323,13 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                     else:
                         nPC = t if C == 0 else PC + elen
             elif eop == 0x0E:
-                if SP < 2 or PC + elen > CODELEN:
+
+                if PC + elen > CODELEN:
                     err = 1
+                    errc = _name_cause(errc, F_FETCH_OOB)
+                elif SP < 2:
+                    err = 1
+                    errc = _name_cause(errc, F_STACK_OVERFLOW)
                 else:
                     t = tl.load(CODE + PC + 1) | (tl.load(CODE + PC + 2) << 8)
                     ret = PC + elen
@@ -298,6 +339,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
             elif eop == 0x0F or eop == 0x10:
                 if PC + elen > CODELEN:
                     err = 1
+                    errc = _name_cause(errc, F_FETCH_OOB)
                 else:
                     t = tl.load(CODE + PC + 1) | (tl.load(CODE + PC + 2) << 8)
                     nPC = PC + elen
@@ -308,6 +350,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
             elif eop == 0x11 or eop == 0x12:
                 if PC + elen > CODELEN:
                     err = 1
+                    errc = _name_cause(errc, F_FETCH_OOB)
                 else:
                     rs = _get4(r0, r1, r2, r3, tl.load(CODE + PC + 1) & 3)
                     nPC = PC + elen
@@ -328,6 +371,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
             else:
                 err = 1
+                errc = _name_cause(errc, _decode_refusal(eop))
         elif eop >= 0x20 and eop <= 0x5F:
 
             f = eop & 0xF
@@ -347,6 +391,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 nC = (t > 255).to(tl.int32); nZ = (v == 0).to(tl.int32)
             else:
                 err = 1
+                errc = _name_cause(errc, _decode_refusal(eop))
             nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
         elif eop >= 0x80 and eop <= 0xCF:
             f = eop & 0xF
@@ -367,10 +412,12 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 v = b
             else:
                 err = 1
+                errc = _name_cause(errc, _decode_refusal(eop))
             nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
         elif eop >= 0xD0 and eop <= 0xDF:
             if PC + elen > CODELEN:
                 err = 1
+                errc = _name_cause(errc, F_FETCH_OOB)
             else:
                 i8 = tl.load(CODE + PC + 1)
                 rr = _get4(r0, r1, r2, r3, eop & 3)
@@ -398,6 +445,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
             else:
                 if PC + elen > CODELEN:
                     err = 1
+                    errc = _name_cause(errc, F_FETCH_OOB)
                 else:
                     t = tl.load(CODE + PC + 1) | (tl.load(CODE + PC + 2) << 8)
                     v = (rr - 1) & 255
@@ -412,31 +460,37 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
             if eop < 0xE4:
                 if HL >= DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 else:
                     v = tl.load(DATA + HL)
             elif eop < 0xE8:
                 if HL >= DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 else:
                     A1 = HL; V1 = rr; E1 = 1
             elif eop < 0xEC:
                 if DE >= DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 else:
                     v = tl.load(DATA + DE)
             elif eop < 0xF0:
                 if DE >= DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 else:
                     A1 = DE; V1 = rr; E1 = 1
             elif eop < 0xF4:
                 if SP <= 0:
                     err = 1
+                    errc = _name_cause(errc, F_STACK_OVERFLOW)
                 else:
                     A1 = SP - 1; V1 = rr; E1 = 1; nSP = SP - 1
             elif eop < 0xF8:
                 if SP >= DS:
                     err = 1
+                    errc = _name_cause(errc, F_STACK_UNDERFLOW)
                 else:
                     v = tl.load(DATA + SP); nSP = SP + 1
             elif eop < 0xFC:
@@ -454,6 +508,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 b = _get4(r0, r1, r2, r3, es)
                 if b == 0:
                     err = 1
+                    errc = _name_cause(errc, F_DIV_ZERO)
                 else:
                     if eop == ESC_DIV:
                         v = a // b
@@ -507,15 +562,22 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
 
                 if PC + elen > CODELEN:
                     err = 1
+                    errc = _name_cause(errc, F_FETCH_OOB)
                 else:
                     k = tl.load(CODE + PC + 2)
                     if k >= 16:
                         err = 1
+                        errc = _name_cause(errc, F_TRAP_UNREG)
                     else:
                         tgt = tl.load(CODE + 0x0F00 + 2 * k) \
                             | (tl.load(CODE + 0x0F00 + 2 * k + 1) << 8)
-                        if tgt == 0 or SP < 2:
+
+                        if tgt == 0:
                             err = 1
+                            errc = _name_cause(errc, F_TRAP_UNREG)
+                        elif SP < 2:
+                            err = 1
+                            errc = _name_cause(errc, F_STACK_OVERFLOW)
                         else:
                             ret = PC + elen
                             A1 = SP - 1; V1 = ret & 0xFF; E1 = 1
@@ -525,17 +587,20 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
 
                 if HL >= CODELEN:
                     err = 1
+                    errc = _name_cause(errc, F_CODE_OOB)
                 else:
                     wlo = tl.load(CODE + 0x0F20)
                     whi = tl.load(CODE + 0x0F21)
                     if HL < wlo or HL >= whi:
                         err = 1
+                        errc = _name_cause(errc, F_WINDOW)
                     else:
                         A3 = HL; V3 = _get4(r0, r1, r2, r3, ed); E3 = 1
             elif eop == ESC_LDC:
 
                 if HL >= CODELEN:
                     err = 1
+                    errc = _name_cause(errc, F_CODE_OOB)
                 else:
                     v = tl.load(CODE + HL)
                     nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
@@ -551,17 +616,20 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
 
                 if HL > DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 else:
                     nSP = HL
             elif eop == ESC_MOVW_SP_DE:
                 if DE > DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 else:
                     nSP = DE
             elif eop == ESC_PUSHW_HL or eop == ESC_PUSHW_DE:
 
                 if SP < 2:
                     err = 1
+                    errc = _name_cause(errc, F_STACK_OVERFLOW)
                 else:
                     if eop == ESC_PUSHW_HL:
                         v = HL
@@ -573,6 +641,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
             elif eop == ESC_POPW_HL or eop == ESC_POPW_DE:
                 if SP + 2 > DS:
                     err = 1
+                    errc = _name_cause(errc, F_STACK_UNDERFLOW)
                 else:
                     v = tl.load(DATA + SP) | (tl.load(DATA + SP + 1) << 8)
                     if eop == ESC_POPW_HL:
@@ -590,6 +659,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                     v = HL
                 if adr + 1 >= DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 else:
                     A1 = adr; V1 = v & 0xFF; E1 = 1
                     A2 = adr + 1; V2 = (v >> 8) & 0xFF; E2 = 1
@@ -601,6 +671,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                     adr = DE
                 if adr + 1 >= DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 else:
                     v = tl.load(DATA + adr) | (tl.load(DATA + adr + 1) << 8)
                     if eop == ESC_LDW_DEHL:
@@ -614,6 +685,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 adr = (HL + sx) & 0xFFFF
                 if adr >= DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 elif eop == ESC_LDX:
                     v = tl.load(DATA + adr)
                     nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
@@ -626,6 +698,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 v = (SP + sx) & 0xFFFF
                 if v > DS:
                     err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
                 else:
                     nSP = v
             elif eop == ESC_MULH:
@@ -636,10 +709,13 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                 nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
             else:
                 err = 1
+                errc = _name_cause(errc, F_BAD_SUBCODE)
         else:
             err = 1
+            errc = _name_cause(errc, _decode_refusal(eop))
     else:
         err = 1
+        errc = _name_cause(errc, F_FETCH_OOB)
 
     OT = tl.load(S + 12)
     ST = tl.load(S + 13)
@@ -647,6 +723,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
     if OEN == 1 and OL >= OC:
 
         err = 1
+        errc = _name_cause(errc, F_OUT_CAP)
     if ST != 0:
 
         RST = ST
@@ -659,6 +736,8 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
     elif err == 1:
 
         tl.store(S + 13, 3)
+        tl.store(S + S_FAULT_REASON, errc)
+        tl.store(S + S_FAULT_ADDR, PC)
         RST = 3
         RTK = OT
     else:
@@ -698,7 +777,7 @@ def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BU
     DP = DATA + pid * DS
     IP = INPUTS + pid * INS
     OP = OUTBUF + pid * OCS
-    ST = STATES + pid * 14
+    ST = STATES + pid * STATE_ROWS_C
     CL = tl.load(CODELENS + pid)
     IL = tl.load(INLENS + pid)
     BD = tl.load(BUDGETS + pid)
@@ -731,7 +810,7 @@ class TritonBatch:
         self.DATA = torch.zeros((n, DATA_SIZE), dtype=i32, device=self.dev)
         self.INPUTS = torch.zeros((n, self.max_in), dtype=i32, device=self.dev)
         self.OUTBUF = torch.zeros((n, self.out_cap), dtype=i32, device=self.dev)
-        self.STATE = torch.zeros((n, 14), dtype=i32, device=self.dev)
+        self.STATE = torch.zeros((n, STATE_ROWS), dtype=i32, device=self.dev)
         self.STATE[:, 7] = DATA_SIZE
         self.CODELENS = torch.zeros(n, dtype=i32, device=self.dev)
         self.INLENS = torch.zeros(n, dtype=i32, device=self.dev)
@@ -771,11 +850,13 @@ class TritonBatch:
         self.STATE[i, 7] = DATA_SIZE
 
     def set_state(self, i, r=(0, 0, 0, 0), HL=0, DE=0, PC=0, SP=DATA_SIZE,
-                  C=0, Z=0, ipos=0, oplen=0, tick=0, status=0):
+                  C=0, Z=0, ipos=0, oplen=0, tick=0, status=0, fault_reason=0,
+                  fault_addr=0):
 
         self._row(i)
         check_state(r, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=ipos, oplen=oplen,
-                    status=status, where=f"machine {i}: ")
+                    status=status, fault_reason=fault_reason, fault_addr=fault_addr,
+                    where=f"machine {i}: ")
         self.STATE[i, 0:4] = torch.tensor(list(r), dtype=torch.int32, device=self.dev)
         self.STATE[i, 4] = HL
         self.STATE[i, 5] = DE
@@ -787,6 +868,8 @@ class TritonBatch:
         self.STATE[i, 11] = oplen
         self.STATE[i, 12] = tick
         self.STATE[i, 13] = status
+        self.STATE[i, 14] = fault_reason
+        self.STATE[i, 15] = fault_addr
 
     def set_budget(self, i, budget):
 
@@ -841,7 +924,8 @@ class TritonBatch:
         self._row(i)
         s = self.STATE[i].cpu().tolist()
         return dict(r=s[0:4], HL=s[4], DE=s[5], SP=s[7], PC=s[6], C=s[8], Z=s[9],
-                    ipos=s[10], oplen=s[11], tick=s[12], status=s[13])
+                    ipos=s[10], oplen=s[11], tick=s[12], status=s[13],
+                    fault_reason=s[14], fault_addr=s[15])
 
     def data(self, i):
 
@@ -873,11 +957,12 @@ def run_batch(codes, datas=None, inputs=None, budgets=None, states=None,
             raise ValueError(f"states must be {n} rows, got {len(states)}")
         for i, s in enumerate(states):
             row = list(s)
-            if len(row) != 14:
-                raise ValueError(f"machine {i}: state row has {len(row)} values, need 14")
+            if len(row) != STATE_ROWS:
+                raise ValueError(f"machine {i}: state row has {len(row)} values, "
+                                 f"need {STATE_ROWS}")
             b.set_state(i, r=row[0:4], HL=row[4], DE=row[5], PC=row[6], SP=row[7],
                         C=row[8], Z=row[9], ipos=row[10], oplen=row[11], tick=row[12],
-                        status=row[13])
+                        status=row[13], fault_reason=row[14], fault_addr=row[15])
     return b.run()
 
 class TritonCircuit:
@@ -899,18 +984,24 @@ class TritonCircuit:
         self.INP = torch.tensor(list(inputs) if inputs else [0], dtype=i32, device=dev)
         self.inlen = len(inputs)
         self.OUTBUF = torch.zeros(OUT_CAP, dtype=i32, device=dev)
-        self.S = torch.zeros(14, dtype=i32, device=dev)
+        self.S = torch.zeros(STATE_ROWS, dtype=i32, device=dev)
         self.S[7] = DATA_SIZE
         self.BUDGET = torch.tensor([int(tick_budget)], dtype=i32, device=dev)
         self.tb = int(tick_budget)
 
-    def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0):
+    def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0, fault_reason=None,
+                   fault_addr=None):
 
-        check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC)
+        fr = int(self.S[14].item()) if fault_reason is None else fault_reason
+        fa = int(self.S[15].item()) if fault_addr is None else fault_addr
+        check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC,
+                    ipos=int(self.S[10].item()), oplen=int(self.S[11].item()),
+                    status=int(self.S[13].item()), fault_reason=fr, fault_addr=fa)
         self.S[0:4] = torch.tensor(list(R), dtype=torch.int32, device=self.dev)
         self.S[4] = HL; self.S[5] = DE; self.S[6] = PC
         self.S[7] = SP; self.S[8] = C; self.S[9] = Z
         self.S[12] = tick
+        self.S[14] = fr; self.S[15] = fa
 
     def step(self):
         ncp_step_kernel[(1,)](self.CODE, self.DATA, self.INP, self.OUTBUF, self.S,
@@ -928,10 +1019,20 @@ class TritonCircuit:
     def oplen(self):
         return self.S[11:12]
 
+    @property
+    def fault_reason(self):
+        return self.S[14:15]
+
+    @property
+    def fault_addr(self):
+        return self.S[15:16]
+
     def snapshot(self):
+
         s = self.S.cpu().tolist()
         return dict(r=s[0:4], HL=s[4], DE=s[5], SP=s[7], PC=s[6], C=s[8], Z=s[9],
-                    ipos=s[10], oplen=s[11], tick=s[12], status=s[13])
+                    ipos=s[10], oplen=s[11], tick=s[12], status=s[13],
+                    fault_reason=s[14], fault_addr=s[15])
 
     def out(self):
 

@@ -25,7 +25,8 @@ import debug
 import disasm
 import loader
 import profiler
-from golden_sim import AssemblyError, CODE_SIZE, DATA_SIZE, MachineError, NCP8, asm
+from golden_sim import (AssemblyError, CODE_SIZE, DATA_SIZE, MachineError, NCP8,
+                          STATUS_ERROR, asm)
 
 IMMS = (0x00, 0x01, 0x7F, 0x80, 0xFF)
 A16_HIGH = 0x80
@@ -40,6 +41,18 @@ def require(cond, msg):
     if not cond:
         raise AssertionError(msg)
 
+def require_atomic_fault(before, after, what):
+
+    require(after["status"] == STATUS_ERROR,
+            f"{what} left status {after['status']!r}, not ERROR")
+    require(after["fault_reason"] != 0, f"{what} stopped without naming a cause")
+    require(after["fault_addr"] == before["PC"],
+            f"{what} fault_addr {after['fault_addr']} is not the faulting instruction "
+            f"{before['PC']}")
+    for k, v in before.items():
+        if k in ("status", "fault_reason", "fault_addr"):
+            continue
+        require(after[k] == v, f"{what} faulted non-atomically: {k} {v} -> {after[k]}")
 def refuses(fn, *args, **kw):
 
     try:
@@ -325,7 +338,8 @@ def test_reserved_faults_on_the_machine():
         msg = refuses(g.step)
         require(msg is not None and "MachineError" in msg,
                 f"sampled {kind} {img.hex()} did not fault: {msg}")
-        require(g.snapshot() == before, f"sampled {kind} {img.hex()} faulted non-atomically")
+        require_atomic_fault(before, g.snapshot(),
+                           f'sampled {kind} {img.hex()}')
     for img in (bytes([0x0E]), bytes([0x70, 0x36]), bytes([0x70, 0xFF])):
         g = NCP8(img)
         g.r[0] = 7
@@ -333,8 +347,7 @@ def test_reserved_faults_on_the_machine():
         msg = refuses(g.step)
         require(msg is not None and "MachineError" in msg,
                 f"{img.hex()} did not fault on the reference: {msg}")
-        after = g.snapshot()
-        require(after == before, f"{img.hex()} faulted but moved state: {before} -> {after}")
+        require_atomic_fault(before, g.snapshot(), f"{img.hex()}")
 
     g = NCP8(asm("JNC 0x0003\nOUT r0\nHALT\n"))
     g.run()
@@ -1267,11 +1280,12 @@ def test_debugger_reports_atomicity():
                                                         f"{f.raised}")
     require(f.post is None and f.writes == [], f"a faulting frame committed something: "
                                               f"{f.post} {f.writes}")
-    require(d.state() == before[0], "the faulting step changed the visible state")
+
+    require_atomic_fault(before[0], d.state(), "the debugger's faulting step")
     require(bytes(d.m.data) == before[1], "the faulting step changed DATA")
     require(f.tick == 3 and d.state()["tick"] == 3, "tick moved on an atomic error")
-    print("  the faulting frame carries no writes and no post-state, and the machine is "
-          "bit-identical across it")
+    print("  the faulting frame carries no writes and no post-state; across it the "
+          "machine advances nothing but status, cause and the faulting address")
 
 def test_debugger_records_what_the_machine_did():
 
