@@ -11,10 +11,17 @@
 | `C`, `Z` | 1 bit each | carry and zero flags |
 | `CODE` | 4096 bytes | program memory; readable anywhere, written only by `STC`, and only inside the declared window (see 5) |
 | `DATA` | 4096 bytes | data memory and stack |
-| input / output | byte streams | `IN` / `OUT` |
+| input | byte stream | `IN`, cursor `ipos` |
+| output | byte stream, capacity 8192 | `OUT`; see 2.3 |
 | `tick` | counter | bounded by a tick budget |
 
 Status: `0` running, `1` halted, `2` tick budget exhausted, `3` error.
+
+`CODE_SIZE = DATA_SIZE = 4096` and `OUT_CAP = 8192` are declared once and shared by all
+three implementations. All three sizes are required to be positive powers of two, and the
+requirement is checked at import rather than assumed: the tensor and kernel paths contain
+a write at `address & (SIZE - 1)` to keep a machine's store inside its own buffer, and
+that mask only confines a write when the size is a power of two.
 
 ## 2. Error contract
 
@@ -28,6 +35,43 @@ advances only on a successful tick.
 A 16-bit memory access checks both of its bytes before either one is read or
 written, so a violating tick cannot commit half a word. The same rule applies to
 `PUSHW`/`POPW`, which occupy two stack slots.
+
+### 2.1 Terminal status is sticky
+
+Once `status` is `1`, `2` or `3` it never changes again, and the machine's other fields
+are frozen with it. Stepping a stopped machine is a **no-op, not an error**: `step()`
+returns having committed nothing, and `run()` returns immediately. This is what makes it
+safe for a driver to call `step()` without first asking whether the machine is still
+running, and it is the behaviour the batched executor depends on, because a batch keeps
+stepping machines that halted on different ticks.
+
+### 2.2 The tick budget is checked before the instruction
+
+The budget is tested at the start of a tick, so the tick that exhausts it executes
+nothing: `status` becomes `2`, `PC` stays where it was, and `tick` does not advance. The
+same rule holds through `step()` as through `run()`; a budget is a property of the
+machine, not of one particular driver.
+
+A tick that raises is rolled back rather than left half-applied, including for exceptions
+that are not machine errors: `PC` is restored, so a failed `step()` cannot advance the
+program counter on its own.
+
+### 2.3 Output capacity is an error, not a truncation
+
+A machine may produce at most `OUT_CAP = 8192` bytes. The attempt to produce byte number
+`8193` is an atomic error tick (`status = 3`, and the stream stays at 8192 bytes), rather
+than a run that "succeeds" with a silently shortened output. In the batched path the
+capacity is per machine: one machine overflowing cannot truncate or extend its neighbour's
+stream.
+
+### 2.4 State can only be installed through a validating constructor
+
+`load_state`/`check_state` refuse a value outside a field's declared width and name the
+field, the index and the offending value. This is enforced on every path, including under
+`python -O`: validation that lives in a bare `assert` disappears with the flag, and a
+silently unvalidated state constructor would make the bit-for-bit comparisons in the test
+suites depend on how the interpreter was started.
+
 
 ## 3. Registers and flags
 
@@ -213,7 +257,15 @@ these tables must pad the image to at least `0x0F22` bytes.
 ## 6. Invariants
 
 1. Flags change only through instructions that declare it.
-2. Halt happens only through `HALT` or by exhausting the tick budget.
-3. Out-of-range access raises; nothing wraps silently.
-4. A trace recorded from any implementation can be replayed to reproduce the
-   state of the reference simulator exactly.
+2. `status` leaves `0` only through `HALT`, an exhausted tick budget, or an error
+   tick, and never returns: a stopped machine commits nothing further (see 2.1).
+3. Out-of-range access raises; nothing wraps silently, and no write leaves the
+   machine's own buffer.
+4. State is installed only through a validating constructor, and the validation
+   holds under `python -O` as well as normally (see 2.4).
+5. A trace recorded from any implementation can be replayed to reproduce the state
+   of the reference simulator exactly. Of the properties on this list, this one is the
+   least tested: the suites compare implementations tick-by-tick from tick 0, and the
+   debugger replays a recording re-derived from the program image, but resuming a
+   machine from an arbitrary mid-run state and continuing is a separate claim, and it
+   is listed here because it is intended, not because a published test demonstrates it.

@@ -46,11 +46,20 @@ The reference-only suites run on CPU. The circuit suites need CUDA.
   input, not of numeric precision.
 * **Atomic errors.** A violating tick writes `status = 3` and nothing else: no
   register, memory, flag or PC update. Verified separately for undefined
-  opcodes, out-of-range accesses, stack bounds, division by zero and writes
-  outside the self-modification window.
+  opcodes, out-of-range accesses, stack bounds, division by zero, writes outside
+  the self-modification window, and a program producing more output than the
+  machine can hold.
+* **A bounded, validated state.** `status` is sticky once terminal and stepping a
+  stopped machine commits nothing; the tick budget is enforced before the
+  instruction it stops, identically through `step()` and `run()`; state can only be
+  installed through a constructor that rejects an out-of-width field, and that
+  rejection survives `python -O`. See `ISA.md` section 2.
 * **Exactness across implementations.** Three implementations of the same
   specification, differing in how the transition is computed, agree bit-for-bit
   on every opcode, every escape subcode and on multi-thousand-tick program runs.
+  Agreement is checked per tick and per field, on the error paths as well as the
+  successful ones; `test_state_contract.py` exists because the fields that were
+  *not* compared are exactly where the divergences turned out to be.
 
 ## Extension mechanism
 
