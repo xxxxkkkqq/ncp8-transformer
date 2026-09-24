@@ -5,8 +5,10 @@ byte-for-byte against an independent Python integer model.
 """
 from golden_sim import NCP8, asm
 
+def require(condition, message):
 
-
+    if not condition:
+        raise AssertionError(message)
 
 LONG_ADD = asm("""
   LDI HL, 0
@@ -36,7 +38,6 @@ od:
   HALT
 """)
 
-
 def run_long_add(a: int, b: int):
     n = max((a.bit_length() + 7) // 8, (b.bit_length() + 7) // 8, 1)
     data = bytearray(1 + 3 * n)
@@ -46,12 +47,9 @@ def run_long_add(a: int, b: int):
         data[1 + n + i] = (b >> (8 * i)) & 0xFF
     sim = NCP8(LONG_ADD, data=data)
     out = sim.run()
-    assert sim.status == "HALT", sim.status
+    require(sim.status == "HALT", f"machine ended in status {sim.status}, not HALT")
     got = sum(v << (8 * i) for i, v in enumerate(out))
     return got, a + b, sim
-
-
-
 
 FIB = asm("""
   LDI HL, 0
@@ -117,25 +115,20 @@ od:
   HALT
 """)
 
-
 def fib(n):
     a, b = 0, 1
     for _ in range(n):
         a, b = b, a + b
     return b
 
-
 def run_fib(k: int):
     data = bytearray(13)
     data[0] = k
     sim = NCP8(FIB, data=data)
     out = sim.run()
-    assert sim.status == "HALT", sim.status
+    require(sim.status == "HALT", f"machine ended in status {sim.status}, not HALT")
     got = sum(v << (8 * i) for i, v in enumerate(out))
     return got, fib(k), sim
-
-
-
 
 SUMREC = asm("""
   LDI HL, 0
@@ -160,32 +153,15 @@ base:
   RET
 """)
 
-
 def run_sumrec(n: int):
     data = bytearray(n + 16)
     data[0] = n
     sim = NCP8(SUMREC, data=data)
     out = sim.run()
-    assert sim.status == "HALT", sim.status
-    assert len(out) == 2
+    require(sim.status == "HALT", f"machine ended in status {sim.status}, not HALT")
+    require(len(out) == 2, f"sumrec returned {len(out)} bytes, expected 2")
     got = out[0] << 8 | out[1]
     return got, n * (n + 1) // 2, sim
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 FRAME_MUL = asm("""
   LDI HL, 2
@@ -306,15 +282,12 @@ mul8:
   RET
 """)
 
-
 def frame_mul_model(a, b):
-
 
     x = a & 0xFFFF
     y = b[0] | (b[1] << 8)
     addend = b[2] | (b[3] << 8)
     return (x * y + addend) & 0xFFFFFFFF
-
 
 def run_frame_mul(a, b):
 
@@ -324,10 +297,9 @@ def run_frame_mul(a, b):
     data[2:6] = bytes(b)
     sim = NCP8(FRAME_MUL, data=data)
     out = sim.run()
-    assert sim.status == "HALT", sim.status
-    assert len(out) == 4, out
+    require(sim.status == "HALT", f"machine ended in status {sim.status}, not HALT")
+    require(len(out) == 4, f"frame_mul returned {len(out)} bytes, expected 4")
     return out[0] | (out[1] << 8) | (out[2] << 16) | (out[3] << 24), sim
-
 
 if __name__ == "__main__":
     import random
@@ -338,19 +310,19 @@ if __name__ == "__main__":
         a = random.getrandbits(nbits)
         b = random.getrandbits(nbits)
         got, want, _ = run_long_add(a, b)
-        assert got == want, (trial, a, b, got, want)
+        require(got == want, f"long_add trial {trial}: {a} + {b} gave {got}, expected {want}")
         ok += 1
     print(f"long_add: {ok} random long additions byte-exact ")
 
     for k in range(47):
         got, want, _ = run_fib(k)
-        assert got == want, (k, got, want)
+        require(got == want, f"fib({k}) gave {got}, expected {want}")
     print("fibonacci: F(0..46) all byte-exact")
 
     for n in [0, 1, 2, 7, 23, 100, 200, 255]:
         got, want, sim = run_sumrec(n)
-        assert got == want, (n, got, want)
-        assert sim.snapshot()["SP"] == 4096, f"n={n} stack not restored: {sim.snapshot()}"
+        require(got == want, f"sumrec({n}) gave {got}, expected {want}")
+        require(sim.snapshot()["SP"] == 4096, f"n={n} stack not restored: {sim.snapshot()}")
     print("sumrec: recursion bounds/depth/stack balance all match")
 
     for _ in range(200):
@@ -358,13 +330,10 @@ if __name__ == "__main__":
         b = [random.randrange(256) for _ in range(4)]
         got, sim = run_frame_mul(a, b)
         want = frame_mul_model(a, b)
-        assert got == want, (hex(a), b, hex(got), hex(want))
-        assert sim.snapshot()["SP"] == 4096, f"frame not unwound: {sim.snapshot()}"
+        require(got == want, f"frame_mul({hex(a)}, {b}) gave {hex(got)}, expected {hex(want)}")
+        require(sim.snapshot()["SP"] == 4096, f"frame not unwound: {sim.snapshot()}")
     print("frame_mul: 200 random (a, b) pairs, 16x16->32 widening product + local array, "
           "frame unwound and result byte-exact against the Python model")
-
-
-
 
 MUL = asm("""
   LDI HL, 0
@@ -386,17 +355,13 @@ done:
   HALT
 """)
 
-
 def run_mul(a, b):
     data = bytearray(2); data[0] = a; data[1] = b
     sim = NCP8(MUL, data=data)
     out = sim.run()
-    assert sim.status == "HALT", sim.status
+    require(sim.status == "HALT", f"machine ended in status {sim.status}, not HALT")
     got = (out[0] << 8) | out[1]
     return got, a * b
-
-
-
 
 NESTED = asm("""
   LDI HL, 0
@@ -413,16 +378,12 @@ inner:
   RET
 """)
 
-
 def run_nested(n):
     data = bytearray(1); data[0] = n
     sim = NCP8(NESTED, data=data)
     out = sim.run()
-    assert sim.status == "HALT", sim.status
+    require(sim.status == "HALT", f"machine ended in status {sim.status}, not HALT")
     return out[0], n * 2 + 5
-
-
-
 
 OVERFLOW = asm("""
 recurse:

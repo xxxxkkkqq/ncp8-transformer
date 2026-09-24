@@ -23,6 +23,7 @@ from __future__ import annotations
 from golden_sim import NCP8, MachineError, asm
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
+from test_state_contract import assert_widths
 
 DATA_SIZE = 4096
 VEC = 0x0F00
@@ -42,37 +43,27 @@ INPUTS = b"\xAB\xCD"
 
 DATA_IMAGE = bytes((i * 7 + 13) & 0xFF for i in range(DATA_SIZE))
 
-
 def build_code(head, vec0=None):
-
-
-
-
 
     b = bytearray(bytes(head).ljust(WHI + 2, b"\x00"))
     if vec0 is not None:
         b[VEC:VEC + 2] = (vec0 & 0xFFFF).to_bytes(2, "little")
     return bytes(b)
 
-
 def ref_view(g):
     return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
                 ipos=g.ipos, oplen=len(g.out), tick=g.tick, status=STATUS[g.status])
 
-
 def run_reference(code, sp, hl, de):
 
     g = NCP8(code, data=DATA_IMAGE, inputs=INPUTS)
-    g.r = list(INIT_R)
-    g.HL, g.DE, g.SP = hl, de, sp
-    g.C, g.Z, g.tick = INIT_C, INIT_Z, TICK0
+    g.load_state(INIT_R, hl, de, sp, INIT_C, INIT_Z, TICK0)
     try:
         g.step()
         raised = False
     except MachineError:
         raised = True
     return raised, ref_view(g), list(g.data), bytes(g.code), bytes(g.out)
-
 
 def run_circuit(Machine, code, sp, hl, de):
 
@@ -90,14 +81,7 @@ def run_circuit(Machine, code, sp, hl, de):
     code_img = bytes(c.CODE.cpu().tolist()[:len(code)])
     return raised, snap, data, code_img, c.out()
 
-
 def check_case(name, code, sp, hl, de, expect_err, expect_commit=None):
-
-
-
-
-
-
 
     runs = [("reference", run_reference(code, sp, hl, de)),
             ("torch", run_circuit(TorchCircuit, code, sp, hl, de)),
@@ -105,6 +89,7 @@ def check_case(name, code, sp, hl, de, expect_err, expect_commit=None):
     ref_pre = dict(r=list(INIT_R), HL=hl, DE=de, SP=sp, PC=0, C=INIT_C, Z=INIT_Z,
                    ipos=0, oplen=0, tick=TICK0, status=0)
     for label, (raised, post, data, code_img, out) in runs:
+        assert_widths(post, (name, label, "post-state"))
         if expect_err:
             assert raised, (name, label, "the violating tick did not report an error")
             if label == "reference":
@@ -125,7 +110,6 @@ def check_case(name, code, sp, hl, de, expect_err, expect_commit=None):
             assert data == list(exp_data), (name, label, "legal tick DATA mismatch")
             assert out == exp_out, (name, label, "legal tick output mismatch", exp_out, out)
 
-
     r_raised, r_post, r_data, r_code, r_out = runs[0][1]
     keys = [k for k in ref_pre if k != "status"] if expect_err else list(ref_pre)
     for label, (raised, post, data, code_img, out) in runs[1:]:
@@ -136,14 +120,7 @@ def check_case(name, code, sp, hl, de, expect_err, expect_commit=None):
             (name, label, "memory or output differs from the reference")
     return "err" if expect_err else "ok"
 
-
 def legal_expect(kind, sp, hl, de, imm=None):
-
-
-
-
-
-
 
     r = list(INIT_R)
     d = bytearray(DATA_IMAGE)
@@ -228,8 +205,6 @@ def legal_expect(kind, sp, hl, de, imm=None):
         raise AssertionError(f"unknown case kind {kind!r}")
     return st, bytes(d), out
 
-
-
 STACK_CASES = (
     ("PUSH r0", bytes([0xF0 | 0])),
     ("POP r0", bytes([0xF4 | 0])),
@@ -263,16 +238,12 @@ MEM_CASES = (
     ("OUTDE", bytes([0x07]), "DE"),
 )
 
-
-
 WIDE_CASES = (
     ("STW [HL], DE", bytes([0x70, 0x3C]), "HL"),
     ("STW [DE], HL", bytes([0x70, 0x3D]), "DE"),
     ("LDW DE, [HL]", bytes([0x70, 0x3E]), "HL"),
     ("LDW HL, [DE]", bytes([0x70, 0x3F]), "DE"),
 )
-
-
 
 FRAME_CASES = (
     ("LDX r0, [HL+i]", "LDX r0, [HL-1]", 1, -1, False),
@@ -287,7 +258,6 @@ FRAME_CASES = (
     ("STX [HL+i], r0", "STX [HL], r0", 4095, 0, False),
 )
 
-
 ADD_SP_CASES = (
     (4096, 1, True), (4096, 0, False), (4096, -128, False), (4095, 1, False),
     (0, -1, True), (0, 0, False), (1, -1, False), (3, -3, False), (127, -128, True),
@@ -299,12 +269,9 @@ MOVW_SP_CASES = (
 )
 SP_PAIR_VALUES = (0, 4095, 4096, 4097, 65535)
 
-
 def _seed_last_byte(addr):
 
-
     return DATA_IMAGE[addr] | (DATA_IMAGE[addr + 1] << 8)
-
 
 def test_stack_boundaries():
     tot = {"ok": 0, "err": 0}
@@ -322,7 +289,6 @@ def test_stack_boundaries():
           f"(error {tot['err']} + legal {tot['ok']})")
     return tot
 
-
 def test_memory_boundaries():
     tot = {"ok": 0, "err": 0}
     for kind, head, ptr in MEM_CASES:
@@ -338,14 +304,7 @@ def test_memory_boundaries():
           f"(error {tot['err']} + legal {tot['ok']})")
     return tot
 
-
 def test_wide_memory_boundaries():
-
-
-
-
-
-
 
     tot = {"ok": 0, "err": 0}
     for kind, head, ptr in WIDE_CASES:
@@ -364,7 +323,6 @@ def test_wide_memory_boundaries():
           f"(error {tot['err']} + legal {tot['ok']})")
     return tot
 
-
 def test_frame_boundaries():
 
     tot = {"ok": 0, "err": 0}
@@ -377,12 +335,7 @@ def test_frame_boundaries():
           f"(error {tot['err']} + legal {tot['ok']})")
     return tot
 
-
 def test_sp_boundaries():
-
-
-
-
 
     tot = {"ok": 0, "err": 0}
     for sp, imm, expect_err in ADD_SP_CASES:
@@ -401,7 +354,6 @@ def test_sp_boundaries():
     print(f"  stack-pointer writes: {sum(tot.values())} cases "
           f"(error {tot['err']} + legal {tot['ok']})")
     return tot
-
 
 if __name__ == "__main__":
     print("error-tick atomicity (reference + both circuits):")

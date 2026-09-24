@@ -13,17 +13,19 @@ import random
 from golden_sim import NCP8, MachineError
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
+from test_state_contract import assert_widths
 
+PC_SITES = (0, 256)
 
 def golden_view(g):
     return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
                 ipos=g.ipos, oplen=len(g.out), tick=g.tick,
                 status={"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}[g.status])
 
+def one_step_agreement(Machine, op, seed, pc=0):
 
-def one_step_agreement(Machine, op, seed):
     rng = random.Random(seed)
-    code = bytes([op, rng.randrange(256), rng.randrange(256)])
+    code = bytes(pc) + bytes([op, rng.randrange(256), rng.randrange(256)])
     data_g = bytearray(rng.randrange(256) for _ in range(4096))
     inputs = bytes(rng.randrange(256) for _ in range(3))
     R = [rng.randrange(256) for _ in range(4)]
@@ -31,27 +33,25 @@ def one_step_agreement(Machine, op, seed):
     DE = rng.choice([rng.randrange(4096), rng.randrange(4096, 4400)])
     SP = rng.choice([0, 1, 2, 3, rng.randrange(16, 4093), 4095, 4096])
     C0, Z0 = rng.randrange(2), rng.randrange(2)
+    tick0 = rng.randrange(100)
 
     g = NCP8(code, data=data_g, inputs=inputs)
-    g.r = list(R); g.HL = HL; g.DE = DE; g.SP = SP; g.C = C0; g.Z = Z0
-    g.tick = rng.randrange(100)
+    g.load_state(R, HL, DE, SP, C0, Z0, tick0, PC=pc)
     c = Machine(code, data=data_g, inputs=inputs)
-    c.load_state(R, HL, DE, SP, C0, Z0, g.tick)
+    c.load_state(R, HL, DE, SP, C0, Z0, tick0, PC=pc)
 
     pre_g = golden_view(g); pre_data = list(g.data)
     pre_code, pre_out = bytes(g.code), bytes(g.out)
+    assert_widths(pre_g, (Machine.__name__, "pre-tick"))
     g_err = False
     try:
         g.step()
     except MachineError:
         g_err = True
     c.step()
+    assert_widths(c.snapshot(), (Machine.__name__, "post-tick", op, seed, pc))
 
     if g_err:
-
-
-
-
 
         assert golden_view(g) == pre_g, (op, seed, "reference error tick was not atomic",
                                          pre_g, golden_view(g))
@@ -70,30 +70,44 @@ def one_step_agreement(Machine, op, seed):
         return "err"
     else:
         cv = c.snapshot()
-        assert golden_view(g) == cv, (op, seed, golden_view(g), cv)
+        assert_widths(golden_view(g), (Machine.__name__, "reference post-tick", op, seed, pc))
+        assert golden_view(g) == cv, (op, seed, pc, golden_view(g), cv)
         assert list(g.data) == list(c.DATA.cpu().tolist()), (op, seed, "DATA")
         assert c.out() == bytes(g.out), (op, seed, "out")
         return "ok"
 
-
 def test_all_opcodes(Machine, name):
-
-
-
-
-
-
 
     import torch
     total = {"ok": 0, "err": 0}
     ops = list(range(256))
     for op in ops:
         for seed in range(6):
-            total[one_step_agreement(Machine, op, seed)] += 1
+            for site in PC_SITES:
+                pc = site + op if site else 0
+                total[one_step_agreement(Machine, op, seed, pc)] += 1
     torch.cuda.synchronize()
-    assert len(ops) * 6 == 1536, len(ops)
-    print(f"[{name}] all-opcode single step: {len(ops)*6} cases match (ok {total['ok']} + error {total['err']})  ")
+    n = len(ops) * 6 * len(PC_SITES)
+    assert n == 3072, n
+    assert min(PC_SITES) == 0 and max(PC_SITES) >= 256, PC_SITES
+    print(f"[{name}] all-opcode single step: {n} cases match (ok {total['ok']} + error {total['err']})  ")
+    print(f"        single step executed at PC in {PC_SITES} (wider than 8-bit sources"
+          f" are only visible away from address 0): {n // len(PC_SITES)} cases per site")
 
+def lockstep(g, c):
+    n = 0
+    while g.status == "RUNNING" and g.tick < g.tb and int(c.status.item()) == 0:
+        g.step(); c.step(); n += 1
+        gv = golden_view(g)
+        assert_widths(gv, ("reference lockstep tick", n))
+        assert_widths(c.snapshot(), (type(c).__name__, "lockstep tick", n))
+        assert gv == c.snapshot(), n
+        assert list(g.data) == list(c.DATA.cpu().tolist()), n
+        assert c.out() == bytes(g.out), n
+    assert g.status == "HALT", g.status
+    assert int(c.status.item()) == 1
+    assert c.out() == bytes(g.out)
+    return n
 
 def lockstep(g, c):
     n = 0
@@ -106,7 +120,6 @@ def lockstep(g, c):
     assert int(c.status.item()) == 1
     assert c.out() == bytes(g.out)
     return n
-
 
 def test_programs(Machine, name):
     import programs
@@ -132,7 +145,6 @@ def test_programs(Machine, name):
         data = bytearray(n + 16); data[0] = n
         t += lockstep(NCP8(programs.SUMREC, data=data), Machine(programs.SUMREC, data=data))
     print(f"[{name}] sumrec lockstep: 5 cases {t} tick ")
-
 
 if __name__ == "__main__":
     test_all_opcodes(TorchCircuit, "torch")

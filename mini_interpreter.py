@@ -11,6 +11,7 @@ from golden_sim import NCP8, asm
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
 from test_circuit_equivalence import golden_view
+from test_state_contract import assert_widths
 
 S_MPC, S_A, S_F, S_C = 0, 1, 2, 3
 PROG_BASE = 8
@@ -238,8 +239,6 @@ h_swap:
   JMP fetch
 """)
 
-
-
 def mini_sim(prog, mem_init, max_steps=20000):
     A = C = 0
     Fz = Fc = 0
@@ -276,7 +275,6 @@ def mini_sim(prog, mem_init, max_steps=20000):
         MPC = nxt
     raise ValueError("mini step limit exceeded")
 
-
 def build_state(prog, mem_init):
     data = bytearray(4096)
     for i, b in enumerate(prog):
@@ -284,9 +282,6 @@ def build_state(prog, mem_init):
     for m, v in mem_init.items():
         data[MEM_BASE + m] = v
     return data
-
-
-
 
 def mini_asm(lines):
 
@@ -307,7 +302,6 @@ def mini_asm(lines):
             out.append(labels[arg] if isinstance(arg, str) else arg)
     return bytes(out)
 
-
 def prog_sum(vals):
     n = len(vals)
     """total = sum(values); 8-bit version wraps on overflow, matching the reference model"""
@@ -317,7 +311,6 @@ def prog_sum(vals):
     ]
     mem = {102: n}
     return list(lines), mem
-
 
 def run_test():
 
@@ -333,9 +326,9 @@ def run_test():
         want = mini_sim(prog, mem)
         g = NCP8(INTERP, data=build_state(prog, mem))
         got = g.run()
+        assert_widths(g.snapshot(), "mini interpreter sum")
         assert bytes(got) == want, (trial, vals, bytes(got), want)
     print("interpreter sum: 5 random arrays, interpreter output == Python mini reference byte-exact")
-
 
     carry_prog = mini_asm([
         (1, 200), (2, 100), (7,), (13,), (12, "E"), (1, 99), (13,), "E:", (0,)])
@@ -343,13 +336,14 @@ def run_test():
     assert want == bytes([44]), want
     g = NCP8(INTERP, data=build_state(carry_prog, {}))
     got = bytes(g.run())
+    assert_widths(g.snapshot(), "mini interpreter carry")
     assert got == want, (got, want)
     nocarry = mini_asm([(1, 10), (2, 20), (7,), (13,), (12, "E"), (1, 99), (13,), "E:", (0,)])
     want2 = mini_sim(nocarry, {})
     g = NCP8(INTERP, data=build_state(nocarry, {}))
     assert bytes(g.run()) == want2, (want2,)
+    assert_widths(g.snapshot(), "mini interpreter no-carry")
     print("interpreter carry branch: JC depends on mini flags, both paths match the reference")
-
 
     from test_circuit_equivalence import lockstep
     vals = [10, 20, 7, 33, 12]
@@ -365,7 +359,6 @@ def run_test():
         ticks = lockstep(g, c)
         print(f"L3 meta-circular-{nm} lockstep: {ticks} tick bit-exact ")
     print("\nmini interpreter: all passed")
-
 
 if __name__ == "__main__":
     run_test()

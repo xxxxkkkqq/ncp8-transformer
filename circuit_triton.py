@@ -7,15 +7,19 @@ tensor implementation so that both can be driven by the same equivalence tests.
 Two execution paths share the same per-tick body:
   * TritonCircuit.step(): one launch per tick, driven by the host;
   * TritonBatch: a resident batched executor that keeps B machines in device
-    buffers (CODE [B,4096], DATA [B,4096], INPUTS [B,max_in], OUTBUF [B,out_cap],
+    buffers (CODE [B,4096], DATA [B,4096], INPUTS [B,max_in], OUTBUF [B,OUT_CAP],
     state [B,14]) and runs the tick loop inside the kernel, so a whole program run
     costs one launch for the whole batch. The per-machine status drives the loop:
-    a machine that has halted or errored stops advancing while the rest of the
-    batch keeps running. run_batch() is the one-shot form and
+    a machine that has halted, errored or used up its tick budget stops advancing
+    while the rest of the batch keeps running. run_batch() is the one-shot form and
     TritonCircuit.run_resident() is the B = 1 form.
 
 Error contract: a violating tick writes status = 3 only; all other state and the
-tick counter stay unchanged.
+tick counter stay unchanged. The same body also latches OVERRUN (status = 2) when
+the machine's tick reaches its budget and refuses the output byte past OUT_CAP,
+both as atomic ticks that commit nothing else. Every store address is masked into
+its own machine's buffer, so a write cannot leave the row it was given, and
+check_state()/set_state()/load_state() refuse a state outside the declared widths.
 
 The escape-prefix dispatch chain assigns the carry explicitly in the operations
 that leave it alone, written as C & 1 rather than a plain copy. With this many
@@ -36,9 +40,6 @@ from typing import NamedTuple
 DATA_SIZE = 4096
 CODE_SIZE = 4096
 OUT_CAP = 8192
-
-
-
 
 ESC_DIV = tl.constexpr(0x100)
 ESC_MOD = tl.constexpr(0x101)
@@ -74,33 +75,54 @@ ESC_STX = tl.constexpr(0x11D)
 ESC_ADD_SP = tl.constexpr(0x11E)
 ESC_MULH = tl.constexpr(0x11F)
 
+def _power_of_two_or_die(name, size):
+
+    if size <= 0 or size & (size - 1):
+        raise ValueError(f"{name}={size} is not a positive power of two; the store "
+                         f"masks would let a write leave its machine's own buffer")
+
+for _name, _size in (("CODE_SIZE", CODE_SIZE), ("DATA_SIZE", DATA_SIZE),
+                     ("OUT_CAP", OUT_CAP)):
+    _power_of_two_or_die(_name, _size)
+CODE_MASK = tl.constexpr(CODE_SIZE - 1)
+
+def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, where=""):
+
+    def outside(field, value, lo, hi):
+        raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
+
+    for i, v in enumerate(list(R)):
+        if not 0 <= v < 256:
+            outside(f"r[{i}]", v, 0, 255)
+    for field, v in (("HL", HL), ("DE", DE), ("PC", PC)):
+        if not 0 <= v < 65536:
+            outside(field, v, 0, 65535)
+    if not 0 <= SP <= DATA_SIZE:
+        outside("SP", SP, 0, DATA_SIZE)
+    for field, v in (("C", C), ("Z", Z)):
+        if v not in (0, 1):
+            outside(field, v, 0, 1)
+    if not 0 <= oplen <= OUT_CAP:
+        outside("oplen", oplen, 0, OUT_CAP)
+    for field, v in (("ipos", ipos), ("tick", tick)):
+        if v < 0:
+            outside(field, v, 0, "unbounded")
+    if status not in (0, 1, 2, 3):
+        outside("status", status, 0, 3)
 
 @triton.jit
 def _get4(v0, v1, v2, v3, idx):
     return tl.where(idx == 0, v0, tl.where(idx == 1, v1, tl.where(idx == 2, v2, v3)))
 
-
 @triton.jit
 def _wr(r0, r1, r2, r3, d, v):
 
-    return (tl.where(d == 0, v, r0), tl.where(d == 1, v, r1),
-            tl.where(d == 2, v, r2), tl.where(d == 3, v, r3))
-
+    w = v & 255
+    return (tl.where(d == 0, w, r0), tl.where(d == 1, w, r1),
+            tl.where(d == 2, w, r2), tl.where(d == 3, w, r3))
 
 @triton.jit
 def _dec_esc(sub):
-
-
-
-
-
-
-
-
-
-
-
-
 
     if sub <= 0x2F:
         eop = ESC_DIV + (sub >> 4); d = (sub >> 2) & 3; s = sub & 3; lx = 0
@@ -128,19 +150,8 @@ def _dec_esc(sub):
         eop = ESC_BAD; d = 0; s = 0; lx = 0
     return eop, d, s, lx
 
-
 @triton.jit
-def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
-
-
-
-
-
-
-
-
-
-
+def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
 
     r0 = tl.load(S + 0); r1 = tl.load(S + 1); r2 = tl.load(S + 2); r3 = tl.load(S + 3)
     HL = tl.load(S + 4); DE = tl.load(S + 5); PC = tl.load(S + 6); SP = tl.load(S + 7)
@@ -158,8 +169,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
     A3 = 0; V3 = 0; E3 = 0
     err = 0
 
-
-
     eop = 0xFFFF
     ed = 0; es = 0; elen = 1
 
@@ -170,7 +179,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
         es = op & 3
         if op == 0x70:
 
-
             if PC + 2 > CODELEN:
                 err = 1
             else:
@@ -179,7 +187,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                 elen = 2 + elx
                 nPC = PC + elen
                 if PC + elen > CODELEN:
-
 
                     eop = 0xFFFF
                     err = 1
@@ -391,13 +398,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
             nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
         elif eop >= 0x100:
 
-
-
-
-
-
-
-
             if eop == ESC_DIV or eop == ESC_MOD:
                 a = _get4(r0, r1, r2, r3, ed)
                 b = _get4(r0, r1, r2, r3, es)
@@ -454,8 +454,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                 nDE = HL
             elif eop == ESC_EXT:
 
-
-
                 if PC + 3 > CODELEN:
                     err = 1
                 else:
@@ -473,8 +471,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                             A2 = SP - 2; V2 = (ret >> 8) & 0xFF; E2 = 1
                             nSP = SP - 2; nPC = tgt
             elif eop == ESC_STC:
-
-
 
                 if HL >= CODELEN:
                     err = 1
@@ -502,7 +498,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                 nDE = SP
             elif eop == ESC_MOVW_SP_HL:
 
-
                 if HL > DS:
                     err = 1
                 else:
@@ -513,7 +508,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                 else:
                     nSP = DE
             elif eop == ESC_PUSHW_HL or eop == ESC_PUSHW_DE:
-
 
                 if SP < 2:
                     err = 1
@@ -564,7 +558,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                         nHL = v
             elif eop == ESC_LDX or eop == ESC_STX:
 
-
                 sx = tl.load(CODE + PC + 2)
                 sx = sx - 256 * (sx >> 7)
                 adr = (HL + sx) & 0xFFFF
@@ -586,9 +579,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
                     nSP = v
             elif eop == ESC_MULH:
 
-
-
-
                 v = ((_get4(r0, r1, r2, r3, ed) * _get4(r0, r1, r2, r3, es)) >> 8) & 255
                 nZ = (v == 0).to(tl.int32)
                 nC = C & 1
@@ -601,8 +591,21 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
         err = 1
 
     OT = tl.load(S + 12)
+    ST = tl.load(S + 13)
     NT = OT + 1
-    if err == 1:
+    if OEN == 1 and OL >= OC:
+
+        err = 1
+    if ST != 0:
+
+        RST = ST
+        RTK = OT
+    elif OT >= BD:
+
+        tl.store(S + 13, 2)
+        RST = 2
+        RTK = OT
+    elif err == 1:
 
         tl.store(S + 13, 3)
         RST = 3
@@ -614,44 +617,30 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
         tl.store(S + 8, nC); tl.store(S + 9, nZ); tl.store(S + 10, nIPO); tl.store(S + 11, nOL)
         tl.store(S + 12, NT)
         tl.store(S + 13, NST)
+
         if OEN == 1:
-            tl.store(OUTBUF + OL, OVAL)
+            tl.store(OUTBUF + (OL & (OC - 1)), OVAL)
         if E1 == 1:
-            tl.store(DATA + A1, V1)
+            tl.store(DATA + (A1 & (DS - 1)), V1)
         if E2 == 1:
-            tl.store(DATA + A2, V2)
+            tl.store(DATA + (A2 & (DS - 1)), V2)
         if E3 == 1:
-            tl.store(CODE + A3, V3)
+            tl.store(CODE + (A3 & CODE_MASK), V3)
         RST = NST
         RTK = NT
     return RST, RTK
 
-
 @triton.jit
-def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS):
+def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, BUDGET, CODELEN, INLEN, DS, OC):
 
-    _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, DS)
-
+    BD = tl.load(BUDGET + 0)
+    _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC)
 
 @triton.jit
 def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BUDGETS,
-                        STEP_LIMIT, APPLY_OVERRUN,
+                        STEP_LIMIT,
                         CS: tl.constexpr, DS: tl.constexpr, INS: tl.constexpr,
                         OCS: tl.constexpr):
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     pid = tl.program_id(0)
     CP = CODE + pid * CS
@@ -665,51 +654,25 @@ def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BU
     st = tl.load(ST + 13)
     tk = tl.load(ST + 12)
     n = 0
-    while (st == 0) & (tk < BD) & ((STEP_LIMIT <= 0) | (n < STEP_LIMIT)):
-        st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, DS)
+    while (st == 0) & ((STEP_LIMIT <= 0) | (n < STEP_LIMIT)):
+        st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, BD, DS, OCS)
         n += 1
-    if (APPLY_OVERRUN == 1) & (st == 0):
-        tl.store(ST + 13, 2)
-
 
 class BatchResult(NamedTuple):
-
-
-
-
-
-
 
     outs: list
     status: list
     ticks: list
     oplens: list
 
-
 class TritonBatch:
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    def __init__(self, n, device="cuda", out_cap=OUT_CAP, max_in=1, tick_budget=200_000,
-                 num_warps=1):
+    def __init__(self, n, device="cuda", max_in=1, tick_budget=200_000, num_warps=1):
         if n < 1:
             raise ValueError("batch size must be >= 1")
         self.dev = torch.device(device)
         self.n = n
-        self.out_cap = int(out_cap)
+        self.out_cap = OUT_CAP
         self.max_in = max(1, int(max_in))
         self.num_warps = num_warps
         i32 = torch.int32
@@ -723,28 +686,32 @@ class TritonBatch:
         self.INLENS = torch.zeros(n, dtype=i32, device=self.dev)
         self.BUDGETS = torch.full((n,), int(tick_budget), dtype=i32, device=self.dev)
 
+    def _row(self, i):
+
+        if not isinstance(i, int) or not 0 <= i < self.n:
+            raise ValueError(f"machine index {i} is outside a batch of {self.n} machines")
+
     def set_program(self, i, code, data=None, inputs=None):
 
-
-
-
-
+        self._row(i)
         cb = bytes(code)
         if len(cb) > CODE_SIZE:
-            raise ValueError("code exceeds CODE_SIZE")
+            raise ValueError(f"machine {i}: code is {len(cb)} bytes, above CODE_SIZE {CODE_SIZE}")
         self.CODE[i] = 0
         if cb:
             self.CODE[i, :len(cb)] = torch.tensor(list(cb), dtype=torch.int32, device=self.dev)
         self.CODELENS[i] = len(cb)
         db = bytes(data) if data else b""
         if len(db) > DATA_SIZE:
-            raise ValueError("data image exceeds DATA_SIZE")
+            raise ValueError(f"machine {i}: data image is {len(db)} bytes, "
+                             f"above DATA_SIZE {DATA_SIZE}")
         self.DATA[i] = 0
         if db:
             self.DATA[i, :len(db)] = torch.tensor(list(db), dtype=torch.int32, device=self.dev)
         ib = bytes(inputs) if inputs else b""
         if len(ib) > self.max_in:
-            raise ValueError("input stream exceeds the batch input capacity")
+            raise ValueError(f"machine {i}: input stream of {len(ib)} bytes exceeds the "
+                             f"batch input capacity {self.max_in}")
         self.INPUTS[i] = 0
         if ib:
             self.INPUTS[i, :len(ib)] = torch.tensor(list(ib), dtype=torch.int32, device=self.dev)
@@ -755,6 +722,9 @@ class TritonBatch:
     def set_state(self, i, r=(0, 0, 0, 0), HL=0, DE=0, PC=0, SP=DATA_SIZE,
                   C=0, Z=0, ipos=0, oplen=0, tick=0, status=0):
 
+        self._row(i)
+        check_state(r, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=ipos, oplen=oplen,
+                    status=status, where=f"machine {i}: ")
         self.STATE[i, 0:4] = torch.tensor(list(r), dtype=torch.int32, device=self.dev)
         self.STATE[i, 4] = HL
         self.STATE[i, 5] = DE
@@ -769,31 +739,23 @@ class TritonBatch:
 
     def set_budget(self, i, budget):
 
+        self._row(i)
         self.BUDGETS[i] = int(budget)
 
     def run(self):
 
-
-
-
-
-
-        self._launch(0, 1)
+        self._launch(0)
         return self.results()
 
     def step(self, steps=1):
 
-
-
-
-
-        self._launch(int(steps), 0)
+        self._launch(int(steps))
         return self.results()
 
-    def _launch(self, step_limit, apply_overrun):
+    def _launch(self, step_limit):
         ncp_resident_kernel[(self.n,)](
             self.CODE, self.DATA, self.INPUTS, self.OUTBUF, self.STATE,
-            self.CODELENS, self.INLENS, self.BUDGETS, step_limit, apply_overrun,
+            self.CODELENS, self.INLENS, self.BUDGETS, step_limit,
             CS=CODE_SIZE, DS=DATA_SIZE, INS=self.max_in, OCS=self.out_cap,
             num_warps=self.num_warps)
 
@@ -819,42 +781,35 @@ class TritonBatch:
 
     def out(self, i):
 
-        n = int(self.STATE[i, 11].item())
-        if n > self.out_cap:
-            raise RuntimeError(f"machine {i} emitted {n} bytes, above the output capacity")
+        self._row(i)
+        n = min(int(self.STATE[i, 11].item()), self.out_cap)
         return bytes(self.OUTBUF[i, :n].cpu().tolist())
 
     def snapshot(self, i):
 
+        self._row(i)
         s = self.STATE[i].cpu().tolist()
         return dict(r=s[0:4], HL=s[4], DE=s[5], SP=s[7], PC=s[6], C=s[8], Z=s[9],
                     ipos=s[10], oplen=s[11], tick=s[12], status=s[13])
 
     def data(self, i):
 
+        self._row(i)
         return self.DATA[i].cpu().tolist()
 
     def code(self, i):
 
+        self._row(i)
         return self.CODE[i].cpu().tolist()
 
-
 def run_batch(codes, datas=None, inputs=None, budgets=None, states=None,
-              tick_budget=200_000, device="cuda", out_cap=OUT_CAP, num_warps=1):
-
-
-
-
-
-
-
-
+              tick_budget=200_000, device="cuda", num_warps=1):
 
     n = len(codes)
     max_in = 1
     if inputs:
         max_in = max(1, max((len(v) for v in inputs), default=1))
-    b = TritonBatch(n, device=device, out_cap=out_cap, max_in=max_in,
+    b = TritonBatch(n, device=device, max_in=max_in,
                     tick_budget=tick_budget, num_warps=num_warps)
     for i in range(n):
         b.set_program(i, codes[i],
@@ -863,17 +818,24 @@ def run_batch(codes, datas=None, inputs=None, budgets=None, states=None,
         if budgets is not None:
             b.set_budget(i, budgets[i])
     if states is not None:
-        rows = torch.tensor([list(s) for s in states], dtype=torch.int32, device=b.dev)
-        if rows.shape != (n, 14):
-            raise ValueError("states must be n rows of 14 values")
-        b.STATE.copy_(rows)
+        if len(states) != n:
+            raise ValueError(f"states must be {n} rows, got {len(states)}")
+        for i, s in enumerate(states):
+            row = list(s)
+            if len(row) != 14:
+                raise ValueError(f"machine {i}: state row has {len(row)} values, need 14")
+            b.set_state(i, r=row[0:4], HL=row[4], DE=row[5], PC=row[6], SP=row[7],
+                        C=row[8], Z=row[9], ipos=row[10], oplen=row[11], tick=row[12],
+                        status=row[13])
     return b.run()
-
 
 class TritonCircuit:
 
-
     def __init__(self, code, data=None, inputs=b"", tick_budget=200_000, device="cuda"):
+        if len(code) > CODE_SIZE:
+            raise ValueError(f"code image is {len(code)} bytes, above CODE_SIZE {CODE_SIZE}")
+        if data and len(data) > DATA_SIZE:
+            raise ValueError(f"data image is {len(data)} bytes, above DATA_SIZE {DATA_SIZE}")
         dev = torch.device(device)
         self.dev = dev
         i32 = torch.int32
@@ -888,17 +850,20 @@ class TritonCircuit:
         self.OUTBUF = torch.zeros(OUT_CAP, dtype=i32, device=dev)
         self.S = torch.zeros(14, dtype=i32, device=dev)
         self.S[7] = DATA_SIZE
-        self.tb = tick_budget
+        self.BUDGET = torch.tensor([int(tick_budget)], dtype=i32, device=dev)
+        self.tb = int(tick_budget)
 
-    def load_state(self, R, HL, DE, SP, C, Z, tick):
-        self.S[0:4] = torch.tensor(R, dtype=torch.int32, device=self.dev)
-        self.S[4] = HL; self.S[5] = DE; self.S[6] = 0
+    def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0):
+
+        check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC)
+        self.S[0:4] = torch.tensor(list(R), dtype=torch.int32, device=self.dev)
+        self.S[4] = HL; self.S[5] = DE; self.S[6] = PC
         self.S[7] = SP; self.S[8] = C; self.S[9] = Z
         self.S[12] = tick
 
     def step(self):
         ncp_step_kernel[(1,)](self.CODE, self.DATA, self.INP, self.OUTBUF, self.S,
-                              self.codelen, self.inlen, DATA_SIZE)
+                              self.BUDGET, self.codelen, self.inlen, DATA_SIZE, OUT_CAP)
 
     @property
     def status(self):
@@ -918,27 +883,19 @@ class TritonCircuit:
                     ipos=s[10], oplen=s[11], tick=s[12], status=s[13])
 
     def out(self):
-        n = int(self.S[11].item())
+
+        n = min(int(self.S[11].item()), OUT_CAP)
         return bytes(self.OUTBUF[:n].cpu().tolist())
 
     def run(self):
 
-        while int(self.status.item()) == 0 and int(self.tick.item()) < self.tb:
+        while int(self.status.item()) == 0:
             self.step()
-        if int(self.status.item()) == 0:
-            self.S[13] = 2
         return self.out()
 
     def run_resident(self):
 
-
-
-
-
-
-
-        b = TritonBatch(1, device=self.dev, out_cap=self.OUTBUF.numel(),
-                        max_in=max(1, int(self.INP.numel())))
+        b = TritonBatch(1, device=self.dev, max_in=max(1, int(self.INP.numel())))
         b.CODE[0].copy_(self.CODE)
         b.CODELENS[0] = self.codelen
         b.DATA[0].copy_(self.DATA)
