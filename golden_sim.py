@@ -36,15 +36,13 @@ DATA_SIZE = 4096
 CODE_SIZE = 4096
 OUT_CAP = 8192
 
-R_BITS = 8
-PTR_BITS = 16
-FAULT_BITS = ISA.FAULT_BITS
-
 STATUS_RUNNING = "RUNNING"
 STATUS_HALT = "HALT"
 STATUS_OVERRUN = "OVERRUN"
 STATUS_ERROR = "ERROR"
 STATUS_CODE = {STATUS_RUNNING: 0, STATUS_HALT: 1, STATUS_OVERRUN: 2, STATUS_ERROR: 3}
+
+STATUS_NAME = {c: n for n, c in STATUS_CODE.items()}
 
 CAUSE = ISA.CAUSE
 
@@ -61,28 +59,12 @@ class FaultCauseMissing(MachineError):
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
                 fault_reason=0, fault_addr=0, where=""):
 
-    def outside(field, value, lo, hi):
-        raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
-
-    for i, v in enumerate(list(R)):
-        if not 0 <= v < (1 << R_BITS):
-            outside(f"r[{i}]", v, 0, (1 << R_BITS) - 1)
-    for field, v in (("HL", HL), ("DE", DE), ("PC", PC)):
-        if not 0 <= v < (1 << PTR_BITS):
-            outside(field, v, 0, (1 << PTR_BITS) - 1)
-    if not 0 <= SP <= DATA_SIZE:
-        outside("SP", SP, 0, DATA_SIZE)
-    for field, v in (("C", C), ("Z", Z)):
-        if v not in (0, 1):
-            outside(field, v, 0, 1)
     if not 0 <= oplen <= OUT_CAP:
-        outside("oplen", oplen, 0, OUT_CAP)
-    for field, v in (("ipos", ipos), ("tick", tick)):
-        if v < 0:
-            outside(field, v, 0, "unbounded")
-    if status not in (0, 1, 2, 3):
-        outside("status", status, 0, 3)
-    bad = ISA.fault_state_error(status, fault_reason, fault_addr, where)
+        raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
+    bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "PC": PC, "SP": SP,
+                           "C": C, "Z": Z, "ipos": ipos, "tick": tick, "status": status,
+                           "fault_reason": fault_reason, "fault_addr": fault_addr},
+                          where)
     if bad is not None:
         raise ValueError(bad)
 
@@ -149,6 +131,71 @@ class NCP8:
         self.HL, self.DE, self.SP, self.C, self.Z = HL, DE, SP, C, Z
         self.tick, self.PC = tick, PC
         self.fault_reason, self.fault_addr = fr, fa
+
+    def _record_inputs(self):
+
+        return self.inputs
+
+    def _record_code(self):
+
+        return bytes(self.code).ljust(CODE_SIZE, b"\x00")[:CODE_SIZE]
+
+    def _record_block(self):
+
+        lo, hi = self.config.window()
+        return ISA.MachineConfig(codelen=self.codelen, winlo=lo, winhi=hi,
+                                 vec=self.config.vectors(), nbanks=self.nbanks,
+                                 tdlim=self.tdlim, tickbudget=self.tb,
+                                 outcap=self.out_cap)
+
+    _RECORD_READERS = {
+        "r": lambda m: list(m.r),
+        "HL": lambda m: m.HL,
+        "DE": lambda m: m.DE,
+        "PC": lambda m: m.PC,
+        "SP": lambda m: m.SP,
+        "C": lambda m: m.C,
+        "Z": lambda m: m.Z,
+        "ipos": lambda m: m.ipos,
+        "tick": lambda m: m.tick,
+        "status": lambda m: m.status_code(),
+        "fault_reason": lambda m: m.fault_reason,
+        "fault_addr": lambda m: m.fault_addr,
+        "CODE": lambda m: m._record_code(),
+        "DATA": lambda m: bytes(m.data),
+        "out": lambda m: bytes(m.out),
+        "inputs": lambda m: m._record_inputs(),
+        "block": lambda m: m._record_block().as_dict(),
+    }
+
+    def _record_bounds(self):
+
+        return ISA.RecordBounds(where="NCP8: ", out_cap=self.out_cap,
+                                code_size=CODE_SIZE, data_size=DATA_SIZE,
+                                inputs=self._record_inputs(),
+                                block=self._record_block())
+
+    def record_state(self):
+
+        return ISA.publish_record(self, self._RECORD_READERS, self._record_bounds())
+
+    def install_state(self, snap):
+
+        got = ISA.check_record(snap, self._record_bounds())
+        st = got.state
+        check_state(st["r"], st["HL"], st["DE"], st["SP"], st["C"], st["Z"],
+                    tick=st["tick"], PC=st["PC"], ipos=st["ipos"],
+                    status=st["status"], fault_reason=st["fault_reason"],
+                    fault_addr=st["fault_addr"], where="NCP8: ")
+        self.r = list(st["r"])
+        self.HL, self.DE, self.PC, self.SP = st["HL"], st["DE"], st["PC"], st["SP"]
+        self.C, self.Z = st["C"], st["Z"]
+        self.ipos, self.tick = st["ipos"], st["tick"]
+        self.status = STATUS_NAME[st["status"]]
+        self.fault_reason, self.fault_addr = st["fault_reason"], st["fault_addr"]
+        self.code = got.code
+        self.data = bytearray(got.data)
+        self.out = bytearray(got.out)
 
     def _fault(self, cause, msg):
 

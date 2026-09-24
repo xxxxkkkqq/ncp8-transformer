@@ -166,7 +166,8 @@ def _row(machine, is_batch, row):
             out[field] = _scalar(snap[field])
     return out
 
-def agreement(code, data=None, inputs=b"", budget=64, config=None):
+def agreement(code, data=None, inputs=b"", budget=64, config=None,
+              tensor_device="cpu"):
 
     batch = None
     kwargs = {}
@@ -181,8 +182,8 @@ def agreement(code, data=None, inputs=b"", budget=64, config=None):
     except Exception as exc:
         return None, [f"the circuit paths could not be imported, so four-way agreement "
                       f"did not run: {exc}"]
-    paths.append(("torch", TorchCircuit(code, data=data, inputs=inputs, tick_budget=budget),
-                  None))
+    paths.append(("torch", TorchCircuit(code, data=data, inputs=inputs, tick_budget=budget,
+                                         device=tensor_device), None))
     paths.append(("triton", TritonCircuit(code, data=data, inputs=inputs,
                                           tick_budget=budget), None))
 
@@ -225,7 +226,8 @@ def agreement(code, data=None, inputs=b"", budget=64, config=None):
                      f"RUNNING, so the run never produced a label")
     final = _row(ref, False, None)
     return {"ticks_compared": ticks, "final": final, "out": out_ref.hex(),
-            "final_tick": final["tick"], "fields": list(COMPARED_FIELDS)}, fails
+            "final_tick": final["tick"], "fields": list(COMPARED_FIELDS),
+            "tensor_device": tensor_device}, fails
 
 def _status(machine, row):
     snap = machine.snapshot(row) if row is not None else machine.snapshot()
@@ -320,7 +322,8 @@ def label(spec, compile_text=None):
                 "flavor": "reference", "code": code.hex(), "execution": execution})
     rec["agreement"] = {"ticks_compared": meta["ticks_compared"],
                         "compared_fields": meta["fields"],
-                        "final_tick": meta["final"]["tick"]}
+                        "final_tick": meta["final"]["tick"],
+                        "tensor_device": meta["tensor_device"]}
     emission = rec.setdefault("emission", {})
     for field, source in (("source_hash", spec["text"].encode("utf-8")),
                           ("bytes_hash", code)):

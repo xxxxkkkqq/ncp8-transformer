@@ -255,15 +255,13 @@ def s1_defaults():
           (b.out_cap, b.config.equivalent_to_default()) == (OUT_CAP, True),
           f"got {(b.out_cap, b.config)}")
 
-    for p in PATHS + [BATCH_PATH]:
+    for p in CAPACITY_PATHS:
         c = p.build(b"\x00\x00\x00\x00")
         s = c.snapshot(0) if p.name == "batch" else c.snapshot()
-        rec = getattr(c, "record_state", None)
-        recd = {}
-        if rec is not None:
-            r = rec(0) if p.name == "batch" else rec()
-            if isinstance(r, dict):
-                recd = r
+
+        recd = c.record_state(0) if p.name == "batch" else c.record_state()
+        check(f"S1 {p.name}.record_state publishes a dict", isinstance(recd, dict),
+              f"got a {type(recd).__name__}")
         leaked = sorted({str(k) for k in s if _is_config_name(k)} |
                         {str(k) for k in recd if _is_config_name(k)})
         check(f"S1 {p.name} snapshot exposes no configuration field", not leaked,

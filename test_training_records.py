@@ -44,6 +44,30 @@ def main():
           "fault_reason" in meta["fields"] and "fault_addr" in meta["fields"],
           str(meta["fields"]))
 
+    check("agreement states the tensor device it used",
+          meta.get("tensor_device") == "cpu", str(meta.get("tensor_device")))
+    prog = G.asm("  LDI r0, 250\nloop:\n  DJNZ r0, loop\n  OUT r0\n  HALT\n")
+    from circuit_torch import TorchCircuit
+    import torch
+    if torch.cuda.is_available():
+        other, name = TorchCircuit(prog, tick_budget=300, device="cuda"), \
+            "the tensor path answers the same on either device"
+    else:
+        other, name = G.NCP8(prog, tick_budget=300), \
+            "the tensor path on cpu answers as the reference does (no device present)"
+    ours = TorchCircuit(prog, tick_budget=300, device="cpu")
+    diverged, ticks = None, 0
+    for _ in range(250):
+        mine, theirs = ours.snapshot(), other.snapshot()
+        if mine != theirs:
+            diverged = (ticks, {k: (theirs[k], mine[k]) for k in mine if mine[k] != theirs[k]})
+            break
+        ours.step()
+        other.step()
+        ticks += 1
+    check(name, diverged is None and ticks >= 200,
+          f"diverged at tick {diverged}" if diverged else f"{ticks} ticks compared")
+
     real = G.NCP8.snapshot
     G.NCP8.snapshot = lambda self: {**real(self), "DE": real(self)["DE"] + 1}
     try:

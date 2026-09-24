@@ -4,7 +4,7 @@
 
 | field | size | notes |
 |---|---|---|
-| `r0`-`r3` | 8 bit each | general registers |
+| `r` (`r0`-`r3`) | 8 bit each | general registers, published as one four-element list |
 | `HL`, `DE` | 16 bit each | address pointers |
 | `SP` | 16 bit | stack pointer, starts at 4096 and grows down; legal values are `[0, 4096]` |
 | `PC` | 16 bit | program counter |
@@ -14,10 +14,11 @@
 | input | byte stream | `IN`, cursor `ipos` |
 | output | byte stream, capacity 8192 | `OUT`; see 2.3 |
 | `tick` | counter | bounded by a tick budget |
+| `status` | 2 bit | `0` running, `1` halted, `2` tick budget exhausted, `3` error; a terminal status is sticky (see 2.1) |
 | `fault_reason` | 8 bit | which rule the machine stopped on; `0` means no fault |
 | `fault_addr` | 16 bit | the address of the instruction that faulted |
 
-Status: `0` running, `1` halted, `2` tick budget exhausted, `3` error.
+The fields from `r` to `fault_addr` are what a machine publishes as its visible state, and they are the fields every cross-implementation comparison is made over.
 
 `CODE_SIZE = DATA_SIZE = 4096` and `OUT_CAP = 8192` are declared once and shared by all
 three implementations. All three sizes are required to be positive powers of two, and the
@@ -309,30 +310,51 @@ would have to be configuration, like the fields above, and is not yet.
 3. Out-of-range access raises; nothing wraps silently, and no write leaves the
    machine's own buffer.
 4. State is installed only through a validating constructor, and the validation
-   holds under `python -O` as well as normally (see 2.4). What that constructor
-   covers is the register file, the pointers, `SP`, the flags and `tick` - and
-   nothing else: see 6.1.
+   holds under `python -O` as well as normally (see 2.4). The complete state travels
+   through `record_state` / `install_state`, which carry every field of section 1 plus
+   both memory images, both byte streams and the configuration block: see 6.1.
 5. All three implementations agree tick by tick, on every field, from a common
    start: same program, same input, same initial state, and the state, memories
    and output stream are compared after each tick, on the error paths as well as
    the successful ones. Agreement under a *shared* start is what is claimed and
    what is tested.
 
-### 6.1 A run cannot be resumed mid-stream
+### 6.1 A run can be captured and put back at an instruction boundary
 
-`load_state` on all three implementations takes the registers, `HL`, `DE`, `PC`,
-`SP`, `C`, `Z` and `tick` - and nothing else. It accepts no output stream, no input
-cursor and no `status`, so a machine that has already emitted bytes, consumed input,
-halted or faulted cannot be restored through it: the entry point named "load state"
-carries a subset, and the rest silently returns to its initial value. This is a
-limitation of the interface rather than a numeric discrepancy - given a complete
-state the datapaths do agree, and the batched executor's `set_state` really does
-accept all eleven scalar fields - but the asymmetry between the two entry points is
-itself the reason the property cannot be stated as "a trace can be replayed".
+Every path publishes the pair `record_state()` / `install_state(record)`: the reference
+machine, the tensor circuit, the kernel circuit, and the resident batch - whose two entry
+points name a row and write that row only.
 
-Two things are true in its place. The suites compare implementations tick-by-tick from
-a shared start (invariant 5), and the debugger can re-run a recording from that
-recording's own beginning and demand an exact match on every frame, both memories and
-the output stream. Neither is resumption from an arbitrary point.
+A record is a dict with one entry per component, and the component list has one owner,
+`isa_table.RECORD_COMPONENTS`: every field of section 1's state table, the two memory
+images `CODE` and `DATA` each at their full width, the output stream `out`, the input
+stream `inputs` the machine consumed its `ipos` from, and the configuration block
+`block` the machine was loaded under. The output cursor is not a component: the stream
+is, and a record that carried a second copy of its length could have the two disagree. Nothing is left at a reset value behind the caller's back, so a machine that has
+emitted bytes, consumed input, rewritten `CODE` or stopped comes back as the same machine.
+
+`install_state` refuses, before writing anything, a record that:
+
+* is not that mapping of components, or is missing one, or carries one that is not a
+  component;
+* carries an image that is not this machine's `CODE_SIZE` / `DATA_SIZE` bytes;
+* carries an output stream longer than this machine's output capacity;
+* carries an input stream that is not the one this machine was given;
+* carries a configuration block that is not the one this machine runs under;
+* holds a field outside its declared width, or a `fault_reason` / `status` pairing the
+  state table does not allow (see 2.1).
+
+One tick is one whole instruction on every path, so every record is taken at an
+instruction boundary and none needs a marker saying so. A refusal writes nothing: a
+rejected record leaves the machine exactly as it was. A record
+taken on one path installs on every other path, and the capturing machine and the one that
+received the record then advance identically - which is measured at every tick a program
+survives, and across paths.
+
+What the pair does not do is carry a machine onto a *different* machine: the
+configuration, the input stream and the image widths are components of the record and are
+checked against the receiver, not applied to it. `load_state` stays the boot entry point
+for a fresh machine - it installs the eight values its signature names, and no `status`,
+stream or image - which is why `install_state` is the resumption path.
 
 
