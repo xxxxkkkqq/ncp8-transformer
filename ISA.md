@@ -262,10 +262,30 @@ these tables must pad the image to at least `0x0F22` bytes.
 3. Out-of-range access raises; nothing wraps silently, and no write leaves the
    machine's own buffer.
 4. State is installed only through a validating constructor, and the validation
-   holds under `python -O` as well as normally (see 2.4).
-5. A trace recorded from any implementation can be replayed to reproduce the state
-   of the reference simulator exactly. Of the properties on this list, this one is the
-   least tested: the suites compare implementations tick-by-tick from tick 0, and the
-   debugger replays a recording re-derived from the program image, but resuming a
-   machine from an arbitrary mid-run state and continuing is a separate claim, and it
-   is listed here because it is intended, not because a published test demonstrates it.
+   holds under `python -O` as well as normally (see 2.4). What that constructor
+   covers is the register file, the pointers, `SP`, the flags and `tick` - and
+   nothing else: see 6.1.
+5. All three implementations agree tick by tick, on every field, from a common
+   start: same program, same input, same initial state, and the state, memories
+   and output stream are compared after each tick, on the error paths as well as
+   the successful ones. Agreement under a *shared* start is what is claimed and
+   what is tested.
+
+### 6.1 A run cannot be resumed mid-stream
+
+`load_state` on all three implementations takes the registers, `HL`, `DE`, `PC`,
+`SP`, `C`, `Z` and `tick` - and nothing else. It accepts no output stream, no input
+cursor and no `status`, so a machine that has already emitted bytes, consumed input,
+halted or faulted cannot be restored through it: the entry point named "load state"
+carries a subset, and the rest silently returns to its initial value. This is a
+limitation of the interface rather than a numeric discrepancy - given a complete
+state the datapaths do agree, and the batched executor's `set_state` really does
+accept all eleven scalar fields - but the asymmetry between the two entry points is
+itself the reason the property cannot be stated as "a trace can be replayed".
+
+Two things are true in its place. The suites compare implementations tick-by-tick from
+a shared start (invariant 5), and the debugger can re-run a recording from that
+recording's own beginning and demand an exact match on every frame, both memories and
+the output stream. Neither is resumption from an arbitrary point.
+
+
