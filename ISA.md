@@ -6,7 +6,7 @@
 |---|---|---|
 | `r0`-`r3` | 8 bit each | general registers |
 | `HL`, `DE` | 16 bit each | address pointers |
-| `SP` | 16 bit | stack pointer, starts at 4096 and grows down |
+| `SP` | 16 bit | stack pointer, starts at 4096 and grows down; legal values are `[0, 4096]` |
 | `PC` | 16 bit | program counter |
 | `C`, `Z` | 1 bit each | carry and zero flags |
 | `CODE` | 4096 bytes | program memory, read-only to the machine |
@@ -21,8 +21,13 @@ Status: `0` running, `1` halted, `2` tick budget exhausted, `3` error.
 An error tick is atomic: it sets `status = 3` and changes nothing else. This
 covers undefined opcodes, reserved subcodes, instruction fetch past the end of
 `CODE`, data access outside `DATA`, stack underflow/overflow, division or modulo
-by zero, an unregistered trap vector, and a self-modification write outside the
-declared window. The tick counter advances only on a successful tick.
+by zero, an unregistered trap vector, a self-modification write outside the
+declared window, and a `SP` write that would leave `[0, 4096]`. The tick counter
+advances only on a successful tick.
+
+A 16-bit memory access checks both of its bytes before either one is read or
+written, so a violating tick cannot commit half a word. The same rule applies to
+`PUSHW`/`POPW`, which occupy two stack slots.
 
 ## 3. Registers and flags
 
@@ -64,8 +69,9 @@ Fields do not overlap. `f = (r << 2) | s` with `r`, `s` in 0-3.
 | 0x50+f | MUL r,s | `r = (r * s) & 0xFF`, `C = 1 if (r * s) > 255` | C,Z |
 
 `MUL` leaves the low byte in `r` and sets `C` to a single "the high byte is
-non-zero" bit; the high byte itself is not retained, so a widening product is
-built with the shift/rotate family and the `ADC` chain rather than from `C`.
+non-zero" bit; the high byte itself is not retained. `MULH` (escape subcode
+`0x90`+f) returns that high byte, so an 8x8 product is one `MUL` plus one `MULH`,
+and wider products are assembled with the `ADC` chain.
 
 ### 4.3 Single-register operations (0x60-0x6F)
 
@@ -116,16 +122,37 @@ instruction length is counted from the prefix byte.
 | 0x00+f | DIV r,s | `r = r / s` (integer); `s == 0` is an error | Z |
 | 0x10+f | MOD r,s | `r = r % s`; `s == 0` is an error | Z |
 | 0x20+f | CMP r,s | sets `Z = (r == s)`, `C = (r < s)`, writes no register | C,Z |
+| 0x30 / 0x31 | MOVW HL, DE / MOVW DE, HL | copy between the two 16-bit pointers | untouched |
+| 0x32 / 0x33 | MOVW HL, SP / MOVW DE, SP | copy `SP` into a pointer | untouched |
+| 0x34 / 0x35 | MOVW SP, HL / MOVW SP, DE | `SP =` pointer; an out-of-range pointer is an error | untouched |
+| 0x38 / 0x39 | PUSHW HL / PUSHW DE | `SP -= 2`, `DATA[SP] = low byte`, `DATA[SP+1] = high byte` | untouched |
+| 0x3A / 0x3B | POPW HL / POPW DE | read the pair at `SP` low-first, then `SP += 2` | untouched |
+| 0x3C / 0x3D | STW [HL], DE / STW [DE], HL | store 16 bits little-endian | untouched |
+| 0x3E / 0x3F | LDW DE, [HL] / LDW HL, [DE] | load 16 bits little-endian | untouched |
 | 0x40+r | NOT r | `r = ~r` | Z |
 | 0x44+r | NEG r | `r = (-r) & 0xFF` | C,Z |
 | 0x48+r | ROL r | rotate left through carry (9-bit rotation: C is the ninth bit) | C,Z |
 | 0x4C+r | ROR r | rotate right through carry | C,Z |
+| 0x50+r, i8 | LDX r, [HL+i8] | `r = DATA[(HL + i8) & 0xFFFF]`, `i8` sign-extended to 16 bits | untouched |
+| 0x54+r, i8 | STX [HL+i8], r | `DATA[(HL + i8) & 0xFFFF] = r`, `i8` sign-extended | untouched |
+| 0x58, i8 | ADD SP, i8 | `SP = (SP + i8) & 0xFFFF`, `i8` sign-extended; result must stay in `[0, 4096]` | untouched |
 | 0x60 | ADD HL, DE | 16-bit pointer addition | C |
 | 0x61 | SUB HL, DE | 16-bit pointer subtraction | C |
 | 0x62 | XCHG HL, DE | swap the pointer pair | untouched |
 | 0x70 k | EXT k | push return address, then jump to `vector[k]` | - |
 | 0x80+r | STC [HL], r | `CODE[HL] = r`, allowed only inside the declared window | - |
 | 0x84+r | LDC r, [HL] | `r = CODE[HL]` | untouched |
+| 0x90+f | MULH r, s | `r = (r * s) >> 8`, the high byte of the widening product | Z |
+
+Three subcode groups take a trailing immediate byte and are therefore 3 bytes
+long: `LDX`, `STX`, `ADD SP` (and, as before, `EXT k`). Every other escape
+instruction is 2 bytes: prefix plus subcode.
+
+`PUSHW`/`POPW` store the pair low byte first, at the lower address. `CALL`,
+`EXT` and `RET` push a return address low byte first as well, which places the
+low byte at the *higher* address because the stack grows down; the two pair
+conventions are therefore not interchangeable, and `PUSHW` pairs only with
+`POPW`.
 
 Every subcode not listed above is reserved and raises an atomic error, as does
 any single-byte opcode not listed in 4.1-4.5.
