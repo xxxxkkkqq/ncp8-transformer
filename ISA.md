@@ -280,7 +280,7 @@ program. Construction validates it once; no instruction can read or write the bl
 | `winlo`, `winhi` | 0..65535, supplied together or not at all | the self-modification window `[winlo, winhi)` |
 | `vec` | at most 16 entries, each 0..65535 | trap entry points; `0` means unregistered |
 | `tickbudget` | 0..2^62 | ticks before `OVERRUN` |
-| `outcap` | 1..65535 | output bytes before the capacity fault |
+| `outcap` | a power of two, from 1 up to 32768 | output bytes before the capacity fault; a non-power-of-two is refused because the store masks the write index |
 | `nbanks` | 1..65535 | carried, not yet consulted by any instruction (memory banks) |
 | `tdlim` | 0..255 | carried, not yet consulted by any instruction (trap depth) |
 
