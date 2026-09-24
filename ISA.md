@@ -159,17 +159,51 @@ any single-byte opcode not listed in 4.1-4.5.
 
 ## 5. Fixed code-region tables
 
-Both tables live in `CODE`, which the machine cannot write, so they can only be
-established at load time.
-
 | address | contents |
 |---|---|
 | `CODE[0x0F00 + 2k]` | 16-bit little-endian entry point for trap `EXT k`, `k` in 0-15; a zero entry means unregistered |
-| `CODE[0x0F20]`, `CODE[0x0F21]` | lower and upper bound of the self-modification window; the upper bound is exclusive |
+| `CODE[0x0F20]`, `CODE[0x0F21]` | lower and inclusive-lower / exclusive-upper bound of the self-modification window, as two independent 8-bit bytes |
 
 If `WLO >= WHI` the window is empty and every `STC` raises. `EXT` with `k >= 16`
 or with a zero vector raises. Both pushes follow the `CALL` convention (low byte
 first), so handlers may nest and return with `RET`.
+
+### 5.1 Why the machine cannot reach these tables
+
+`STC` writes `CODE`. It is kept out of the tables above by **two declared limits
+that happen to coincide**, and readers must not confuse this with `CODE` being
+write-protected, because it is not:
+
+* the window bounds are 8-bit, so the widest expressible window is `[0x00, 0xFF]`
+  and the highest address `STC` can ever reach is `0xFE`;
+* the tables above start at `0x0F00`, far outside that reach.
+
+An exhaustive sweep of all 65536 declarable `(WLO, WHI)` pairs confirms no `STC`
+lands in `[0x0F00, 0x0F22)`.
+
+**Consequence for anyone widening this.** Because the protection comes from the
+bound *width* and not from read-only-ness, enlarging the window to 16-bit bounds
+without also declaring a protected region would let `STC` reach the trap vector
+table, and the window bound cells themselves, so the machine could then widen its
+own window to all of `CODE`. Any change to the bound width must therefore come
+together with an explicit protected region that the datapath refuses regardless of
+the window.
+
+### 5.2 Loaded length is not the address space
+
+`CODE` is a 4096-byte address space, but every bound the machine checks is the
+**length of the loaded image**, not 4096. So an image must be long enough to
+contain the tables it is supposed to have:
+
+* `EXT k` needs the image to reach `0x0F02`, otherwise the vector reads as zero and
+  the trap raises `handler k unregistered` even though the caller believes it wrote
+  one;
+* `STC` and the window declaration need the image to reach `0x0F22`, otherwise the
+  bounds read as zero, the window is empty, and `STC` raises `outside window`
+  reporting the range `[0x0, 0x0)`.
+
+Both failure messages describe the *symptom*, not this cause. A builder placing
+these tables must pad the image to at least `0x0F22` bytes.
 
 ## 6. Invariants
 

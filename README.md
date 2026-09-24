@@ -2,13 +2,18 @@
 
 NCP-8: a small machine specified in integer bit-planes.
 
-Three independent implementations of one ISA, required to agree bit-for-bit:
+Three implementations of one ISA, required to agree bit-for-bit:
 
 | file | implementation |
 |---|---|
 | `golden_sim.py` | reference simulator, pure Python integers, no floating point |
 | `circuit_torch.py` | datapath built from one-hot gated rows over a decode ROM |
 | `circuit_triton.py` | the same cycle fused into a single Triton kernel |
+
+They share one specification and differ in how the transition is computed. They
+are not independent derivations of it, so agreement between them is evidence
+about transcription and about numeric determinism, not proof that the
+specification is unambiguous; `ISA.md` is the normative text.
 
 Acceptance is recomputation, never inspection: every implementation is compared
 against the reference per tick, field by field (registers, pointers, stack
@@ -19,13 +24,16 @@ error paths. See `ISA.md` for the instruction set.
 
 ```
 pip install torch triton          # triton only needed for circuit_triton.py
-python3 test_isa_v2.py            # instruction semantics (reference only)
-python3 test_arithmetic_bounds.py # bit-width / radix bounds, carry chains
+python3 test_isa_v2.py                # instruction semantics (reference only)
+python3 test_arithmetic_bounds.py     # bit-width / radix bounds, carry chains
+python3 test_asm_strictness.py        # assembler must refuse, never mis-encode
 python3 test_circuit_equivalence.py   # both circuits vs reference, all 256 opcodes
 python3 test_isa_v2_equivalence.py    # escape subcode space + program lockstep
-python3 test_recursion.py         # multiply, nested CALL/RET, stack overflow
-python3 mini_interpreter.py       # a 16-opcode interpreter implemented in NCP-8
-python3 selfread.py               # programs that read their own PC/SP/flags
+python3 test_error_atomicity.py       # every bound case, on the reference too
+python3 test_recursion.py             # multiply, nested CALL/RET, stack overflow
+python3 test_batched_execution.py     # batched/resident executor vs reference
+python3 mini_interpreter.py           # a 16-opcode interpreter implemented in NCP-8
+python3 selfread.py                   # programs that read their own PC/SP/flags
 ```
 
 The reference-only suites run on CPU. The circuit suites need CUDA.
@@ -55,10 +63,12 @@ are available:
    return address and jumps to the entry point stored in the vector table, which
    lives in the read-only code region and is populated at load time. A handler
    is an ordinary program, so it can be verified by running it.
-3. **Controlled self-modification** through `STC [HL], r`, restricted to a
-   window declared in the read-only code region, so the machine cannot widen its
-   own window. An undeclared window is zero-width, which disables
+3. **Controlled self-modification** through `STC [HL], r`, restricted to a window
+   declared at load time. An undeclared window is zero-width, which disables
    self-modification entirely. Writes outside the window raise an atomic error.
+   The window bounds are two 8-bit bytes, so the highest address `STC` can reach
+   at all is `0xFE`, which is what keeps it out of the trap vector table at
+   `0x0F00`. See `ISA.md` section 5.1 before widening those bounds.
 
 ## Status
 
