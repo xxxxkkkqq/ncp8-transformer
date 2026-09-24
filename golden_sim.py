@@ -25,6 +25,8 @@ Opcode layout (fields do not overlap):
 from __future__ import annotations
 import re
 
+import isa_table as ISA
+
 DATA_SIZE = 4096
 CODE_SIZE = 4096
 OUT_CAP = 8192
@@ -154,272 +156,267 @@ class NCP8:
             self.status = "OVERRUN"
             return
         pc0 = self.PC
+
         (op,) = self._fetch(1)
-        r = op & 3
+        if op == ISA.ESCAPE_PREFIX:
+            (sub,) = self._fetch(1)
+            row = ISA.ESCAPE.get(sub)
+            if row is None:
+                raise MachineError(f"reserved subcode {sub:#04x} (ESC)  @ {pc0:#04x}")
+        else:
+            row = ISA.SINGLE.get(op)
+            if row is None:
+                raise MachineError(f"undefined opcode {op:#04x} @ {pc0:#04x}")
+        sel = row["alu"]
+        s0, s1 = row["s0"], row["s1"]
+        imm = self._fetch(row["l"])
         m = "???"
 
-        if op <= 0x1F:
-            if op == 0x00: m = "HALT"; self.status = "HALT"
-            elif op == 0x01: m = "NOP"
-            elif op == 0x02: self.HL = (self.HL + 1) & 0xFFFF; m = "INC HL"
-            elif op == 0x03: self.HL = (self.HL - 1) & 0xFFFF; m = "DEC HL"
-            elif op == 0x04: self.DE = (self.DE + 1) & 0xFFFF; m = "INC DE"
-            elif op == 0x05: self.C = 0; m = "CLC"
-            elif op == 0x06:
-                self._mem(self.HL); self._emit(self.data[self.HL])
-                self.HL = (self.HL + 1) & 0xFFFF; m = "OUTM"
-            elif op == 0x07:
-                self._mem(self.DE); self._emit(self.data[self.DE])
-                self.DE = (self.DE + 1) & 0xFFFF; m = "OUTDE"
-            elif op == 0x08:
-                self._stack_have(2)
-                hi = self._pop(); lo = self._pop(); self.PC = hi << 8 | lo; m = "RET"
-            elif 0x09 <= op <= 0x0D:
-                lo, hi = self._fetch(2); t = hi << 8 | lo
-                if op == 0x09: self.PC = t; m = "JMP"
-                elif op == 0x0A: m = "JZ";   self.PC = t if self.Z else self.PC
-                elif op == 0x0B: m = "JNZ";  self.PC = t if not self.Z else self.PC
-                elif op == 0x0C: m = "JC";   self.PC = t if self.C else self.PC
-                elif op == 0x0D: m = "JNC";  self.PC = t if not self.C else self.PC
-            elif op == 0x0E:
-                lo, hi = self._fetch(2); t = hi << 8 | lo; ret = self.PC
-                self._stack_room(2)
-                self._push(ret & 0xFF); self._push(ret >> 8); self.PC = t; m = "CALL"
-            elif op == 0x0F:
-                lo, hi = self._fetch(2); self.HL = hi << 8 | lo; m = f"LDI HL, {self.HL}"
-            elif op == 0x10:
-                lo, hi = self._fetch(2); self.DE = hi << 8 | lo; m = f"LDI DE, {self.DE}"
-            elif op == 0x11:
-                (s,) = self._fetch(1); self.HL = (self.HL + self.r[s & 3]) & 0xFFFF; m = f"ADDI HL, r{s & 3}"
-            elif op == 0x12:
-                (s,) = self._fetch(1); self.DE = (self.DE + self.r[s & 3]) & 0xFFFF; m = f"ADDI DE, r{s & 3}"
-            elif op == 0x13:
-                self.PC = self.HL; m = "JPHL"
-            elif op & 0xFC == 0x14:
-                self.r[r] = pc0 & 255; m = f"GETPC r{r}"
-            elif op & 0xFC == 0x18:
-                self.r[r] = self.SP & 255; m = f"GETSP r{r}"
-            elif op & 0xFC == 0x1C:
-                self.r[r] = self.Z | (self.C << 1); m = f"GETF r{r}"
-            else:
-                raise MachineError(f"undefined opcode {op:#04x} @ {pc0:#04x}")
-        elif 0x80 <= op <= 0xCF:
-            s0, s1 = (op >> 2) & 3, op & 3
-            base = op & 0xF0
+        if sel == "HALT":
+            self.status = "HALT"; m = "HALT"
+        elif sel == "NOP": m = "NOP"
+        elif sel == "INC_HL": self.HL = (self.HL + 1) & 0xFFFF; m = "INC HL"
+        elif sel == "DEC_HL": self.HL = (self.HL - 1) & 0xFFFF; m = "DEC HL"
+        elif sel == "INC_DE": self.DE = (self.DE + 1) & 0xFFFF; m = "INC DE"
+        elif sel == "CLC": self.C = 0; m = "CLC"
+        elif sel == "OUTM":
+            self._mem(self.HL); self._emit(self.data[self.HL])
+            self.HL = (self.HL + 1) & 0xFFFF; m = "OUTM"
+        elif sel == "OUTDE":
+            self._mem(self.DE); self._emit(self.data[self.DE])
+            self.DE = (self.DE + 1) & 0xFFFF; m = "OUTDE"
+        elif sel == "RET":
+            self._stack_have(2)
+            hi = self._pop(); lo = self._pop(); self.PC = hi << 8 | lo; m = "RET"
+        elif sel in ("JMP", "JZ", "JNZ", "JC", "JNC"):
+            t = imm[1] << 8 | imm[0]
+            if sel == "JMP": self.PC = t; m = "JMP"
+            elif sel == "JZ":   m = "JZ";   self.PC = t if self.Z else self.PC
+            elif sel == "JNZ":  m = "JNZ";  self.PC = t if not self.Z else self.PC
+            elif sel == "JC":   m = "JC";   self.PC = t if self.C else self.PC
+            else:               m = "JNC";  self.PC = t if not self.C else self.PC
+        elif sel == "CALL":
+            t = imm[1] << 8 | imm[0]; ret = self.PC
+            self._stack_room(2)
+            self._push(ret & 0xFF); self._push(ret >> 8); self.PC = t; m = "CALL"
+        elif sel == "LDI_HL":
+            self.HL = imm[1] << 8 | imm[0]; m = f"LDI HL, {self.HL}"
+        elif sel == "LDI_DE":
+            self.DE = imm[1] << 8 | imm[0]; m = f"LDI DE, {self.DE}"
+        elif sel == "ADDI_HL":
+            s = imm[0] & 3
+            self.HL = (self.HL + self.r[s]) & 0xFFFF; m = f"ADDI HL, r{s}"
+        elif sel == "ADDI_DE":
+            s = imm[0] & 3
+            self.DE = (self.DE + self.r[s]) & 0xFFFF; m = f"ADDI DE, r{s}"
+        elif sel == "JPHL":
+            self.PC = self.HL; m = "JPHL"
+        elif sel == "GETPC":
+            self.r[s0] = pc0 & 255; m = f"GETPC r{s0}"
+        elif sel == "GETSP":
+            self.r[s0] = self.SP & 255; m = f"GETSP r{s0}"
+        elif sel == "GETF":
+            self.r[s0] = self.Z | (self.C << 1); m = f"GETF r{s0}"
+        elif sel == "ADD":
             a, b = self.r[s0], self.r[s1]
-            if base == 0x80:
-                t = a + b; self.C = t >> 8; self.r[s0] = t & 0xFF; self.Z = int((t & 0xFF) == 0); m = f"ADD r{s0}, r{s1}"
-            elif base == 0x90:
-                self.C = int(a < b); v = (a - b) & 0xFF; self.r[s0] = v; self.Z = int(v == 0); m = f"SUB r{s0}, r{s1}"
-            elif base == 0xA0:
-                t = a + b + self.C; self.C = t >> 8; self.r[s0] = t & 0xFF; self.Z = int((t & 0xFF) == 0); m = f"ADC r{s0}, r{s1}"
-            elif base == 0xB0:
-                t = a - b - self.C; self.C = int(t < 0); v = t & 0xFF; self.r[s0] = v; self.Z = int(v == 0); m = f"SBB r{s0}, r{s1}"
-            elif base == 0xC0:
-                self.r[s0] = b; m = f"MOV r{s0}, r{s1}"
-            else:
-                raise MachineError(f"undefined opcode {op:#04x} @ {pc0:#04x}")
-        elif 0x20 <= op <= 0x5F:
-            s0, s1 = (op >> 2) & 3, op & 3
-            base = op & 0xF0
+            t = a + b; self.C = t >> 8; self.r[s0] = t & 0xFF
+            self.Z = int((t & 0xFF) == 0); m = f"ADD r{s0}, r{s1}"
+        elif sel == "SUB":
             a, b = self.r[s0], self.r[s1]
-            if base == 0x20:
-                v = a & b; self.r[s0] = v; self.Z = int(v == 0); m = f"AND r{s0}, r{s1}"
-            elif base == 0x30:
-                v = a | b; self.r[s0] = v; self.Z = int(v == 0); m = f"OR r{s0}, r{s1}"
-            elif base == 0x40:
-                v = a ^ b; self.r[s0] = v; self.Z = int(v == 0); m = f"XOR r{s0}, r{s1}"
-            elif base == 0x50:
-                t = a * b; self.C = int(t > 255); v = t & 0xFF
-                self.r[s0] = v; self.Z = int(v == 0); m = f"MUL r{s0}, r{s1}"
+            self.C = int(a < b); v = (a - b) & 0xFF; self.r[s0] = v
+            self.Z = int(v == 0); m = f"SUB r{s0}, r{s1}"
+        elif sel == "ADC":
+            a, b = self.r[s0], self.r[s1]
+            t = a + b + self.C; self.C = t >> 8; self.r[s0] = t & 0xFF
+            self.Z = int((t & 0xFF) == 0); m = f"ADC r{s0}, r{s1}"
+        elif sel == "SBB":
+            a, b = self.r[s0], self.r[s1]
+            t = a - b - self.C; self.C = int(t < 0); v = t & 0xFF; self.r[s0] = v
+            self.Z = int(v == 0); m = f"SBB r{s0}, r{s1}"
+        elif sel == "MOV":
+            b = self.r[s1]; self.r[s0] = b; m = f"MOV r{s0}, r{s1}"
+        elif sel == "AND":
+            a, b = self.r[s0], self.r[s1]
+            v = a & b; self.r[s0] = v; self.Z = int(v == 0); m = f"AND r{s0}, r{s1}"
+        elif sel == "OR":
+            a, b = self.r[s0], self.r[s1]
+            v = a | b; self.r[s0] = v; self.Z = int(v == 0); m = f"OR r{s0}, r{s1}"
+        elif sel == "XOR":
+            a, b = self.r[s0], self.r[s1]
+            v = a ^ b; self.r[s0] = v; self.Z = int(v == 0); m = f"XOR r{s0}, r{s1}"
+        elif sel == "MUL":
+            a, b = self.r[s0], self.r[s1]
+            t = a * b; self.C = int(t > 255); v = t & 0xFF
+            self.r[s0] = v; self.Z = int(v == 0); m = f"MUL r{s0}, r{s1}"
+        elif sel in ("DIV", "MOD"):
+            a, b = self.r[s0], self.r[s1]
+            if b == 0:
+                raise MachineError(f"divide by zero {sel} r{s0}, r{s1} @ {pc0:#04x}")
+            v = a // b if sel == "DIV" else a % b
+            self.r[s0] = v; self.Z = int(v == 0); m = f"{sel} r{s0}, r{s1}"
+        elif sel == "CMP":
+            a, b = self.r[s0], self.r[s1]
+            self.Z = int(a == b); self.C = int(a < b); m = f"CMP r{s0}, r{s1}"
+        elif sel == "NOT":
+            v = (~self.r[s0]) & 0xFF; self.r[s0] = v
+            self.Z = int(v == 0); m = f"NOT r{s0}"
+        elif sel == "NEG":
+            t = (-self.r[s0]) & 0xFF; self.C = int(self.r[s0] != 0)
+            self.r[s0] = t; self.Z = int(t == 0); m = f"NEG r{s0}"
+        elif sel == "ROL":
+            v = self.r[s0]; self.C, self.r[s0] = v >> 7, ((v << 1) | self.C) & 0xFF
+            self.Z = int(self.r[s0] == 0); m = f"ROL r{s0}"
+        elif sel == "ROR":
+            v = self.r[s0]; self.C, self.r[s0] = v & 1, ((v >> 1) | (self.C << 7)) & 0xFF
+            self.Z = int(self.r[s0] == 0); m = f"ROR r{s0}"
+        elif sel == "MOVW_HL_DE":
+            self.HL = self.DE; m = "MOVW HL, DE"
+        elif sel == "MOVW_DE_HL":
+            self.DE = self.HL; m = "MOVW DE, HL"
+        elif sel == "MOVW_HL_SP":
+            self.HL = self.SP; m = "MOVW HL, SP"
+        elif sel == "MOVW_DE_SP":
+            self.DE = self.SP; m = "MOVW DE, SP"
+        elif sel == "MOVW_SP_HL":
+            if self.HL > DATA_SIZE:
+                raise MachineError(f"MOVW SP, HL out of range {self.HL} @ {pc0:#04x}")
+            self.SP = self.HL; m = "MOVW SP, HL"
+        elif sel == "MOVW_SP_DE":
+            if self.DE > DATA_SIZE:
+                raise MachineError(f"MOVW SP, DE out of range {self.DE} @ {pc0:#04x}")
+            self.SP = self.DE; m = "MOVW SP, DE"
+        elif sel == "PUSHW_HL" or sel == "PUSHW_DE":
+            v = self.HL if sel == "PUSHW_HL" else self.DE
+            self._stack_room(2); self.SP -= 2
+            self.data[self.SP] = v & 0xFF
+            self.data[self.SP + 1] = (v >> 8) & 0xFF
+            m = "PUSHW HL" if sel == "PUSHW_HL" else "PUSHW DE"
+        elif sel == "POPW_HL" or sel == "POPW_DE":
+            self._stack_have(2)
+            v = self.data[self.SP] | (self.data[self.SP + 1] << 8)
+            if sel == "POPW_HL":
+                self.HL = v; m = "POPW HL"
             else:
-                raise MachineError(f"undefined opcode {op:#04x} @ {pc0:#04x}")
-        elif op == 0x70:
-            (sub,) = self._fetch(1)
-            rs = sub & 3
-            fam = sub & 0xF0
-            if fam in (0x00, 0x10, 0x20):
-                s0, s1 = (sub >> 2) & 3, sub & 3
-                a, b = self.r[s0], self.r[s1]
-                if fam == 0x00:
-                    if b == 0:
-                        raise MachineError(f"divide by zero DIV r{s0}, r{s1} @ {pc0:#04x}")
-                    v = a // b; self.r[s0] = v; self.Z = int(v == 0); m = f"DIV r{s0}, r{s1}"
-                elif fam == 0x10:
-                    if b == 0:
-                        raise MachineError(f"divide by zero MOD r{s0}, r{s1} @ {pc0:#04x}")
-                    v = a % b; self.r[s0] = v; self.Z = int(v == 0); m = f"MOD r{s0}, r{s1}"
-                else:
-                    self.Z = int(a == b); self.C = int(a < b); m = f"CMP r{s0}, r{s1}"
-            elif 0x30 <= sub <= 0x3F:
-                if sub == 0x30:
-                    self.HL = self.DE; m = "MOVW HL, DE"
-                elif sub == 0x31:
-                    self.DE = self.HL; m = "MOVW DE, HL"
-                elif sub == 0x32:
-                    self.HL = self.SP; m = "MOVW HL, SP"
-                elif sub == 0x33:
-                    self.DE = self.SP; m = "MOVW DE, SP"
-                elif sub == 0x34:
-                    if self.HL > DATA_SIZE:
-                        raise MachineError(f"MOVW SP, HL out of range {self.HL} @ {pc0:#04x}")
-                    self.SP = self.HL; m = "MOVW SP, HL"
-                elif sub == 0x35:
-                    if self.DE > DATA_SIZE:
-                        raise MachineError(f"MOVW SP, DE out of range {self.DE} @ {pc0:#04x}")
-                    self.SP = self.DE; m = "MOVW SP, DE"
-                elif sub == 0x38:
-                    self._stack_room(2); self.SP -= 2
-                    self.data[self.SP] = self.HL & 0xFF
-                    self.data[self.SP + 1] = (self.HL >> 8) & 0xFF
-                    m = "PUSHW HL"
-                elif sub == 0x39:
-                    self._stack_room(2); self.SP -= 2
-                    self.data[self.SP] = self.DE & 0xFF
-                    self.data[self.SP + 1] = (self.DE >> 8) & 0xFF
-                    m = "PUSHW DE"
-                elif sub == 0x3A:
-                    self._stack_have(2)
-                    self.HL = self.data[self.SP] | (self.data[self.SP + 1] << 8)
-                    self.SP += 2; m = "POPW HL"
-                elif sub == 0x3B:
-                    self._stack_have(2)
-                    self.DE = self.data[self.SP] | (self.data[self.SP + 1] << 8)
-                    self.SP += 2; m = "POPW DE"
-                elif sub == 0x3C:
-                    self._mem16(self.HL)
-                    self.data[self.HL] = self.DE & 0xFF
-                    self.data[self.HL + 1] = (self.DE >> 8) & 0xFF
-                    m = "STW [HL], DE"
-                elif sub == 0x3D:
-                    self._mem16(self.DE)
-                    self.data[self.DE] = self.HL & 0xFF
-                    self.data[self.DE + 1] = (self.HL >> 8) & 0xFF
-                    m = "STW [DE], HL"
-                elif sub == 0x3E:
-                    self._mem16(self.HL)
-                    self.DE = self.data[self.HL] | (self.data[self.HL + 1] << 8)
-                    m = "LDW DE, [HL]"
-                elif sub == 0x3F:
-                    self._mem16(self.DE)
-                    self.HL = self.data[self.DE] | (self.data[self.DE + 1] << 8)
-                    m = "LDW HL, [DE]"
-                else:
-                    raise MachineError(f"reserved subcode {sub:#04x} (ESC)  @ {pc0:#04x}")
-            elif sub & 0xFC in (0x40, 0x44, 0x48, 0x4C):
-                if sub & 0xFC == 0x40:
-                    v = (~self.r[rs]) & 0xFF; self.r[rs] = v
-                    self.Z = int(v == 0); m = f"NOT r{rs}"
-                elif sub & 0xFC == 0x44:
-                    t = (-self.r[rs]) & 0xFF; self.C = int(self.r[rs] != 0)
-                    self.r[rs] = t; self.Z = int(t == 0); m = f"NEG r{rs}"
-                elif sub & 0xFC == 0x48:
-                    v = self.r[rs]; self.C, self.r[rs] = v >> 7, ((v << 1) | self.C) & 0xFF
-                    self.Z = int(self.r[rs] == 0); m = f"ROL r{rs}"
-                else:
-                    v = self.r[rs]; self.C, self.r[rs] = v & 1, ((v >> 1) | (self.C << 7)) & 0xFF
-                    self.Z = int(self.r[rs] == 0); m = f"ROR r{rs}"
-            elif 0x50 <= sub <= 0x5F:
-                if sub <= 0x53:
-                    (i,) = self._fetch(1)
-                    sx = (i ^ 0x80) - 0x80
-                    addr = (self.HL + sx) & 0xFFFF
-                    self._mem(addr)
-                    self.r[rs] = self.data[addr]; m = f"LDX r{rs}, [HL{sx:+d}]"
-                elif sub <= 0x57:
-                    (i,) = self._fetch(1)
-                    sx = (i ^ 0x80) - 0x80
-                    addr = (self.HL + sx) & 0xFFFF
-                    self._mem(addr)
-                    self.data[addr] = self.r[rs]; m = f"STX [HL{sx:+d}], r{rs}"
-                elif sub == 0x58:
-                    (i,) = self._fetch(1)
-                    sx = (i ^ 0x80) - 0x80
-                    sp = (self.SP + sx) & 0xFFFF
-                    if sp > DATA_SIZE:
-                        raise MachineError(f"ADD SP out of range {sp} @ {pc0:#04x}")
-                    self.SP = sp; m = f"ADD SP, {sx}"
-                else:
-                    raise MachineError(f"reserved subcode {sub:#04x} (ESC)  @ {pc0:#04x}")
-            elif sub == 0x60:
-                t = self.HL + self.DE; self.C = t >> 16; self.HL = t & 0xFFFF; m = "ADD HL, DE"
-            elif sub == 0x61:
-                self.C = int(self.HL < self.DE); self.HL = (self.HL - self.DE) & 0xFFFF; m = "SUB HL, DE"
-            elif sub == 0x62:
-                self.HL, self.DE = self.DE, self.HL; m = "XCHG HL, DE"
-            elif sub & 0xFC in (0x80, 0x84):
+                self.DE = v; m = "POPW DE"
+            self.SP += 2
+        elif sel == "STW_HLDE":
+            self._mem16(self.HL)
+            self.data[self.HL] = self.DE & 0xFF
+            self.data[self.HL + 1] = (self.DE >> 8) & 0xFF
+            m = "STW [HL], DE"
+        elif sel == "STW_DEHL":
+            self._mem16(self.DE)
+            self.data[self.DE] = self.HL & 0xFF
+            self.data[self.DE + 1] = (self.HL >> 8) & 0xFF
+            m = "STW [DE], HL"
+        elif sel == "LDW_DEHL":
+            self._mem16(self.HL)
+            self.DE = self.data[self.HL] | (self.data[self.HL + 1] << 8)
+            m = "LDW DE, [HL]"
+        elif sel == "LDW_HLDE":
+            self._mem16(self.DE)
+            self.HL = self.data[self.DE] | (self.data[self.DE + 1] << 8)
+            m = "LDW HL, [DE]"
+        elif sel == "LDX":
+            sx = (imm[0] ^ 0x80) - 0x80
+            addr = (self.HL + sx) & 0xFFFF
+            self._mem(addr)
+            self.r[s0] = self.data[addr]; m = f"LDX r{s0}, [HL{sx:+d}]"
+        elif sel == "STX":
+            sx = (imm[0] ^ 0x80) - 0x80
+            addr = (self.HL + sx) & 0xFFFF
+            self._mem(addr)
+            self.data[addr] = self.r[s0]; m = f"STX [HL{sx:+d}], r{s0}"
+        elif sel == "ADD_SP":
+            sx = (imm[0] ^ 0x80) - 0x80
+            sp = (self.SP + sx) & 0xFFFF
+            if sp > DATA_SIZE:
+                raise MachineError(f"ADD SP out of range {sp} @ {pc0:#04x}")
+            self.SP = sp; m = f"ADD SP, {sx}"
+        elif sel == "ADD_HLDE":
+            t = self.HL + self.DE; self.C = t >> 16; self.HL = t & 0xFFFF; m = "ADD HL, DE"
+        elif sel == "SUB_HLDE":
+            self.C = int(self.HL < self.DE); self.HL = (self.HL - self.DE) & 0xFFFF; m = "SUB HL, DE"
+        elif sel == "XCHG":
+            self.HL, self.DE = self.DE, self.HL; m = "XCHG HL, DE"
+        elif sel == "LDC":
+            if not 0 <= self.HL < len(self.code):
+                raise MachineError(f"LDC out of range {self.HL} @ {pc0:#04x}")
+            self.r[s0] = self.code[self.HL]; m = f"LDC r{s0}, [HL]"
+        elif sel == "STC":
 
-                WLO, WHI = 0x0F20, 0x0F21
-                wl = self.code[WLO] if WLO < len(self.code) else 0
-                wh = self.code[WHI] if WHI < len(self.code) else 0
-                if sub & 0xFC == 0x84:
-                    if not 0 <= self.HL < len(self.code):
-                        raise MachineError(f"LDC out of range {self.HL} @ {pc0:#04x}")
-                    self.r[rs] = self.code[self.HL]; m = f"LDC r{rs}, [HL]"
-                else:
-                    if not 0 <= self.HL < len(self.code):
-                        raise MachineError(f"STC out of range {self.HL} @ {pc0:#04x}")
-                    if not (wl <= self.HL < wh):
-                        raise MachineError(
-                            f"STC outside window {self.HL:#x} not in [{wl:#x},{wh:#x}) @ {pc0:#04x}")
-                    b = bytearray(self.code); b[self.HL] = self.r[rs]; self.code = bytes(b)
-                    m = f"STC [HL], r{rs}"
-            elif 0x90 <= sub <= 0x9F:
-                s0, s1 = (sub >> 2) & 3, sub & 3
-                v = ((self.r[s0] * self.r[s1]) >> 8) & 0xFF
-                self.r[s0] = v; self.Z = int(v == 0); m = f"MULH r{s0}, r{s1}"
-            elif sub == 0x70:
-                (k,) = self._fetch(1)
-                if k >= 16:
-                    raise MachineError(f"EXT k out of range {k} @ {pc0:#04x}")
-                a = 0x0F00 + 2 * k
-                tgt = 0
-                if a + 1 < len(self.code):
-                    tgt = (self.code[a + 1] << 8) | self.code[a]
-                if tgt == 0:
-                    raise MachineError(f"EXT handler {k} unregistered @ {pc0:#04x}")
-                self._stack_room(2)
-                self._push(self.PC & 0xFF); self._push((self.PC >> 8) & 0xFF)
-                self.PC = tgt; m = f"EXT {k}"
+            WLO, WHI = 0x0F20, 0x0F21
+            wl = self.code[WLO] if WLO < len(self.code) else 0
+            wh = self.code[WHI] if WHI < len(self.code) else 0
+            if not 0 <= self.HL < len(self.code):
+                raise MachineError(f"STC out of range {self.HL} @ {pc0:#04x}")
+            if not (wl <= self.HL < wh):
+                raise MachineError(
+                    f"STC outside window {self.HL:#x} not in [{wl:#x},{wh:#x}) @ {pc0:#04x}")
+            b = bytearray(self.code); b[self.HL] = self.r[s0]; self.code = bytes(b)
+            m = f"STC [HL], r{s0}"
+        elif sel == "MULH":
+            v = ((self.r[s0] * self.r[s1]) >> 8) & 0xFF
+            self.r[s0] = v; self.Z = int(v == 0); m = f"MULH r{s0}, r{s1}"
+        elif sel == "EXT":
+
+            k = imm[0]
+            if k >= 16:
+                raise MachineError(f"EXT k out of range {k} @ {pc0:#04x}")
+            a = 0x0F00 + 2 * k
+            tgt = 0
+            if a + 1 < len(self.code):
+                tgt = (self.code[a + 1] << 8) | self.code[a]
+            if tgt == 0:
+                raise MachineError(f"EXT handler {k} unregistered @ {pc0:#04x}")
+            self._stack_room(2)
+            self._push(self.PC & 0xFF); self._push((self.PC >> 8) & 0xFF)
+            self.PC = tgt; m = f"EXT {k}"
+        elif sel in ("LDI", "ADDI", "SUBI", "ADCI"):
+            i = imm[0]
+            if sel == "LDI":
+                self.r[s0] = i; m = f"LDI r{s0}, {i}"
+            elif sel == "ADDI":
+                t = self.r[s0] + i
+                self.C = t >> 8; self.r[s0] = t & 0xFF
+                self.Z = int((t & 0xFF) == 0); m = f"ADDI r{s0}, {i}"
+            elif sel == "SUBI":
+                a = self.r[s0]; self.C = int(a < i); v = (a - i) & 0xFF
+                self.r[s0] = v; self.Z = int(v == 0); m = f"SUBI r{s0}, {i}"
             else:
-                raise MachineError(f"reserved subcode {sub:#04x} (ESC)  @ {pc0:#04x}")
-        elif 0xD0 <= op <= 0xDF:
-            (i,) = self._fetch(1)
-            t = self.r[r] + i + (self.C if op >= 0xDC else 0)
-            if op & 0xFC == 0xD0:
-                self.r[r] = i; m = f"LDI r{r}, {i}"
-            elif op & 0xFC == 0xD4:
-                self.C = t >> 8; self.r[r] = t & 0xFF; self.Z = int((t & 0xFF) == 0); m = f"ADDI r{r}, {i}"
-            elif op & 0xFC == 0xD8:
-                a = self.r[r]; self.C = int(a < i); v = (a - i) & 0xFF; self.r[r] = v; self.Z = int(v == 0); m = f"SUBI r{r}, {i}"
-            elif op & 0xFC == 0xDC:
-                self.C = t >> 8; self.r[r] = t & 0xFF; self.Z = int((t & 0xFF) == 0); m = f"ADCI r{r}, {i}"
-        elif (op & 0xFC) in (0x60, 0x64, 0x68, 0x6C) or 0xE0 <= op <= 0xFF:
-            fam = op & 0xFC
-            if fam == 0xE0: self._mem(self.HL); self.r[r] = self.data[self.HL]; m = f"MOV r{r}, [HL]"
-            elif fam == 0xE4: self._mem(self.HL); self.data[self.HL] = self.r[r]; m = f"MOV [HL], r{r}"
-            elif fam == 0xE8: self._mem(self.DE); self.r[r] = self.data[self.DE]; m = f"MOV r{r}, [DE]"
-            elif fam == 0xEC: self._mem(self.DE); self.data[self.DE] = self.r[r]; m = f"MOV [DE], r{r}"
-            elif fam == 0xF0: self._push(self.r[r]); m = f"PUSH r{r}"
-            elif fam == 0xF4: self.r[r] = self._pop(); m = f"POP r{r}"
-            elif fam == 0xF8: self._emit(self.r[r]); m = f"OUT r{r}"
-            elif fam == 0xFC:
-                if self.ipos < len(self.inputs):
-                    self.r[r] = self.inputs[self.ipos]; self.ipos += 1
-                else:
-                    self.r[r] = 0; self.C = 1
-                m = f"IN r{r}"
-            elif fam == 0x60:
-                self.C = self.r[r] >> 7; v = (self.r[r] << 1) & 0xFF; self.r[r] = v; self.Z = int(v == 0); m = f"SHL r{r}"
-            elif fam == 0x64:
-                self.C = self.r[r] & 1; v = self.r[r] >> 1; self.r[r] = v; self.Z = int(v == 0); m = f"SHR r{r}"
-            elif fam == 0x68:
-                self.Z = int(self.r[r] == 0); m = f"TST r{r}"
-            elif fam == 0x6C:
-                lo, hi = self._fetch(2); t = hi << 8 | lo
-                self.r[r] = (self.r[r] - 1) & 0xFF
-                if self.r[r] != 0: self.PC = t
-                m = f"DJNZ r{r}"
+                t = self.r[s0] + i + self.C
+                self.C = t >> 8; self.r[s0] = t & 0xFF
+                self.Z = int((t & 0xFF) == 0); m = f"ADCI r{s0}, {i}"
+        elif sel == "SHL":
+            self.C = self.r[s0] >> 7; v = (self.r[s0] << 1) & 0xFF; self.r[s0] = v
+            self.Z = int(v == 0); m = f"SHL r{s0}"
+        elif sel == "SHR":
+            self.C = self.r[s0] & 1; v = self.r[s0] >> 1; self.r[s0] = v
+            self.Z = int(v == 0); m = f"SHR r{s0}"
+        elif sel == "TST":
+            self.Z = int(self.r[s0] == 0); m = f"TST r{s0}"
+        elif sel == "DJNZ":
+            t = imm[1] << 8 | imm[0]
+            self.r[s0] = (self.r[s0] - 1) & 0xFF
+            if self.r[s0] != 0: self.PC = t
+            m = f"DJNZ r{s0}"
+        elif sel == "MOV_R_HL":
+            self._mem(self.HL); self.r[s0] = self.data[self.HL]; m = f"MOV r{s0}, [HL]"
+        elif sel == "MOV_HL_R":
+            self._mem(self.HL); self.data[self.HL] = self.r[s0]; m = f"MOV [HL], r{s0}"
+        elif sel == "MOV_R_DE":
+            self._mem(self.DE); self.r[s0] = self.data[self.DE]; m = f"MOV r{s0}, [DE]"
+        elif sel == "MOV_DE_R":
+            self._mem(self.DE); self.data[self.DE] = self.r[s0]; m = f"MOV [DE], r{s0}"
+        elif sel == "PUSH": self._push(self.r[s0]); m = f"PUSH r{s0}"
+        elif sel == "POP": self.r[s0] = self._pop(); m = f"POP r{s0}"
+        elif sel == "OUT": self._emit(self.r[s0]); m = f"OUT r{s0}"
+        elif sel == "IN":
+            if self.ipos < len(self.inputs):
+                self.r[s0] = self.inputs[self.ipos]; self.ipos += 1
+            else:
+                self.r[s0] = 0; self.C = 1
+            m = f"IN r{s0}"
         else:
             raise MachineError(f"undefined opcode {op:#04x} @ {pc0:#04x}")
 
@@ -650,15 +647,28 @@ def asm(src: str) -> bytes:
         raise AssemblyError(f"unknown instruction {name!r} in {text!r}", lineno)
 
     labels, addr = {}, 0
+
+    def enc_checked(it, labels, strict):
+
+        b = enc(it[1], it[2], labels, it[3], it[4], strict)
+        want = ISA.instruction_length(b)
+        if want != len(b):
+            raise AssemblyError(
+                f"assembler emitted {b.hex()} for {it[4]!r}, which the decode table "
+                f"reads as "
+                + ("no assigned instruction" if want is None else f"{want} bytes"),
+                it[3])
+        return b
+
     for it in items:
         if it[0] == "label":
             labels[it[1]] = addr
         else:
-            addr += len(enc(it[1], it[2], labels, it[3], it[4], strict=False))
+            addr += len(enc_checked(it, labels, False))
     out = bytearray()
     for it in items:
         if it[0] != "label":
-            out += enc(it[1], it[2], labels, it[3], it[4], strict=True)
+            out += enc_checked(it, labels, True)
     if len(out) > CODE_SIZE:
         raise AssemblyError(f"assembled code is {len(out)} bytes, above CODE_SIZE {CODE_SIZE}")
     return bytes(out)
