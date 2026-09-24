@@ -66,6 +66,23 @@ S_FAULT_REASON = tl.constexpr(14)
 S_FAULT_ADDR = tl.constexpr(15)
 STATE_ROWS_C = tl.constexpr(STATE_ROWS)
 
+CFG_VEC_COUNT = ISA.LEGACY_VEC_COUNT
+CFG_LEN = ISA.LEGACY_VEC_COUNT + 2
+CFG_WINLO = tl.constexpr(ISA.LEGACY_VEC_COUNT)
+CFG_WINHI = tl.constexpr(ISA.LEGACY_VEC_COUNT + 1)
+CFG_LEN_C = tl.constexpr(CFG_LEN)
+LEGACY_CFG_LO = tl.constexpr(ISA.LEGACY_VEC_BASE)
+LEGACY_CFG_HI = tl.constexpr(ISA.LEGACY_CONFIG_HI)
+
+def _cfg_row(cfg):
+
+    row = [0] * (ISA.LEGACY_VEC_COUNT + 2)
+    if cfg.vec is not None:
+        row[:ISA.LEGACY_VEC_COUNT] = list(cfg.vec)
+    if cfg.has_window:
+        row[CFG_WINLO.value], row[CFG_WINHI.value] = cfg.winlo, cfg.winhi
+    return row
+
 class DecodeTableMismatch(Exception):
 
     pass
@@ -231,7 +248,8 @@ def _name_cause(errc, code):
     return errc
 
 @triton.jit
-def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
+def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC,
+          CFG, CFGVEC: tl.constexpr, CFGWIN: tl.constexpr):
 
     r0 = tl.load(S + 0); r1 = tl.load(S + 1); r2 = tl.load(S + 2); r3 = tl.load(S + 3)
     HL = tl.load(S + 4); DE = tl.load(S + 5); PC = tl.load(S + 6); SP = tl.load(S + 7)
@@ -569,8 +587,12 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                         err = 1
                         errc = _name_cause(errc, F_TRAP_UNREG)
                     else:
-                        tgt = tl.load(CODE + 0x0F00 + 2 * k) \
-                            | (tl.load(CODE + 0x0F00 + 2 * k + 1) << 8)
+                        if CFGVEC:
+
+                            tgt = tl.load(CFG + k)
+                        else:
+                            tgt = tl.load(CODE + 0x0F00 + 2 * k) \
+                                | (tl.load(CODE + 0x0F00 + 2 * k + 1) << 8)
 
                         if tgt == 0:
                             err = 1
@@ -589,9 +611,20 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
                     err = 1
                     errc = _name_cause(errc, F_CODE_OOB)
                 else:
-                    wlo = tl.load(CODE + 0x0F20)
-                    whi = tl.load(CODE + 0x0F21)
-                    if HL < wlo or HL >= whi:
+                    if CFGWIN:
+
+                        wlo = tl.load(CFG + CFG_WINLO)
+                        whi = tl.load(CFG + CFG_WINHI)
+                    else:
+                        wlo = tl.load(CODE + 0x0F20)
+                        whi = tl.load(CODE + 0x0F21)
+
+                    inlegacy = 0
+                    if CFGVEC:
+                        inlegacy = 1
+                        if (HL < LEGACY_CFG_LO) or (HL >= LEGACY_CFG_HI):
+                            inlegacy = 0
+                    if (HL < wlo) or (HL >= whi) or (inlegacy == 1):
                         err = 1
                         errc = _name_cause(errc, F_WINDOW)
                     else:
@@ -761,16 +794,18 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC):
     return RST, RTK
 
 @triton.jit
-def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, BUDGET, CODELEN, INLEN, DS, OC):
+def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, BUDGET, CODELEN, INLEN, DS, OC,
+                    CFG, CFGVEC: tl.constexpr, CFGWIN: tl.constexpr):
 
     BD = tl.load(BUDGET + 0)
-    _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC)
+    _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC,
+          CFG, CFGVEC, CFGWIN)
 
 @triton.jit
 def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BUDGETS,
-                        STEP_LIMIT,
+                        STEP_LIMIT, CFG,
                         CS: tl.constexpr, DS: tl.constexpr, INS: tl.constexpr,
-                        OCS: tl.constexpr):
+                        OCS: tl.constexpr, CFGVEC: tl.constexpr, CFGWIN: tl.constexpr):
 
     pid = tl.program_id(0)
     CP = CODE + pid * CS
@@ -778,6 +813,7 @@ def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BU
     IP = INPUTS + pid * INS
     OP = OUTBUF + pid * OCS
     ST = STATES + pid * STATE_ROWS_C
+    CF = CFG + pid * CFG_LEN_C
     CL = tl.load(CODELENS + pid)
     IL = tl.load(INLENS + pid)
     BD = tl.load(BUDGETS + pid)
@@ -785,7 +821,7 @@ def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BU
     tk = tl.load(ST + 12)
     n = 0
     while (st == 0) & ((STEP_LIMIT <= 0) | (n < STEP_LIMIT)):
-        st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, BD, DS, OCS)
+        st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, BD, DS, OCS, CF, CFGVEC, CFGWIN)
         n += 1
 
 class BatchResult(NamedTuple):
@@ -797,12 +833,30 @@ class BatchResult(NamedTuple):
 
 class TritonBatch:
 
-    def __init__(self, n, device="cuda", max_in=1, tick_budget=200_000, num_warps=1):
+    def __init__(self, n, device="cuda", max_in=1, tick_budget=ISA.TICK_BUDGET_DEFAULT,
+                 num_warps=1, out_cap=OUT_CAP, config=None):
         if n < 1:
             raise ValueError("batch size must be >= 1")
+        cfg = ISA.MachineConfig() if config is None else config
+        if config is not None and not isinstance(config, ISA.MachineConfig):
+            raise ISA.ConfigError(
+                f"config must be an isa_table.MachineConfig, got a "
+                f"{type(config).__name__}: configuration is validated at load, and a "
+                f"mapping or tuple would arrive unchecked")
+        if cfg.codelen is not None:
+            raise ISA.ConfigError(
+                f"CODELEN={cfg.codelen} cannot be declared for a batch: each row's "
+                f"instruction bound is the length of the program set_program loaded "
+                f"into it, so one number for all {n} rows would describe {n} machines "
+                f"that are not this batch")
         self.dev = torch.device(device)
         self.n = n
-        self.out_cap = OUT_CAP
+        self.config = cfg
+        self.out_cap = ISA.resolve_constraint("OUTCAP", "out_cap", out_cap, OUT_CAP,
+                                              cfg.outcap)
+        ISA.check_capacity(self.out_cap, OUT_CAP)
+        self.nbanks = 1 if cfg.nbanks is None else cfg.nbanks
+        self.tdlim = 0 if cfg.tdlim is None else cfg.tdlim
         self.max_in = max(1, int(max_in))
         self.num_warps = num_warps
         i32 = torch.int32
@@ -814,7 +868,12 @@ class TritonBatch:
         self.STATE[:, 7] = DATA_SIZE
         self.CODELENS = torch.zeros(n, dtype=i32, device=self.dev)
         self.INLENS = torch.zeros(n, dtype=i32, device=self.dev)
-        self.BUDGETS = torch.full((n,), int(tick_budget), dtype=i32, device=self.dev)
+        tb = ISA.resolve_constraint("TICKBUDGET", "tick_budget", int(tick_budget),
+                                    ISA.TICK_BUDGET_DEFAULT, cfg.tickbudget)
+        self.BUDGETS = torch.full((n,), int(tb), dtype=i32, device=self.dev)
+
+        self.CFG = torch.tensor([_cfg_row(cfg) for _ in range(n)], dtype=i32,
+                                device=self.dev)
 
     def _row(self, i):
 
@@ -889,8 +948,9 @@ class TritonBatch:
     def _launch(self, step_limit):
         ncp_resident_kernel[(self.n,)](
             self.CODE, self.DATA, self.INPUTS, self.OUTBUF, self.STATE,
-            self.CODELENS, self.INLENS, self.BUDGETS, step_limit,
+            self.CODELENS, self.INLENS, self.BUDGETS, step_limit, self.CFG,
             CS=CODE_SIZE, DS=DATA_SIZE, INS=self.max_in, OCS=self.out_cap,
+            CFGVEC=self.config.has_vec, CFGWIN=self.config.has_window,
             num_warps=self.num_warps)
 
     def results(self):
@@ -967,15 +1027,38 @@ def run_batch(codes, datas=None, inputs=None, budgets=None, states=None,
 
 class TritonCircuit:
 
-    def __init__(self, code, data=None, inputs=b"", tick_budget=200_000, device="cuda"):
+    def __init__(self, code, data=None, inputs=b"",
+                 tick_budget=ISA.TICK_BUDGET_DEFAULT, device="cuda",
+                 out_cap=OUT_CAP, config=None):
+
         if len(code) > CODE_SIZE:
             raise ValueError(f"code image is {len(code)} bytes, above CODE_SIZE {CODE_SIZE}")
         if data and len(data) > DATA_SIZE:
             raise ValueError(f"data image is {len(data)} bytes, above DATA_SIZE {DATA_SIZE}")
+        cfg = ISA.MachineConfig() if config is None else config
+        if config is not None and not isinstance(config, ISA.MachineConfig):
+            raise ISA.ConfigError(
+                f"config must be an isa_table.MachineConfig, got a "
+                f"{type(config).__name__}: configuration is validated at load, and a "
+                f"mapping or tuple would arrive unchecked")
+        self.config = cfg
         dev = torch.device(device)
         self.dev = dev
         i32 = torch.int32
-        self.codelen = len(code)
+        self.codelen = len(code) if cfg.codelen is None else cfg.codelen
+        if self.codelen > CODE_SIZE:
+            raise ISA.ConfigError(
+                f"CODELEN={self.codelen} is past the {CODE_SIZE}-byte CODE buffer this "
+                f"machine allocates: the bound has to name storage that exists")
+        if self.codelen > len(code):
+            raise ISA.ConfigError(
+                f"CODELEN={self.codelen} is past the end of the {len(code)}-byte "
+                f"image: the machine would fetch bytes that were never loaded")
+        self.out_cap = ISA.resolve_constraint("OUTCAP", "out_cap", out_cap, OUT_CAP,
+                                              cfg.outcap)
+        ISA.check_capacity(self.out_cap, OUT_CAP)
+        self.nbanks = 1 if cfg.nbanks is None else cfg.nbanks
+        self.tdlim = 0 if cfg.tdlim is None else cfg.tdlim
         self.CODE = torch.zeros(max(1, CODE_SIZE), dtype=i32, device=dev)
         self.CODE[: len(code)] = torch.tensor(list(code), dtype=i32, device=dev)
         self.DATA = torch.zeros(DATA_SIZE, dtype=i32, device=dev)
@@ -983,11 +1066,19 @@ class TritonCircuit:
             self.DATA[: len(data)] = torch.tensor(list(data), dtype=i32, device=dev)
         self.INP = torch.tensor(list(inputs) if inputs else [0], dtype=i32, device=dev)
         self.inlen = len(inputs)
-        self.OUTBUF = torch.zeros(OUT_CAP, dtype=i32, device=dev)
+        self.OUTBUF = torch.zeros(self.out_cap, dtype=i32, device=dev)
         self.S = torch.zeros(STATE_ROWS, dtype=i32, device=dev)
         self.S[7] = DATA_SIZE
-        self.BUDGET = torch.tensor([int(tick_budget)], dtype=i32, device=dev)
-        self.tb = int(tick_budget)
+        self.BUDGET = torch.tensor(
+            [ISA.resolve_constraint("TICKBUDGET", "tick_budget", int(tick_budget),
+                                    ISA.TICK_BUDGET_DEFAULT, cfg.tickbudget)],
+            dtype=i32, device=dev)
+        self.tb = int(self.BUDGET.item())
+
+        self.CFG = torch.tensor(_cfg_row(cfg), dtype=i32, device=dev)
+        self.cfg_vec = None if cfg.vec is None else self.CFG[:ISA.LEGACY_VEC_COUNT]
+        self.cfg_win = (None if not cfg.has_window
+                        else self.CFG[ISA.LEGACY_VEC_COUNT:])
 
     def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0, fault_reason=None,
                    fault_addr=None):
@@ -1005,7 +1096,9 @@ class TritonCircuit:
 
     def step(self):
         ncp_step_kernel[(1,)](self.CODE, self.DATA, self.INP, self.OUTBUF, self.S,
-                              self.BUDGET, self.codelen, self.inlen, DATA_SIZE, OUT_CAP)
+                              self.BUDGET, self.codelen, self.inlen, DATA_SIZE,
+                              self.out_cap, self.CFG,
+                              CFGVEC=self.config.has_vec, CFGWIN=self.config.has_window)
 
     @property
     def status(self):
@@ -1047,7 +1140,12 @@ class TritonCircuit:
 
     def run_resident(self):
 
-        b = TritonBatch(1, device=self.dev, max_in=max(1, int(self.INP.numel())))
+        cfg = self.config
+        if cfg.codelen is not None:
+            cfg = ISA.MachineConfig(**{n: getattr(cfg, n) for n in cfg.__slots__
+                                       if n != "codelen"})
+        b = TritonBatch(1, device=self.dev, max_in=max(1, int(self.INP.numel())),
+                        out_cap=self.out_cap, config=cfg)
         b.CODE[0].copy_(self.CODE)
         b.CODELENS[0] = self.codelen
         b.DATA[0].copy_(self.DATA)

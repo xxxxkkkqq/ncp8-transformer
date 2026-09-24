@@ -673,8 +673,12 @@ def benchmark(reps=5):
     assert out[0] == res.outs[0], "the two paths disagree on the workload output"
 
     print()
+    free, total_mem = torch.cuda.mem_get_info()
     print(f"benchmark: {n} machines, {total_ticks} ticks total (same workload both times), "
           f"best of {reps} runs, fresh state per run")
+    print(f"  device state: {free / (1 << 20):,.0f} MiB of "
+          f"{total_mem // (1 << 20):,} MiB free; rates below are unguarded against "
+          f"co-runners and are a comparison inside this run, not a throughput claim")
     print(f"  old per-tick path : {n} sequential machines, {total_ticks} launches, "
           f"{best_old * 1e3:9.3f} ms -> {total_ticks / best_old:14,.0f} ticks/s")
     print(f"  resident batch    : one launch for all {n} machines, "

@@ -312,7 +312,7 @@ if __name__ == "__main__":
         got, want, _ = run_long_add(a, b)
         require(got == want, f"long_add trial {trial}: {a} + {b} gave {got}, expected {want}")
         ok += 1
-    print(f"long_add: {ok} random long additions byte-exact ")
+    print(f"long_add: {ok} random long additionsbyte for bytematch ")
 
     for k in range(47):
         got, want, _ = run_fib(k)
@@ -322,7 +322,7 @@ if __name__ == "__main__":
     for n in [0, 1, 2, 7, 23, 100, 200, 255]:
         got, want, sim = run_sumrec(n)
         require(got == want, f"sumrec({n}) gave {got}, expected {want}")
-        require(sim.snapshot()["SP"] == 4096, f"n={n} stack not restored: {sim.snapshot()}")
+        require(sim.snapshot()["SP"] == 4096, f"n={n} stacknot restored: {sim.snapshot()}")
     print("sumrec: recursion bounds/depth/stack balance all match")
 
     for _ in range(200):

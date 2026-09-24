@@ -84,10 +84,25 @@ def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
         raise ValueError(bad)
 
 class NCP8:
-    def __init__(self, code, data=None, inputs=b"", tick_budget=200_000):
+    def __init__(self, code, data=None, inputs=b"", tick_budget=ISA.TICK_BUDGET_DEFAULT,
+                 out_cap=OUT_CAP, config=None):
+
         if len(code) > CODE_SIZE:
             raise ValueError(f"code image is {len(code)} bytes, above CODE_SIZE {CODE_SIZE}")
+        cfg = ISA.MachineConfig() if config is None else config
+        if config is not None and not isinstance(config, ISA.MachineConfig):
+            raise ISA.ConfigError(
+                f"config must be an isa_table.MachineConfig, got a "
+                f"{type(config).__name__}: configuration is validated at load, and a "
+                f"mapping or tuple would arrive unchecked")
+        self.config = cfg
         self.code = bytes(code)
+
+        self.codelen = len(self.code) if cfg.codelen is None else cfg.codelen
+        if self.codelen > len(self.code):
+            raise ISA.ConfigError(
+                f"CODELEN={self.codelen} is past the end of the {len(self.code)}-byte "
+                f"image: the machine would fetch bytes that were never loaded")
         self.data = bytearray(DATA_SIZE)
         if data:
             if len(data) > DATA_SIZE:
@@ -103,9 +118,17 @@ class NCP8:
         self.inputs = bytes(inputs)
         self.ipos = 0
         self.out = bytearray()
-        self.out_cap = OUT_CAP
+        self.out_buf_width = OUT_CAP
+        self.out_cap = ISA.resolve_constraint("OUTCAP", "out_cap", out_cap, OUT_CAP,
+                                              cfg.outcap)
+        ISA.check_capacity(self.out_cap, self.out_buf_width)
         self.tick = 0
-        self.tb = tick_budget
+        self.tb = ISA.resolve_constraint("TICKBUDGET", "tick_budget",
+                                         int(tick_budget), ISA.TICK_BUDGET_DEFAULT,
+                                         cfg.tickbudget)
+
+        self.nbanks = 1 if cfg.nbanks is None else cfg.nbanks
+        self.tdlim = 0 if cfg.tdlim is None else cfg.tdlim
         self.status = STATUS_RUNNING
 
         self.fault_reason = CAUSE["OK"]
@@ -139,11 +162,31 @@ class NCP8:
         return addr
 
     def _fetch(self, n):
-        if self.PC + n > len(self.code):
+        if self.PC + n > self.codelen:
             self._fault(CAUSE["FETCH_OOB"], f"PC out of range: {self.PC}")
         b = self.code[self.PC: self.PC + n]
         self.PC += n
         return b
+
+    def _window(self):
+
+        cfg = self.config
+        if cfg.has_window:
+            return cfg.winlo, cfg.winhi, True
+        WLO, WHI = 0x0F20, 0x0F21
+        wl = self.code[WLO] if WLO < len(self.code) else 0
+        wh = self.code[WHI] if WHI < len(self.code) else 0
+        return wl, wh, False
+
+    def _vector(self, k):
+
+        cfg = self.config
+        if cfg.has_vec:
+            return cfg.vector(k)
+        a = 0x0F00 + 2 * k
+        if a + 1 < len(self.code):
+            return (self.code[a + 1] << 8) | self.code[a]
+        return 0
 
     def _stack_room(self, n):
 
@@ -386,16 +429,20 @@ class NCP8:
         elif sel == "XCHG":
             self.HL, self.DE = self.DE, self.HL; m = "XCHG HL, DE"
         elif sel == "LDC":
-            if not 0 <= self.HL < len(self.code):
+            if not 0 <= self.HL < self.codelen:
                 self._fault(CAUSE["CODE_OOB"], f"LDC out of range {self.HL} @ {pc0:#04x}")
             self.r[s0] = self.code[self.HL]; m = f"LDC r{s0}, [HL]"
         elif sel == "STC":
 
-            WLO, WHI = 0x0F20, 0x0F21
-            wl = self.code[WLO] if WLO < len(self.code) else 0
-            wh = self.code[WHI] if WHI < len(self.code) else 0
-            if not 0 <= self.HL < len(self.code):
+            wl, wh, from_cfg = self._window()
+            if not 0 <= self.HL < self.codelen:
                 self._fault(CAUSE["CODE_OOB"], f"STC out of range {self.HL} @ {pc0:#04x}")
+            if self.config.has_vec and ISA.LEGACY_VEC_BASE <= self.HL < ISA.LEGACY_CONFIG_HI:
+
+                self._fault(CAUSE["WINDOW"],
+                    f"WINDOW: STC target {self.HL:#06x} is a legacy configuration cell this build treats as a constraint "
+                    f"[{ISA.LEGACY_VEC_BASE:#06x},{ISA.LEGACY_CONFIG_HI:#06x}), "
+                    f"unrelated to this machine's window declaration @ {pc0:#04x}")
             if not (wl <= self.HL < wh):
                 self._fault(CAUSE["WINDOW"],
                     f"STC outside window {self.HL:#x} not in [{wl:#x},{wh:#x}) @ {pc0:#04x}")
@@ -409,10 +456,7 @@ class NCP8:
             k = imm[0]
             if k >= 16:
                 self._fault(CAUSE["TRAP_UNREG"], f"EXT k out of range {k} @ {pc0:#04x}")
-            a = 0x0F00 + 2 * k
-            tgt = 0
-            if a + 1 < len(self.code):
-                tgt = (self.code[a + 1] << 8) | self.code[a]
+            tgt = self._vector(k)
             if tgt == 0:
                 self._fault(CAUSE["TRAP_UNREG"], f"EXT handler {k} unregistered @ {pc0:#04x}")
             self._stack_room(2)
@@ -482,8 +526,9 @@ class NCP8:
     def snapshot(self):
 
         return dict(r=list(self.r), HL=self.HL, DE=self.DE, SP=self.SP, PC=self.PC,
-                    C=self.C, Z=self.Z, tick=self.tick, status=self.status,
-                    fault_reason=self.fault_reason, fault_addr=self.fault_addr)
+                    C=self.C, Z=self.Z, ipos=self.ipos, tick=self.tick,
+                    status=self.status, fault_reason=self.fault_reason,
+                    fault_addr=self.fault_addr)
 
     def status_code(self):
 

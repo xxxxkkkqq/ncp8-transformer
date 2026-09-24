@@ -17,6 +17,7 @@ from __future__ import annotations
 import re
 
 import disasm
+import isa_table as ISA
 from golden_sim import AssemblyError, CODE_SIZE, asm
 
 VEC_BASE = 0x0F00
@@ -599,6 +600,22 @@ class LoadResult:
 
         from golden_sim import NCP8
         return NCP8(self.image, **kw)
+
+    def config(self):
+
+        if self.window is None:
+            winlo = winhi = None
+        else:
+            winlo, winhi = self.window
+            if winlo > 0xFF or winhi > 0xFF:
+                raise ISA.ConfigError(
+                    f"window [0x{winlo:04X},0x{winhi:04X}) cannot be converted to a "
+                    f"configuration block from this image: the CODE cells the loader "
+                    f"writes are 8-bit, so the conversion would truncate a bound and "
+                    f"declare a different machine than this load placed")
+        vec = dict(self.vectors) if self.vectors else None
+        return ISA.MachineConfig(codelen=len(self.image), winlo=winlo, winhi=winhi,
+                                 vec=vec)
 
 def _next_pow2(v):
     if v <= 1:
