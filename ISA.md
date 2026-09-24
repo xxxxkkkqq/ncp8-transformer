@@ -229,6 +229,32 @@ conventions are therefore not interchangeable, and `PUSHW` pairs only with
 Every subcode not listed above is reserved and raises an atomic error, as does
 any single-byte opcode not listed in 4.1-4.5.
 
+### 4.7 Encodings that carry more bits than they use
+
+Three assigned encodings have an operand byte with bits the decoder does not read, and the
+disassembler marks them non-canonical: `ADDI HL, r` and `ADDI DE, r` take the register index
+from the low two bits of their operand byte (252 of its 256 values each), and `EXT k` is
+canonical only for a `k` inside the declared trap vector table (240 values are not). Those two
+cases are not the same kind of thing, and the machine treats them differently.
+
+For `ADDI HL` and `ADDI DE` the remaining bits are don't-care: `11 04` and `11 00` add the same
+register, set the same flags and advance the same way. That is measured on all four
+implementations for every operand value that leaves the rendered instruction unchanged, not
+assumed, and executing such an instruction leaves the byte as it was loaded -- the machine reads
+`CODE`, it does not canonicalise it.
+
+For `EXT k` the high bits are not don't-care: they select a vector, and an index outside the
+declared table is a fault (`TRAP_UNREG`) rather than a different register. The disassembler
+prints those encodings as `EXT k` with `k` past the table and the assembler refuses to emit them,
+so a program containing `EXT 16` can be loaded and run today but cannot be produced from source.
+That is an open gap in the toolchain, not a property of the machine: the encoding is assigned,
+the bytes mean what they mean, and the fault is the machine's own answer to an unregistered
+vector.
+
+Programs are compared between implementations by the bytes in `CODE` and what each tick commits,
+so two images that differ only in the unread bits of an alias are different images; narrowing an
+alias to its canonical form is a toolchain decision, and no execution path makes it.
+
 ## 5. Load-time configuration
 
 The bounds that describe a machine rather than a program are handed in beside the
