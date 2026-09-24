@@ -2,8 +2,12 @@
 
 Two-pass assembler front end adding what `golden_sim.asm` does not do: directives
 (`.org`, `.byte`, `.word`, `.ascii`, `.equ`), an expression parser for absolute and
-symbol-relative operands, a symbol table, and the load-time metadata the machine reads
-but cannot write - trap vector entries and the self-modification window bounds.
+symbol-relative operands, a symbol table, and the configuration the machine obeys but
+cannot write - the trap vector entries, the self-modification window bounds, and the
+length of the placed content. A declaration costs no byte of the image: `vectors=` and
+`window=` are handed to the machine beside it, `config()` builds the block, and every
+address in the image is program content. `entry=` states where the load's `main` is;
+the machine boots at CODE[0], so a program that starts elsewhere says so with a jump.
 
 Every refusal is a `LoaderError`, which is deliberately not a `MachineError`: a program
 that never assembled must not be catchable by a handler written for a program that ran
@@ -20,18 +24,8 @@ import disasm
 import isa_table as ISA
 from golden_sim import AssemblyError, CODE_SIZE, asm
 
-VEC_BASE = 0x0F00
-VEC_COUNT = 16
-VEC_LAST_CELL = VEC_BASE + 2 * (VEC_COUNT - 1)
-VEC_TABLE_END = VEC_BASE + 2 * VEC_COUNT
-WINDOW_LO_CELL = 0x0F20
-WINDOW_HI_CELL = 0x0F21
-
-MIN_IMAGE_FOR_VECTORS = VEC_BASE + 2
-MIN_IMAGE_FOR_WINDOW = WINDOW_HI_CELL + 1
-MIN_IMAGE_FOR_ABI = MIN_IMAGE_FOR_WINDOW
-
-PROTECTED_LO, PROTECTED_HI = VEC_BASE, WINDOW_HI_CELL + 1
+VEC_COUNT = ISA.VEC_COUNT
+BOUND_BITS = 16
 
 class LoaderError(AssemblyError):
 
@@ -599,6 +593,7 @@ class LoadResult:
     def to_machine(self, **kw):
 
         from golden_sim import NCP8
+        kw.setdefault("config", self.config())
         return NCP8(self.image, **kw)
 
     def config(self):
@@ -607,14 +602,9 @@ class LoadResult:
             winlo = winhi = None
         else:
             winlo, winhi = self.window
-            if winlo > 0xFF or winhi > 0xFF:
-                raise ISA.ConfigError(
-                    f"window [0x{winlo:04X},0x{winhi:04X}) cannot be converted to a "
-                    f"configuration block from this image: the CODE cells the loader "
-                    f"writes are 8-bit, so the conversion would truncate a bound and "
-                    f"declare a different machine than this load placed")
         vec = dict(self.vectors) if self.vectors else None
-        return ISA.MachineConfig(codelen=len(self.image), winlo=winlo, winhi=winhi,
+
+        return ISA.MachineConfig(codelen=self.content_extent, winlo=winlo, winhi=winhi,
                                  vec=vec)
 
 def _next_pow2(v):
@@ -622,16 +612,9 @@ def _next_pow2(v):
         return 1
     return 1 << (v - 1).bit_length()
 
-def abi_needed(vectors=None, window=None, content_extent=1):
+def image_needed(content_extent=1):
 
-    need = max(int(content_extent), 1)
-    if vectors:
-        for k in vectors:
-            _checked_int(k, "vector index", 0, VEC_COUNT - 1)
-        need = max(need, VEC_BASE + 2 * (max(vectors) + 1))
-    if window is not None:
-        need = max(need, MIN_IMAGE_FOR_WINDOW)
-    return need
+    return max(int(content_extent), 1)
 
 def assemble(src, *, vectors=None, window=None, image=None, entry=None):
 
@@ -777,21 +760,17 @@ def assemble(src, *, vectors=None, window=None, image=None, entry=None):
     content_extent = hi_water
     for k in sorted(vectors):
         _checked_int(k, "vector index", 0, VEC_COUNT - 1)
-    needed = abi_needed(vectors, window, content_extent)
+    needed = image_needed(content_extent)
 
     if image is not None:
         _checked_int(image, "image length", 1, CODE_SIZE)
         length = image
         if length < needed:
-            raise LoaderError(_short_image_message(length, needed, content_extent,
-                                                   vectors, window), None)
+            raise LoaderError(_short_image_message(length, needed, content_extent), None)
     else:
-        floor = needed
-        if vectors or window is not None:
-            floor = max(floor, MIN_IMAGE_FOR_ABI)
-        length = _next_pow2(floor)
+        length = _next_pow2(needed)
         if length > CODE_SIZE:
-            raise LoaderError(f"content needs {floor} bytes, so the image would be "
+            raise LoaderError(f"content needs {needed} bytes, so the image would be "
                               f"{length}, above CODE_SIZE {CODE_SIZE}")
     if length > CODE_SIZE:
         raise LoaderError(f"image length {length} is above CODE_SIZE {CODE_SIZE}")
@@ -804,65 +783,33 @@ def assemble(src, *, vectors=None, window=None, image=None, entry=None):
         image_bytes[a] = out[a]
 
     placed_vectors = {}
+    declarations = []
     for k in sorted(vectors):
-        tgt = _resolve(vectors[k], symbols, f"vector {k} target", 0, 0xFFFF)
-        cell = VEC_BASE + 2 * k
-        if cell + 1 >= length:
-            raise LoaderError(
-                f"vector {k} lives at 0x{cell:04X}..0x{cell + 1:04X} but the image is "
-                f"{length} bytes, so the reference never reads it: EXT {k} would report "
-                f"'handler {k} unregistered' however this cell is written "
-                f"(needs at least {cell + 2} bytes)", None)
-        for a in (cell, cell + 1):
-            if a in out:
-                raise LoaderError(f"vector {k} would overwrite a byte already placed at "
-                                  f"0x{a:04X} ({origins[a]})", None)
+        tgt = _resolve(vectors[k], symbols, f"vector {k} target", 0, (1 << BOUND_BITS) - 1)
         if tgt == 0:
             raise LoaderError(
-                f"vector {k} targets address 0, which the reference reads as 'handler {k} "
-                f"not registered', so the trap fails instead of running anything. Point it "
-                f"at a handler, or if the unregistered entry is intended write it as a "
-                f"literal: .org 0x{cell:04X} / .word 0", None)
-        if tgt >= length:
+                f"vector {k} targets address 0, which the machine reads as 'handler {k} "
+                f"not registered', so the trap faults instead of running anything. Point it "
+                f"at a handler, or leave {k} out of the table to declare it unregistered.",
+                None)
+        if tgt >= content_extent:
             raise LoaderError(f"vector {k} targets 0x{tgt:04X}, past the end of the "
-                              f"{length}-byte image: the handler's first fetch would fault "
-                              f"as an out-of-range PC instead of running", None)
-        image_bytes[cell] = tgt & 0xFF
-        image_bytes[cell + 1] = tgt >> 8
-        origins[cell] = origins[cell + 1] = f"vector {k} -> 0x{tgt:04X}"
+                              f"{content_extent}-byte content: the handler's first fetch "
+                              f"would fault as an out-of-range PC instead of running", None)
         placed_vectors[k] = tgt
-        blocks.append(("vector", cell, 2, None, f"vector {k} -> 0x{tgt:04X}"))
+        declarations.append(f"vector {k} -> 0x{tgt:04X}")
 
     placed_window = None
     if window is not None:
-        lo = _resolve(window[0], symbols, "window lo", 0, 0xFF)
-        hi = _resolve(window[1], symbols, "window hi", 0, 0xFF)
+        lo = _resolve(window[0], symbols, "window lo", 0, (1 << BOUND_BITS) - 1)
+        hi = _resolve(window[1], symbols, "window hi", 0, (1 << BOUND_BITS) - 1)
         if hi < lo:
-            raise LoaderError(f"window bounds are reversed: lo=0x{lo:02X} hi=0x{hi:02X}",
-                              None)
-        if WINDOW_HI_CELL >= length:
-            raise LoaderError(
-                f"the window bounds live at 0x{WINDOW_LO_CELL:04X}..0x{WINDOW_HI_CELL:04X} "
-                f"but the image is {length} bytes, so the reference sees an undeclared "
-                f"[0x0000,0x0000) window and every STC faults as 'outside window' "
-                f"(needs at least {MIN_IMAGE_FOR_WINDOW} bytes)", None)
-
-        if not (hi <= PROTECTED_LO or lo >= PROTECTED_HI):
-            raise LoaderError(
-                f"window [0x{lo:04X}, 0x{hi:04X}) overlaps the protected read-only cells "
-                f"[0x{PROTECTED_LO:04X}, 0x{PROTECTED_HI:04X}): STC could rewrite a trap "
-                f"vector or the window bounds themselves", None)
-        for cell, which in ((WINDOW_LO_CELL, "lo"), (WINDOW_HI_CELL, "hi")):
-            if cell in out:
-                raise LoaderError(f"window {which} would overwrite a byte already placed "
-                                  f"at 0x{cell:04X} ({origins[cell]})", None)
-        image_bytes[WINDOW_LO_CELL] = lo
-        image_bytes[WINDOW_HI_CELL] = hi
-        origins[WINDOW_LO_CELL] = f"window lo -> 0x{lo:04X}"
-        origins[WINDOW_HI_CELL] = f"window hi -> 0x{hi:04X}"
+            raise LoaderError(f"window bounds are reversed: lo=0x{lo:04X} hi=0x{hi:04X}. "
+                              f"A reversed span is refused here rather than loaded as the "
+                              f"empty window, because the empty window is a declaration "
+                              f"meaning 'no STC writes anything'", None)
         placed_window = (lo, hi)
-        blocks.append(("window", WINDOW_LO_CELL, 2, None,
-                       f"window [0x{lo:04X}, 0x{hi:04X})"))
+        declarations.append(f"window [0x{lo:04X}, 0x{hi:04X})")
 
     if entry is None:
         entry_explicit = False
@@ -870,48 +817,46 @@ def assemble(src, *, vectors=None, window=None, image=None, entry=None):
     else:
         entry_explicit = True
         entry = _resolve(entry, symbols, "entry", 0, 0xFFFF)
-        if entry >= length:
-            raise LoaderError(f"entry 0x{entry:04X} is past the end of the {length}-byte "
-                              f"image", None)
+        if entry >= content_extent:
+            raise LoaderError(f"entry 0x{entry:04X} is past the end of the "
+                              f"{content_extent}-byte content: padding past the content is "
+                              f"a buffer, not a place to start", None)
 
     rep = [f"image: {length} bytes "
            + ("(length requested exactly)" if image is not None
               else f"(default: smallest power of two covering the needed "
-                   f"{needed} bytes"
-                   + (", ABI floor 0x0F22 because tables are declared"
-                      if (vectors or window is not None) else "") + ")")]
+                   f"{needed} bytes)")]
     rep.append(f"content: {content_extent} bytes of code/data, needing "
-               f"{needed} bytes with the declared tables")
+               f"{needed} bytes")
+    rep.append(f"configuration: {len(placed_vectors)} trap vector(s), "
+               + ("no window declared, so no STC writes" if placed_window is None
+                  else f"window [0x{placed_window[0]:04X}, 0x{placed_window[1]:04X})")
+               + "; none of it is a byte of the image")
     for kind, addr, size, lineno, text in blocks:
         where = f"line {lineno}" if lineno is not None else "declared by argument"
         rep.append(f"{kind:5s} 0x{addr:04X} {size:3d}B  {text}   [{where}]")
+    for text in declarations:
+        rep.append(f"decl  ---- ----  {text}   [declared by argument]")
     rep.append(f"entry: 0x{entry:04X} "
                + ("(given)" if entry_explicit else
                   ("(symbol main)" if "main" in symbols else
-                   "(no entry given and no symbol main: the load address 0)")))
+                   "(no entry given and no symbol main: the load address 0)"))
+               + (" - where this load's `main` is, not where the machine starts: every "
+                  "path boots at CODE[0] until a start address is configuration"
+                  if entry else ""))
     rep.append(f"symbols: {len(symbols.flat())}")
     for name in sorted(symbols.flat()):
         rep.append(f"        {name:16s} 0x{symbols.value(name):04X} ({symbols.kind_of(name)})")
     return LoadResult(image_bytes, symbols.as_dict(), entry, rep, placed_vectors,
                       placed_window, origins, entry_explicit, content_extent, needed)
 
-def _short_image_message(length, needed, content_extent, vectors, window):
+def _short_image_message(length, needed, content_extent):
 
     parts = [f"image length {length} bytes is too short for this program"]
-    why = []
     if content_extent > length:
-        why.append(f"the code/data itself reaches 0x{content_extent - 1:04X}")
-    for k in sorted(vectors):
-        cell = VEC_BASE + 2 * k
-        if cell + 1 >= length:
-            why.append(f"vector {k} at 0x{cell:04X}..0x{cell + 1:04X} would be unreadable,"
-                       f" so EXT {k} faults as 'handler {k} unregistered'")
-    if window is not None and WINDOW_HI_CELL >= length:
-        why.append(f"the window bounds at 0x{WINDOW_LO_CELL:04X}..0x{WINDOW_HI_CELL:04X}"
-                   f" would be unreadable, so every STC faults as 'outside window'")
-    if not why:
-        why.append(f"the declared tables need {needed} bytes")
-    return "; ".join(parts + why + [f"needs at least {needed} bytes"])
+        parts.append(f"the code/data itself reaches 0x{content_extent - 1:04X}")
+    parts.append(f"needs at least {needed} bytes")
+    return "; ".join(parts)
 
 def describe(result):
 

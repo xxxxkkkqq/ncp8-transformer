@@ -66,21 +66,15 @@ S_FAULT_REASON = tl.constexpr(14)
 S_FAULT_ADDR = tl.constexpr(15)
 STATE_ROWS_C = tl.constexpr(STATE_ROWS)
 
-CFG_VEC_COUNT = ISA.LEGACY_VEC_COUNT
-CFG_LEN = ISA.LEGACY_VEC_COUNT + 2
-CFG_WINLO = tl.constexpr(ISA.LEGACY_VEC_COUNT)
-CFG_WINHI = tl.constexpr(ISA.LEGACY_VEC_COUNT + 1)
+CFG_VEC_COUNT = tl.constexpr(ISA.VEC_COUNT)
+CFG_LEN = ISA.VEC_COUNT + 2
+CFG_WINLO = tl.constexpr(ISA.VEC_COUNT)
+CFG_WINHI = tl.constexpr(ISA.VEC_COUNT + 1)
 CFG_LEN_C = tl.constexpr(CFG_LEN)
-LEGACY_CFG_LO = tl.constexpr(ISA.LEGACY_VEC_BASE)
-LEGACY_CFG_HI = tl.constexpr(ISA.LEGACY_CONFIG_HI)
 
 def _cfg_row(cfg):
 
-    row = [0] * (ISA.LEGACY_VEC_COUNT + 2)
-    if cfg.vec is not None:
-        row[:ISA.LEGACY_VEC_COUNT] = list(cfg.vec)
-    if cfg.has_window:
-        row[CFG_WINLO.value], row[CFG_WINHI.value] = cfg.winlo, cfg.winhi
+    row = list(cfg.vectors()) + [cfg.window()[0], cfg.window()[1]]
     return row
 
 class DecodeTableMismatch(Exception):
@@ -249,7 +243,7 @@ def _name_cause(errc, code):
 
 @triton.jit
 def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC,
-          CFG, CFGVEC: tl.constexpr, CFGWIN: tl.constexpr):
+          CFG):
 
     r0 = tl.load(S + 0); r1 = tl.load(S + 1); r2 = tl.load(S + 2); r3 = tl.load(S + 3)
     HL = tl.load(S + 4); DE = tl.load(S + 5); PC = tl.load(S + 6); SP = tl.load(S + 7)
@@ -583,16 +577,12 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC,
                     errc = _name_cause(errc, F_FETCH_OOB)
                 else:
                     k = tl.load(CODE + PC + 2)
-                    if k >= 16:
+                    if k >= CFG_VEC_COUNT:
                         err = 1
                         errc = _name_cause(errc, F_TRAP_UNREG)
                     else:
-                        if CFGVEC:
 
-                            tgt = tl.load(CFG + k)
-                        else:
-                            tgt = tl.load(CODE + 0x0F00 + 2 * k) \
-                                | (tl.load(CODE + 0x0F00 + 2 * k + 1) << 8)
+                        tgt = tl.load(CFG + k)
 
                         if tgt == 0:
                             err = 1
@@ -611,20 +601,9 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC,
                     err = 1
                     errc = _name_cause(errc, F_CODE_OOB)
                 else:
-                    if CFGWIN:
-
-                        wlo = tl.load(CFG + CFG_WINLO)
-                        whi = tl.load(CFG + CFG_WINHI)
-                    else:
-                        wlo = tl.load(CODE + 0x0F20)
-                        whi = tl.load(CODE + 0x0F21)
-
-                    inlegacy = 0
-                    if CFGVEC:
-                        inlegacy = 1
-                        if (HL < LEGACY_CFG_LO) or (HL >= LEGACY_CFG_HI):
-                            inlegacy = 0
-                    if (HL < wlo) or (HL >= whi) or (inlegacy == 1):
+                    wlo = tl.load(CFG + CFG_WINLO)
+                    whi = tl.load(CFG + CFG_WINHI)
+                    if (HL < wlo) or (HL >= whi):
                         err = 1
                         errc = _name_cause(errc, F_WINDOW)
                     else:
@@ -795,17 +774,16 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC,
 
 @triton.jit
 def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, BUDGET, CODELEN, INLEN, DS, OC,
-                    CFG, CFGVEC: tl.constexpr, CFGWIN: tl.constexpr):
+                    CFG):
 
     BD = tl.load(BUDGET + 0)
-    _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC,
-          CFG, CFGVEC, CFGWIN)
+    _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG)
 
 @triton.jit
 def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BUDGETS,
                         STEP_LIMIT, CFG,
                         CS: tl.constexpr, DS: tl.constexpr, INS: tl.constexpr,
-                        OCS: tl.constexpr, CFGVEC: tl.constexpr, CFGWIN: tl.constexpr):
+                        OCS: tl.constexpr):
 
     pid = tl.program_id(0)
     CP = CODE + pid * CS
@@ -821,7 +799,7 @@ def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BU
     tk = tl.load(ST + 12)
     n = 0
     while (st == 0) & ((STEP_LIMIT <= 0) | (n < STEP_LIMIT)):
-        st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, BD, DS, OCS, CF, CFGVEC, CFGWIN)
+        st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, BD, DS, OCS, CF)
         n += 1
 
 class BatchResult(NamedTuple):
@@ -950,7 +928,6 @@ class TritonBatch:
             self.CODE, self.DATA, self.INPUTS, self.OUTBUF, self.STATE,
             self.CODELENS, self.INLENS, self.BUDGETS, step_limit, self.CFG,
             CS=CODE_SIZE, DS=DATA_SIZE, INS=self.max_in, OCS=self.out_cap,
-            CFGVEC=self.config.has_vec, CFGWIN=self.config.has_window,
             num_warps=self.num_warps)
 
     def results(self):
@@ -998,14 +975,15 @@ class TritonBatch:
         return self.CODE[i].cpu().tolist()
 
 def run_batch(codes, datas=None, inputs=None, budgets=None, states=None,
-              tick_budget=200_000, device="cuda", num_warps=1):
+              tick_budget=ISA.TICK_BUDGET_DEFAULT, device="cuda", num_warps=1,
+              config=None):
 
     n = len(codes)
     max_in = 1
     if inputs:
         max_in = max(1, max((len(v) for v in inputs), default=1))
     b = TritonBatch(n, device=device, max_in=max_in,
-                    tick_budget=tick_budget, num_warps=num_warps)
+                    tick_budget=tick_budget, num_warps=num_warps, config=config)
     for i in range(n):
         b.set_program(i, codes[i],
                       datas[i] if datas else None,
@@ -1076,9 +1054,6 @@ class TritonCircuit:
         self.tb = int(self.BUDGET.item())
 
         self.CFG = torch.tensor(_cfg_row(cfg), dtype=i32, device=dev)
-        self.cfg_vec = None if cfg.vec is None else self.CFG[:ISA.LEGACY_VEC_COUNT]
-        self.cfg_win = (None if not cfg.has_window
-                        else self.CFG[ISA.LEGACY_VEC_COUNT:])
 
     def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0, fault_reason=None,
                    fault_addr=None):
@@ -1097,8 +1072,7 @@ class TritonCircuit:
     def step(self):
         ncp_step_kernel[(1,)](self.CODE, self.DATA, self.INP, self.OUTBUF, self.S,
                               self.BUDGET, self.codelen, self.inlen, DATA_SIZE,
-                              self.out_cap, self.CFG,
-                              CFGVEC=self.config.has_vec, CFGWIN=self.config.has_window)
+                              self.out_cap, self.CFG)
 
     @property
     def status(self):

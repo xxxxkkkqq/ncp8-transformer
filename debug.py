@@ -1,7 +1,8 @@
 """Debugger for NCP-8: breakpoints, watchpoints, frames and exact replay.
 
-A recording (`Trajectory`) stores the image, the initial `DATA`, the inputs and the tick
-budget it started from, the step cap it honoured, why it stopped, and one frame per
+A recording (`Trajectory`) stores the image, the initial `DATA`, the inputs, the
+configuration block the run was given, the tick budget it started from, the step cap it
+honoured, why it stopped, and one frame per
 attempted tick holding the pre-state, the post-state, the `DATA` writes that tick
 committed and any raised condition. `replay()` re-runs from the recorded start under the
 same cap and demands an exact match on every frame, the output stream, both memories and
@@ -16,6 +17,7 @@ Run: python3 debug.py              (self-check)
 from __future__ import annotations
 
 import disasm
+import isa_table as ISA
 from golden_sim import CODE_SIZE, DATA_SIZE, MachineError, NCP8
 
 class DebugError(Exception):
@@ -95,8 +97,8 @@ class Frame:
 
 class Debug:
 
-    def __init__(self, code, *, data=None, inputs=b"", tick_budget=200_000, PC=0,
-                 symbols=None):
+    def __init__(self, code, *, data=None, inputs=b"", tick_budget=ISA.TICK_BUDGET_DEFAULT, PC=0,
+                 symbols=None, config=None):
         if isinstance(code, str):
             raise DebugError("Debug takes an image, not source text: use "
                              "loader.assemble(src, ...).image")
@@ -108,9 +110,15 @@ class Debug:
                  and tick_budget >= 0, f"tick_budget must be an int >= 0, got {tick_budget!r}")
         _require(symbols is None or isinstance(symbols, dict),
                  f"symbols must be a dict of name -> address, got {type(symbols).__name__}")
+        _require(config is None or isinstance(config, ISA.MachineConfig),
+                 f"config must be an isa_table.MachineConfig, got a "
+                 f"{type(config).__name__}: the bounds the machine obeys are validated "
+                 f"at load, and a mapping would arrive unchecked")
         self.image = image
+        self.config = config
         self.symbols = {} if symbols is None else dict(symbols)
-        self.m = NCP8(image, data=data, inputs=inputs, tick_budget=tick_budget)
+        self.m = NCP8(image, data=data, inputs=inputs, tick_budget=tick_budget,
+                      config=config)
         self.m.data = TracingData(self.m.data)
         if PC:
             self.m.PC = PC
@@ -278,10 +286,11 @@ def _frame_equal(a, b):
 class Trajectory:
 
     __slots__ = ("image", "data", "inputs", "tick_budget", "pc", "frames", "out",
-                 "end_data", "end_code", "end_state", "status", "max_steps", "stopped")
+                 "end_data", "end_code", "end_state", "status", "max_steps", "stopped",
+                 "config")
 
     def __init__(self, image, data, inputs, tick_budget, pc, frames, out, end_data,
-                 end_code, end_state, status, max_steps, stopped):
+                 end_code, end_state, status, max_steps, stopped, config=None):
         self.image = bytes(image)
         self.data = bytes(data)
         self.inputs = bytes(inputs)
@@ -295,6 +304,7 @@ class Trajectory:
         self.status = status
         self.max_steps = max_steps
         self.stopped = stopped
+        self.config = config
 
     def __len__(self):
         return len(self.frames)
@@ -307,7 +317,7 @@ class Trajectory:
 
         got = run_trajectory(self.image, data=self.data, inputs=self.inputs,
                              tick_budget=self.tick_budget, PC=self.pc,
-                             max_steps=self.max_steps)
+                             max_steps=self.max_steps, config=self.config)
         if len(got.frames) != len(self.frames):
             raise ReplayError(f"replay produced {len(got.frames)} frames, the recording "
                               f"has {len(self.frames)} (both capped at "
@@ -339,15 +349,16 @@ class Trajectory:
                               f"{self.status}")
         return self
 
-def run_trajectory(code, *, data=None, inputs=b"", tick_budget=200_000, PC=0,
-                   max_steps=100_000):
+def run_trajectory(code, *, data=None, inputs=b"", tick_budget=ISA.TICK_BUDGET_DEFAULT, PC=0,
+                   max_steps=100_000, config=None):
 
     if isinstance(code, str):
         raise DebugError("run_trajectory takes an image, not source text")
     _require(isinstance(max_steps, int) and not isinstance(max_steps, bool)
              and max_steps >= 1, f"max_steps must be an int >= 1, got {max_steps!r}")
     image = bytes(code)
-    dbg = Debug(image, data=data, inputs=inputs, tick_budget=tick_budget, PC=PC)
+    dbg = Debug(image, data=data, inputs=inputs, tick_budget=tick_budget, PC=PC,
+                config=config)
 
     start_data = bytes(dbg.m.data)
     steps = 0
@@ -366,12 +377,13 @@ def run_trajectory(code, *, data=None, inputs=b"", tick_budget=200_000, PC=0,
     frames = [f.as_dict() for f in dbg.frames]
     return Trajectory(image, start_data, dbg.m.inputs, tick_budget, PC, frames,
                       bytes(dbg.m.out), bytes(dbg.m.data), bytes(dbg.m.code),
-                      dbg.state(), dbg.m.status, max_steps, stopped)
+                      dbg.state(), dbg.m.status, max_steps, stopped, config)
 
-def record(code, *, data=None, inputs=b"", tick_budget=200_000, PC=0, max_steps=100_000):
+def record(code, *, data=None, inputs=b"", tick_budget=ISA.TICK_BUDGET_DEFAULT, PC=0,
+           max_steps=100_000, config=None):
 
     return run_trajectory(code, data=data, inputs=inputs, tick_budget=tick_budget,
-                          PC=PC, max_steps=max_steps)
+                          PC=PC, max_steps=max_steps, config=config)
 
 def replay(traj):
 
@@ -386,7 +398,8 @@ def replay(traj):
         t = Trajectory(traj["image"], traj["data"], traj["inputs"], traj["tick_budget"],
                        traj["pc"], traj["frames"], traj["out"], traj["end_data"],
                        traj["end_code"], traj["end_state"], traj["status"],
-                       traj["max_steps"], traj["stopped"])
+                       traj["max_steps"], traj["stopped"],
+                       ISA.MachineConfig.from_dict(traj["config"]))
         return t.replay()
     raise DebugError(f"replay takes a Trajectory or its dict, got a "
                      f"{type(traj).__name__}")
@@ -397,7 +410,8 @@ def to_dict(traj):
                 tick_budget=traj.tick_budget, pc=traj.pc, frames=traj.frames,
                 out=traj.out, end_data=traj.end_data, end_code=traj.end_code,
                 end_state=traj.end_state, status=traj.status,
-                max_steps=traj.max_steps, stopped=traj.stopped)
+                max_steps=traj.max_steps, stopped=traj.stopped,
+                config=None if traj.config is None else traj.config.as_dict())
 
 def stop_pcs(traj):
 

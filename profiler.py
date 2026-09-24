@@ -14,6 +14,7 @@ Run: python3 profile.py            (self-check)
 from __future__ import annotations
 
 import disasm
+import isa_table as ISA
 from golden_sim import CODE_SIZE, DATA_SIZE, MachineError, NCP8
 
 class ProfileError(Exception):
@@ -109,11 +110,13 @@ def _require(condition, message):
     if not condition:
         raise ProfileError(message)
 
-def run(code, *, data=None, inputs=b"", tick_budget=200_000, max_rows=None):
+def run(code, *, data=None, inputs=b"", tick_budget=ISA.TICK_BUDGET_DEFAULT,
+        max_rows=None, config=None):
 
     if isinstance(code, str):
         raise ProfileError("profile.run takes an image, not source text: use "
-                           "loader.assemble(src, ...).image so the ABI cells are placed")
+                           "loader.assemble(src, ...).image, and pass its "
+                           "config() as `config` if the program traps or writes code")
     image = bytes(code)
     _require(1 <= len(image) <= CODE_SIZE,
              f"image is {len(image)} bytes, outside 1..{CODE_SIZE} (CODE_SIZE)")
@@ -122,7 +125,7 @@ def run(code, *, data=None, inputs=b"", tick_budget=200_000, max_rows=None):
                  f"data image is {len(bytes(data))} bytes, above DATA_SIZE {DATA_SIZE}")
     _require(isinstance(tick_budget, int) and not isinstance(tick_budget, bool)
              and tick_budget >= 0, f"tick_budget must be an int >= 0, got {tick_budget!r}")
-    m = NCP8(image, data=data, inputs=inputs, tick_budget=tick_budget)
+    m = NCP8(image, data=data, inputs=inputs, tick_budget=tick_budget, config=config)
     p = Profile()
     p.budget = tick_budget
     p.length = len(image)
@@ -173,7 +176,9 @@ def run_result(result, **kw):
     _require(result.entry in (0, None),
              f"this image declares entry 0x{result.entry:04X} but the reference boots at "
              f"PC 0; jump to the entry in the program or profile it with run(image)")
-    return run(bytes(result.image), **kw)
+    config = kw.pop("config", None)
+    return run(bytes(result.image), config=result.config() if config is None else config,
+               **kw)
 
 def compare(*profiles):
 

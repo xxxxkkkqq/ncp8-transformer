@@ -12,8 +12,11 @@ faulted, taken at tick entry) - and no register, memory, flag, PC or tick update
 step() rolls back on any exception, not only on a machine error. Stepping a
 machine whose status is not running is a no-op that changes nothing at all and is
 not an error. The tick budget and the output capacity (OUT_CAP bytes) are machine
-state and are applied inside step(). check_state()/load_state() refuse a state
-whose fields are outside their declared widths.
+state and are applied inside step(). Every bound the machine obeys - the length of
+the code, the self-modification window, the trap vectors, the tick budget and the
+output capacity - is load-time configuration handed in beside the image, and no cell
+of CODE holds any of them. check_state()/load_state() refuse a state whose fields are
+outside their declared widths.
 
 Opcode layout (fields do not overlap):
   0x00-0x1F  no-operand / a16 / i16 / self-read families
@@ -170,23 +173,11 @@ class NCP8:
 
     def _window(self):
 
-        cfg = self.config
-        if cfg.has_window:
-            return cfg.winlo, cfg.winhi, True
-        WLO, WHI = 0x0F20, 0x0F21
-        wl = self.code[WLO] if WLO < len(self.code) else 0
-        wh = self.code[WHI] if WHI < len(self.code) else 0
-        return wl, wh, False
+        return self.config.window()
 
     def _vector(self, k):
 
-        cfg = self.config
-        if cfg.has_vec:
-            return cfg.vector(k)
-        a = 0x0F00 + 2 * k
-        if a + 1 < len(self.code):
-            return (self.code[a + 1] << 8) | self.code[a]
-        return 0
+        return self.config.vector(k)
 
     def _stack_room(self, n):
 
@@ -433,32 +424,31 @@ class NCP8:
                 self._fault(CAUSE["CODE_OOB"], f"LDC out of range {self.HL} @ {pc0:#04x}")
             self.r[s0] = self.code[self.HL]; m = f"LDC r{s0}, [HL]"
         elif sel == "STC":
-
-            wl, wh, from_cfg = self._window()
+            wl, wh = self._window()
             if not 0 <= self.HL < self.codelen:
                 self._fault(CAUSE["CODE_OOB"], f"STC out of range {self.HL} @ {pc0:#04x}")
-            if self.config.has_vec and ISA.LEGACY_VEC_BASE <= self.HL < ISA.LEGACY_CONFIG_HI:
-
-                self._fault(CAUSE["WINDOW"],
-                    f"WINDOW: STC target {self.HL:#06x} is a legacy configuration cell this build treats as a constraint "
-                    f"[{ISA.LEGACY_VEC_BASE:#06x},{ISA.LEGACY_CONFIG_HI:#06x}), "
-                    f"unrelated to this machine's window declaration @ {pc0:#04x}")
             if not (wl <= self.HL < wh):
                 self._fault(CAUSE["WINDOW"],
-                    f"STC outside window {self.HL:#x} not in [{wl:#x},{wh:#x}) @ {pc0:#04x}")
+                    f"WINDOW: STC target {self.HL:#06x} is outside the declared window "
+                    f"(winlo {wl:#06x}, winhi {wh:#06x}, upper bound exclusive); both "
+                    f"bounds are load-time configuration and no cell of CODE holds "
+                    f"either @ {pc0:#04x}")
             b = bytearray(self.code); b[self.HL] = self.r[s0]; self.code = bytes(b)
             m = f"STC [HL], r{s0}"
         elif sel == "MULH":
             v = ((self.r[s0] * self.r[s1]) >> 8) & 0xFF
             self.r[s0] = v; self.Z = int(v == 0); m = f"MULH r{s0}, r{s1}"
         elif sel == "EXT":
-
             k = imm[0]
-            if k >= 16:
+            if k >= ISA.VEC_COUNT:
                 self._fault(CAUSE["TRAP_UNREG"], f"EXT k out of range {k} @ {pc0:#04x}")
             tgt = self._vector(k)
             if tgt == 0:
-                self._fault(CAUSE["TRAP_UNREG"], f"EXT handler {k} unregistered @ {pc0:#04x}")
+                self._fault(CAUSE["TRAP_UNREG"],
+                            f"EXT handler {k} is not registered: this machine keeps "
+                            f"its trap entry points in load-time configuration and "
+                            f"CODE holds none, so declaring one at load is the only "
+                            f"way to install a handler @ {pc0:#04x}")
             self._stack_room(2)
             self._push(self.PC & 0xFF); self._push((self.PC >> 8) & 0xFF)
             self.PC = tgt; m = f"EXT {k}"

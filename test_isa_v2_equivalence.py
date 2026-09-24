@@ -20,23 +20,27 @@ from __future__ import annotations
 import random
 import re
 
+import isa_table as ISA
 from golden_sim import NCP8, MachineError, asm
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
 from test_state_contract import FAULT_WRITES, assert_widths, circuit_view, ref_view
 
-VEC = 0x0F00
+CFG = ISA.MachineConfig
 
 PC_SITES = (0, 256)
+IMAGE = 0x0F20
 
 def _code_esc(sub, vec=0, pc=0, tail=(0xAA, 0x55)):
 
-    b = bytearray(max(0x0F20, pc + 4))
+    del vec
+    b = bytearray(max(IMAGE, pc + 4))
     b[pc], b[pc + 1], b[pc + 2], b[pc + 3] = 0x70, sub, tail[0], tail[1]
-    if vec:
-        for k in range(16):
-            b[VEC + 2 * k: VEC + 2 * k + 2] = (vec & 0xFFFF).to_bytes(2, "little")
     return bytes(b)
+
+def _registered(vec):
+
+    return None if not vec else CFG(vec={k: vec for k in range(ISA.VEC_COUNT)})
 
 def _golden_view(g):
 
@@ -52,14 +56,15 @@ def one_esc_step(Machine, sub, seed, vec=0, pc=0):
 
     rng = random.Random(seed * 977 + sub)
     code = _code_esc(sub, vec, pc)
+    cfg = _registered(vec)
     data_g = bytearray(rng.randrange(256) for _ in range(4096))
     R = [rng.randrange(256) for _ in range(4)]
     HL, DE = _ptr(rng, seed % 4 == 3), _ptr(rng, seed % 4 == 3)
     SP = rng.choice([0, 1, 2, 3, rng.randrange(16, 4093), 4095, 4096])
     C0, Z0 = rng.randrange(2), rng.randrange(2)
-    g = NCP8(code, data=data_g)
+    g = NCP8(code, data=data_g, config=cfg)
     g.load_state(R, HL, DE, SP, C0, Z0, 0, PC=pc)
-    c = Machine(code, data=data_g)
+    c = Machine(code, data=data_g, config=cfg)
     c.load_state(R, HL, DE, SP, C0, Z0, 0, PC=pc)
     pre, pre_data = _golden_view(g), list(g.data)
     pre_code, pre_out = bytes(g.code), bytes(g.out)
@@ -142,9 +147,10 @@ def test_esc_subcodes(Machine, name):
     print(f"[{name}] escape subcode single step: {n} cases match (ok {tot['ok']} + error {tot['err']}); "
           f"all {len(NEW_SUBCODES)} v3.0 subcodes have a legal case; executed at PC in {PC_SITES}")
 
-def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=None, trace_out=None):
-    g = NCP8(code, data=data, inputs=inputs, tick_budget=max_tick)
-    c = Machine(code, data=data, inputs=inputs, tick_budget=max_tick)
+def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=None,
+              trace_out=None, config=None):
+    g = NCP8(code, data=data, inputs=inputs, tick_budget=max_tick, config=config)
+    c = Machine(code, data=data, inputs=inputs, tick_budget=max_tick, config=config)
     n = 0
     raised = False
     while g.status == "RUNNING" and n < max_tick:
@@ -191,14 +197,6 @@ def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=N
         trace_out.extend(g.trace)
     return n
 
-def _with_vec(code, table):
-    b = bytearray(bytes(code).ljust(max(VEC + 2 * (k + 1) for k in table), b"\x00"))
-    for k, addr in table.items():
-        b[VEC + 2 * k: VEC + 2 * k + 2] = (addr & 0xFFFF).to_bytes(2, "little")
-    return bytes(b)
-
-WLO, WHI = 0x0F20, 0x0F21
-
 def test_selfmod_lockstep(Machine, name):
 
     src = """    JMP main
@@ -215,17 +213,15 @@ main:
 """
     base = asm(src)
 
-    def build(wlo, whi):
-        b = bytearray(bytes(base).ljust(WHI + 1, b"\x00"))
-        b[WLO], b[WHI] = wlo, whi
-        return bytes(b)
-
-    n = _lockstep(Machine, "self-modification takes effect", build(0x00, 0x08), expect=bytes([42]))
+    n = _lockstep(Machine, "self-modification takes effect", base,
+                  config=CFG(winlo=0x00, winhi=0x08), expect=bytes([42]))
     print(f"[{name}] controlled self-modification lockstep {n} ticks (immediate 7 -> 42 patched, output matches)")
 
-    n = _lockstep(Machine, "out of window", build(0x10, 0x18))
-    n = _lockstep(Machine, "zero-width window", build(0x00, 0x00))
-    print(f"[{name}] out-of-window / zero-width window: both implementations atomic ERR at the same tick")
+    n = _lockstep(Machine, "out of window", base, config=CFG(winlo=0x10, winhi=0x18))
+    n = _lockstep(Machine, "zero-width window", base, config=CFG(winlo=0x00, winhi=0x00))
+    n = _lockstep(Machine, "no window declared", base)
+    print(f"[{name}] out-of-window / zero-width / undeclared window: both "
+          f"implementations atomic ERR at the same tick")
 
     code = asm("LDI HL, 0\nLDC r0, [HL]\nOUT r0\nLDI HL, 4\nLDC r0, [HL]\nOUT r0\nHALT")
     n = _lockstep(Machine, "LDC self-read", code, expect=bytes([code[0], code[4]]))
@@ -236,10 +232,10 @@ def test_programs(Machine, name):
     main = bytes([0x70, 0x70, 0x00, 0xD0 | 3, 0x7E, 0x00])
     h0 = bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x08])
     h1 = bytes([0xD4 | 0, 5, 0x08])
-    code = bytearray(bytes(main).ljust(0x20, b"\x00")) + h0 + h1
-    code = _with_vec(bytes(code), {0: 0x20, 1: 0x20 + len(h0)})
-    n = _lockstep(Machine, "EXT nested", code)
-    g = NCP8(code)
+    code = bytes(bytearray(bytes(main).ljust(0x20, b"\x00")) + h0 + h1)
+    table = {0: 0x20, 1: 0x20 + len(h0)}
+    n = _lockstep(Machine, "EXT nested", code, config=CFG(vec=table))
+    g = NCP8(code, config=CFG(vec=table))
     while g.status == "RUNNING":
         g.step()
     assert g.r[0] == 6 and g.r[3] == 0x7E and g.SP == 4096 and g.status == "HALT", g.snapshot()

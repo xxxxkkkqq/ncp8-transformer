@@ -216,63 +216,15 @@ conventions are therefore not interchangeable, and `PUSHW` pairs only with
 Every subcode not listed above is reserved and raises an atomic error, as does
 any single-byte opcode not listed in 4.1-4.5.
 
-## 5. Fixed code-region tables
+## 5. Load-time configuration
 
-| address | contents |
-|---|---|
-| `CODE[0x0F00 + 2k]` | 16-bit little-endian entry point for trap `EXT k`, `k` in 0-15; a zero entry means unregistered |
-| `CODE[0x0F20]`, `CODE[0x0F21]` | the self-modification window's lower bound (inclusive) and upper bound (exclusive), as two independent 8-bit bytes |
-
-If `WLO >= WHI` the window is empty and every `STC` raises. `EXT` with `k >= 16`
-or with a zero vector raises. Both pushes follow the `CALL` convention (low byte
-first), so handlers may nest and return with `RET`.
-
-### 5.1 Why the machine cannot reach these tables
-
-`STC` writes `CODE`. It is kept out of the tables above by **two declared limits
-that happen to coincide**, and readers must not confuse this with `CODE` being
-write-protected, because it is not:
-
-* the window bounds are 8-bit, so the widest expressible window is `[0x00, 0xFF]`
-  and the highest address `STC` can ever reach is `0xFE`;
-* the tables above start at `0x0F00`, far outside that reach.
-
-An exhaustive sweep of all 65536 declarable `(WLO, WHI)` pairs confirms no `STC`
-lands in `[0x0F00, 0x0F22)`.
-
-**Consequence for anyone widening this.** Because the protection comes from the
-bound *width* and not from read-only-ness, enlarging the window to 16-bit bounds
-without further change would let `STC` reach the trap vector table and the window
-bound cells themselves, so the machine could widen its own window to all of `CODE`.
-Any change to the bound width must therefore be a change to *where the tables live*.
-There are two ways to make that safe, and they are not equivalent: declare a
-protected region that the datapath refuses regardless of the window, or keep the
-constraint tables out of the addressable image so that no window can reach them. The
-first still leaves the machine's own limits inside the memory the machine writes; the
-second removes the reachability. This implementation currently relies on the width
-coincidence described above, which is neither of the two, and is stated here rather
-than presented as a design.
-
-### 5.2 Loaded length is not the address space
-
-`CODE` is a 4096-byte address space, but every bound the machine checks is the
-**length of the loaded image**, not 4096. So an image must be long enough to
-contain the tables it is supposed to have:
-
-* `EXT k` needs the image to reach `0x0F02`, otherwise the vector reads as zero and
-  the trap raises `handler k unregistered` even though the caller believes it wrote
-  one;
-* `STC` and the window declaration need the image to reach `0x0F22`, otherwise the
-  bounds read as zero, the window is empty, and `STC` raises `outside window`
-  reporting the range `[0x0, 0x0)`.
-
-Both failure messages describe the *symptom*, not this cause. A builder placing
-these tables must pad the image to at least `0x0F22` bytes.
-
-### 5.3 The same limits can be declared as load-time configuration
-
-`isa_table.MachineConfig` carries the bounds that describe a machine rather than a
-program. Construction validates it once; no instruction can read or write the block.
+The bounds that describe a machine rather than a program are handed in beside the
+image, by `isa_table.MachineConfig`. No cell of `CODE` holds any of them, so a program
+cannot read one, widen one or move one: `STC` writes program bytes and nothing else,
+and the set of addresses it may write is decided before the first tick. Constructing
+the block validates it once, and no instruction can reach the block itself - the state
+a step publishes holds no configuration field, and the state installer takes no
+constraint.
 
 | field | accepted values | what it bounds |
 |---|---|---|
@@ -284,24 +236,70 @@ program. Construction validates it once; no instruction can read or write the bl
 | `nbanks` | 1..65535 | carried, not yet consulted by any instruction (memory banks) |
 | `tdlim` | 0..255 | carried, not yet consulted by any instruction (trap depth) |
 
-A field left as `None` is *absent*, and each implementation then uses the source it
-used before the block existed: `codelen` the loaded image length, `tickbudget` and
-`outcap` the constructor arguments, and the window bounds and trap vectors the `CODE`
-cells above. `equivalent_to_default()` reports a block that declares nothing.
+A field left as `None` is *absent*, and absence has one meaning per field: `codelen`
+is the length of the loaded image, `tickbudget` and `outcap` are the constructor
+arguments, the window is the empty span (no `STC` writes anything) and the vector table
+is all-zero (no `EXT` dispatches anywhere). A reversed window (`winhi < winlo`) is
+refused at construction and is never read as the empty window, because that would make
+a typo in one bound indistinguishable from switching self-modification off. Declaring a
+bound in the block and also moving the matching constructor argument off its default to
+a different number is a load-time refusal (`resolve_constraint`) rather than a
+precedence rule; an argument sitting at its default is not a second declaration.
 
-Declaring a bound in the block and also moving the matching constructor argument off
-its default to a different number is a load-time refusal (`resolve_constraint`) rather
-than a precedence rule; an argument sitting at its default is not a second declaration.
-A reversed window (`winhi < winlo`) is refused at construction and is never read as the
-empty window. `config_difference(before, after)` names the fields that moved between two
-blocks, which is how the acceptance suite states that no tick of a program changed the
-machine's own constraints.
+`equivalent_to_default()` reports a block that declares nothing,
+`config_difference(before, after)` names the fields that moved between two blocks -
+which is how the acceptance states that no tick of a program changed the machine's own
+constraints - and `as_dict()` / `from_dict()` are how a block travels as data, which is
+what lets a training record and a debugger recording hold the machine they describe.
 
-Until the block is the only source, the window bounds stay 8-bit and the tables above
-stay inside `CODE`, so section 5.1's reachability argument is still what protects them.
-`test_config_block.py` pins both halves: that a declared block changes behaviour
-identically on the reference and both circuits, and that nothing passes a block by
-default yet.
+### 5.1 What a run cannot change
+
+Two independent facts can refuse an `STC`, and each names its own cause: the declared
+span (`WINDOW`, with the message stating that both bounds are load-time configuration)
+and the loaded content (`CODE_OOB`, for an address past the code that was placed). A
+case where only one of them excludes the address is therefore distinguishable from a
+case where both do, and the pair census below is judged by that decision rather than by
+reading a byte back at an address that may be part of the program itself.
+
+The addresses these values used to occupy - a 16-bit trap vector table at
+`CODE[0x0F00 + 2k]` and two 8-bit window bound cells at `CODE[0x0F20]` and
+`CODE[0x0F21]` - are ordinary program memory now. A write there commits, and commits
+*harmlessly*: what `EXT` dispatches to and what span `STC` obeys come from the block, so
+the bytes a program leaves at those addresses decide nothing. This is the property the
+sweep states, and it is the reason the earlier protection - a window bound too narrow to
+reach the tables - was not a design: the reachability of the machine's own limits was a
+consequence of an 8-bit field's width, and widening that width would have moved the
+limits inside the memory the machine writes.
+
+Coverage of the census, since 16-bit bounds make the admissible pair set too large to
+state as a total: every one of the 65536 byte-wide `(winlo, winhi)` pairs, every pair
+whose bounds straddle one of the former table addresses, and every pair on a 257-address
+stride across the whole span, each run aiming a write at the pair's own endpoints and
+at the former table addresses and leaving every declared field exactly where the load
+put it. The sweep prints the number of runs it made; the byte-wide set is covered in
+full, and the two circuits are run over the region-straddling pairs.
+census is checked to be able to fire: making the upper bound inclusive instead of
+exclusive is rejected at the first pair it examines.
+
+### 5.2 Loaded length is not the address space
+
+Every bound the machine checks is the length of what was loaded, not the 4096-byte
+address space: a fetch past the content faults rather than reading zeros, `codelen` is
+how far the placed content reaches rather than how long the buffer holding it is, and a
+declared vector target must lie inside the content. Bytes past the end of the content
+are padding, so neither a trap target nor a fetch can land on them and call it code.
+
+A declaration costs no bytes: because neither the vector table nor the window bounds are
+written into the image, there is no minimum image length for a program that traps or
+self-modifies, and an image too short to hold a declared handler is refused at load
+rather than run as an unregistered trap.
+
+### 5.3 Where execution starts
+
+Every implementation boots at `CODE[0]`. The loader's `entry=` and its `main` symbol
+report where a load's `main` is, and that address is not a start address: a program
+whose entry is elsewhere begins with a jump to it. A start address the machine obeys
+would have to be configuration, like the fields above, and is not yet.
 
 ## 6. Invariants
 

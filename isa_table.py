@@ -16,6 +16,14 @@ precedence order, so the tick that stops a machine names exactly one cause and e
 implementation reads that order from this module rather than restating it.
 `fault_state_error` is the single legality rule the three `check_state()`s share: widths,
 cause-in-table, and the pairing `fault_reason != 0` if and only if `status == 3`.
+
+`MachineConfig` is the load-time configuration block the same three implementations
+read: CODELEN, the two window bounds, the trap vector table, the bank count, the trap
+depth limit, the tick budget and the output capacity. Constructing it is the gate -
+each field has one stated range, a half-supplied window and a reversed one are refused,
+and `resolve_constraint` refuses a bound that the block and a moved constructor
+argument state differently. `as_dict()`/`from_dict()` are how a block is carried as
+data, so a record or a recording can hold the machine it describes.
 """
 
 DATA_SIZE = 4096
@@ -230,11 +238,10 @@ def fault_code(name):
 FAULT_BITS = 8
 FAULT_ADDR_BITS = 16
 
-LEGACY_VEC_BASE = 0x0F00
-LEGACY_VEC_COUNT = 16
-LEGACY_WINDOW_LO_CELL = 0x0F20
-LEGACY_WINDOW_HI_CELL = 0x0F21
-LEGACY_CONFIG_HI = LEGACY_WINDOW_HI_CELL + 1
+VEC_COUNT = 16
+
+DEFAULT_WINDOW = (0, 0)
+DEFAULT_VECTORS = (0,) * VEC_COUNT
 
 CONFIG_NAMES = ("CODELEN", "WINLO", "WINHI", "VEC", "NBANKS", "TDLIM",
                 "TICKBUDGET", "OUTCAP")
@@ -331,16 +338,16 @@ class MachineConfig:
     @staticmethod
     def _checked_vec(vec):
 
-        table = [None] * LEGACY_VEC_COUNT
+        table = [None] * VEC_COUNT
         if isinstance(vec, dict):
             for k, v in vec.items():
-                k = _cfg_int("VEC index", k, 0, LEGACY_VEC_COUNT - 1)
+                k = _cfg_int("VEC index", k, 0, VEC_COUNT - 1)
                 table[k] = _cfg_int(f"VEC[{k}]", v, 0, (1 << 16) - 1)
         else:
             entries = list(vec)
-            if len(entries) > LEGACY_VEC_COUNT:
+            if len(entries) > VEC_COUNT:
                 raise ConfigError(f"VEC has {len(entries)} entries, this machine "
-                                  f"declares {LEGACY_VEC_COUNT} traps")
+                                  f"declares {VEC_COUNT} traps")
             for k, v in enumerate(entries):
                 table[k] = _cfg_int(f"VEC[{k}]", v, 0, (1 << 16) - 1)
         return tuple(0 if v is None else v for v in table)
@@ -355,11 +362,15 @@ class MachineConfig:
 
     def vector(self, k):
 
-        if self.vec is None:
-            raise ConfigError("no VEC was declared, so this machine still reads its "
-                              "trap vectors out of CODE; MachineConfig.vector() is "
-                              "not a way to ask the image")
-        return self.vec[k]
+        return DEFAULT_VECTORS[k] if self.vec is None else self.vec[k]
+
+    def vectors(self):
+
+        return DEFAULT_VECTORS if self.vec is None else self.vec
+
+    def window(self):
+
+        return DEFAULT_WINDOW if self.winlo is None else (self.winlo, self.winhi)
 
     def equivalent_to_default(self):
 
@@ -368,6 +379,29 @@ class MachineConfig:
     def set_fields(self):
 
         return [n for n in self.__slots__ if getattr(self, n) is not None]
+
+    def as_dict(self):
+
+        out = {}
+        for name in self.__slots__:
+            value = getattr(self, name)
+            if value is not None:
+                out[name] = list(value) if name == "vec" else value
+        return out
+
+    @classmethod
+    def from_dict(cls, fields):
+
+        if fields is None:
+            return None
+        if not isinstance(fields, dict):
+            raise ConfigError(f"a configuration carried as data must be a dict of "
+                              f"fields, got a {type(fields).__name__}")
+        unknown = sorted(set(fields) - set(cls.__slots__))
+        if unknown:
+            raise ConfigError(f"configuration names constraints outside the field set: "
+                              f"{unknown}")
+        return cls(**fields)
 
     def __eq__(self, other):
         if not isinstance(other, MachineConfig):
@@ -555,25 +589,27 @@ def check_structure():
 
 def check_config_table():
 
-    if LEGACY_VEC_BASE + 2 * LEGACY_VEC_COUNT != LEGACY_WINDOW_LO_CELL:
-        raise DecodeTableError("the legacy vector table does not end where the window "
-                               "bound cells start, so the region named by "
-                               "LEGACY_CONFIG_HI is not the region the reads cover")
-    if LEGACY_WINDOW_HI_CELL != LEGACY_WINDOW_LO_CELL + 1:
-        raise DecodeTableError("the two legacy window bound cells are not adjacent")
-    if LEGACY_CONFIG_HI != LEGACY_WINDOW_HI_CELL + 1:
-        raise DecodeTableError("the legacy region does not end one past its last cell")
     if tuple(n.upper() for n in MachineConfig.__slots__) != CONFIG_NAMES:
         raise DecodeTableError("the configuration block's fields and CONFIG_NAMES "
                                "disagree, so a survey of one misses a field of the "
                                "other")
     if set(CONFIG_WIDTHS) != set(CONFIG_NAMES):
         raise DecodeTableError("a configuration name has no declared width")
-    if CONFIG_WIDTHS["VEC"] != 16 or LEGACY_VEC_COUNT != 16:
+    if CONFIG_WIDTHS["VEC"] != 16 or VEC_COUNT != 16:
         raise DecodeTableError("the vector entries and the trap count disagree about "
                                "how wide a vector is")
-    if not MachineConfig().equivalent_to_default():
+    if len(DEFAULT_VECTORS) != VEC_COUNT or any(v != 0 for v in DEFAULT_VECTORS):
+        raise DecodeTableError("the default vector table does not declare one "
+                               "unregistered entry per trap")
+    if DEFAULT_WINDOW != (0, 0) or DEFAULT_WINDOW[1] < DEFAULT_WINDOW[0]:
+        raise DecodeTableError("the default window is not the empty span")
+    empty = MachineConfig()
+    if not empty.equivalent_to_default():
         raise DecodeTableError("an empty configuration block is not the default one")
+    if empty.window() != DEFAULT_WINDOW or empty.vectors() != DEFAULT_VECTORS:
+        raise DecodeTableError("an absent field does not resolve to its default")
+    if any(empty.vector(k) != 0 for k in range(VEC_COUNT)):
+        raise DecodeTableError("an absent vector table registers a handler")
     try:
         MachineConfig(winlo=8, winhi=4)
     except ConfigError:

@@ -32,8 +32,7 @@ COMPARED_FIELDS = tuple(f for f in ("r", "HL", "DE", "SP", "PC", "C", "Z", "ipos
                                     "tick", "status", "fault_reason", "fault_addr")
                         if f != "oplen")
 
-CONFIG_KEYS = ("codelen", "winlo", "winhi", "vec", "nbanks", "tdlim", "tickbudget",
-               "outcap")
+CONFIG_KEYS = tuple(ISA.MachineConfig.__slots__)
 
 IDENTITY_KEYS = ("ncl_version", "emitter_digest", "flags")
 DRIVER_SLACK = 8
@@ -262,8 +261,10 @@ def emitter_problems(rec):
     except Exception as exc:
         return [f"the emitter {version} refuses the record's own text: {exc}"]
     if rebuilt.hex() != str(code):
-        return [f"text compiles to {rebuilt.hex()} under {version}, the record's code is "
-                f"{code}"]
+        def short(hexed):
+            return hexed if len(hexed) <= 64 else hexed[:64] + f"... ({len(hexed) // 2} bytes)"
+        return [f"text compiles to {short(rebuilt.hex())} under {version}, the record's "
+                f"code is {short(str(code))}"]
     return []
 
 def shaped(spec):
@@ -280,7 +281,11 @@ def label(spec, compile_text=None):
     if isinstance(code, str):
         code = bytes.fromhex(code)
     if code is None:
-        compile_text = compile_text or default_compile
+        if compile_text is None:
+
+            version = str((spec.get("compiler_identity") or {}).get("ncl_version", ""))
+            compile_text = next((f for prefix, f in EMITTERS
+                                 if version.startswith(prefix)), default_compile)
         code = compile_text(spec["text"])
     code = bytes(code)
     data = bytes.fromhex(spec.get("initial_data", "")) or None

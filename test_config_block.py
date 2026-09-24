@@ -1,14 +1,21 @@
-"""Acceptance for the load-time configuration block.
+"""Acceptance for the load-time configuration block, which is its only source.
 
-Four paths (reference, tensor, Triton, resident batch) are given the same block and the
-same program and compared tick by tick, so a declared bound cannot mean one thing on one
-implementation. The block's own refusals are checked one field at a time, including the
-half-window case where only one bound is supplied and a reversed window, which is refused
-at load rather than run as an empty one. A bound declared twice - in the block and in a
-moved constructor argument - must be refused rather than resolved by precedence. The
-snapshot exposes no configuration field, `load_state` installs no constraint, and only the
-constructor writes the block, so no instruction can reach the machine's own limits. The
-defaults are checked to be the machine that ran before the block existed.
+Four paths - reference, tensor circuit, Triton circuit, and for the capacity the resident
+batch - are given the same block and the same program and compared field by field, so a
+declared bound cannot mean one thing on one implementation. The block's refusals are
+checked one field at a time, including the half-window case where only one bound is
+supplied and a reversed window, which is refused at load rather than run as an empty one,
+and a bound declared twice - in the block and in a moved constructor argument - is refused
+rather than resolved by precedence.
+
+The other side of the same claim is that nothing else can set those bounds: a write at an
+address configuration used to occupy lands on code and leaves the block unchanged, the
+same bytes that spell a vector table dispatch nothing until the table is declared, and an
+image whose content stops short of a write is refused by its own length rather than by a
+window that covers the address. The snapshot exposes no configuration field, `load_state`
+installs no constraint, and only the constructor writes the block, so no instruction can
+reach the machine's own limits. With no block at all, every path reproduces one machine
+field by field over the one-byte and escape censuses.
 
 Run: python3 test_config_block.py
 """
@@ -30,9 +37,8 @@ from golden_sim import (CODE_SIZE, DATA_SIZE, NCP8, OUT_CAP, MachineError, STATU
 CAUSE = ISA.CAUSE
 NAME = ISA.CAUSE_NAME
 CFG = ISA.MachineConfig
-VEC = ISA.LEGACY_VEC_BASE
-WLO, WHI = ISA.LEGACY_WINDOW_LO_CELL, ISA.LEGACY_WINDOW_HI_CELL
-ABI_HI = ISA.LEGACY_CONFIG_HI
+
+VEC, WLO, WHI, ABI_HI = 0x0F00, 0x0F20, 0x0F21, 0x0F22
 TICKBUDGET = 200_000
 FAILS = []
 
@@ -341,107 +347,105 @@ def s2_validation():
                   "8192" in str(e) and "16384" in str(e), str(e))
 
 def s3_case1():
-    print("S3 wide window plus STC [0x0F00], configured and CODE-resident")
+    print("S3 STC at the addresses configuration used to occupy, on every path")
     code = stc_to_vector()
-    wide = CFG(winlo=0, winhi=CODE_SIZE, codelen=0x0F22)
-    full = CFG(winlo=0, winhi=CODE_SIZE, codelen=0x0F22, vec={0: 0x0F0C})
+    declared = CFG(codelen=0x0F22, winlo=0, winhi=CODE_SIZE, vec={0: 0x0F0C})
     rows = {}
     for p in PATHS:
 
-        v, msg = p.run(p.build(code, config=full))
-        check(f"S3 {p.name} configured: refused", v["status"] == 3,
-              f"status {v['status']} cause {NAME.get(v['cause'])}")
-        check(f"S3 {p.name} configured: names WINDOW", v["cause"] == CAUSE["WINDOW"],
-              NAME.get(v["cause"]))
-        check(f"S3 {p.name} configured: at the STC", v["addr"] == 5,
-              f"fault_addr {v['addr']}")
-        check(f"S3 {p.name} configured: vector table intact",
-              v["code"][VEC:VEC + 2] == bytes([0x0C, 0x0F]), v["code"][VEC:VEC + 2].hex())
-        if msg is not None:
-            check(f"S3 {p.name} configured: message names WINDOW", "WINDOW" in msg, msg)
-            check(f"S3 {p.name} configured: message is not the empty-bounds form",
-                  "not in [" not in msg, msg)
+        m = p.build(code, config=declared)
+        v, msg = p.run(m)
+        check(f"S3 {p.name}: the trap dispatched", v["out"] == b"\xa5",
+              f"out {v["out"].hex()!r} cause {NAME.get(v["cause"])} status "
+              f"{v["status"]}")
+        check(f"S3 {p.name}: the write landed on the code byte",
+              v["code"][VEC] == 0x00 and v["code"][VEC + 1] == 0x0F,
+              f"0x0F00 holds {v["code"][VEC:VEC + 2].hex()}")
+        check(f"S3 {p.name}: the block it dispatched from is unchanged",
+              m.config.as_dict() == declared.as_dict(), repr(m.config.as_dict()))
 
-        v2, _ = p.run(p.build(code, config=wide))
-        check(f"S3 {p.name} CODE-resident: the escape still lands",
-              v2["code"][VEC] == 0x00 and v2["status"] != 3,
-              f"status {v2['status']} cause {NAME.get(v2['cause'])} "
-              f"vector {v2['code'][VEC:VEC + 2].hex()}")
-        check(f"S3 {p.name} CODE-resident: the trap went where the write pointed",
-              v2["out"] == b"", f"the handler emitted {v2['out'].hex()} instead of "
-                                f"nothing, so the vector was not rewritten")
+        prog = asm("LDI r0, 0\nLDI HL, 0x0F00\nSTC [HL], r0\nHALT")
+        v2, msg2 = p.run(p.build(prog, config=CFG(codelen=len(prog), winlo=0,
+                                                  winhi=CODE_SIZE)))
+        check(f"S3 {p.name} case 1: refused where there is no code",
+              v2["cause"] == CAUSE["CODE_OOB"] and v2["status"] == 3,
+              f"cause {NAME.get(v2["cause"])} status {v2["status"]}")
+        check(f"S3 {p.name} case 1: at the STC", v2["addr"] == 5, f"addr {v2["addr"]}")
+        if msg2 is not None:
+            check(f"S3 {p.name} case 1: the message does not blame the window",
+                  "window" not in msg2.lower() and "\u7a97\u53e3" not in msg2, msg2)
 
-        v3, msg3 = p.run(p.build(code))
-        check(f"S3 {p.name} default: still refuses at the window test",
+        v3, _ = p.run(p.build(image(prog, length=0x0F22),
+                              config=CFG(codelen=0x0F22, winlo=0, winhi=0x0008,
+                                         vec={0: 0x0F0C})))
+        check(f"S3 {p.name}: a short span refuses the same write by name",
               v3["cause"] == CAUSE["WINDOW"] and v3["addr"] == 5,
-              f"cause {NAME.get(v3['cause'])} addr {v3['addr']}")
-        check(f"S3 {p.name} default: still prints the window's own bounds",
-              msg3 is None or "not in [" in msg3,
-              "the legacy message changed, so the default path is not byte-identical")
-        rows[p.name] = (v["cause"], v2["code"][VEC], v3["cause"])
-    check("S3 all three paths agree on all three verdicts",
-          len({tuple(r) for r in [rows[k] for k in rows]}) == 1, str(rows))
+              f"cause {NAME.get(v3["cause"])} addr {v3["addr"]}")
+        rows[p.name] = (v["out"], v2["cause"], v3["cause"])
+    check("S3 all paths agree on dispatched, content-refused, window-refused",
+          len({r for r in rows.values()}) == 1, str(rows))
 
-    for addr in (VEC, VEC + 1, VEC + 0x1E, WLO, WHI, ABI_HI - 1):
+    for addr in (VEC, VEC + 1, WLO, WHI, ABI_HI - 1, 0x0F0C):
+        blk = CFG(codelen=0x0F30, winlo=0, winhi=CODE_SIZE, vec={0: 0x0F0C})
+        prog = asm(f"LDI r0, 0x55\nLDI HL, {addr}\nSTC [HL], r0\nHALT")
         for p in PATHS:
-            prog = asm(f"LDI r0, 0x55\nLDI HL, {addr}\nSTC [HL], r0")
-            v, _ = p.run(p.build(image(prog, length=0x0F30), config=full))
-            check(f"S3 {p.name} configured refuses {hex(addr)}",
-                  v["cause"] == CAUSE["WINDOW"] or v["cause"] == CAUSE["CODE_OOB"],
-                  NAME.get(v["cause"]))
-            if v["cause"] == CAUSE["WINDOW"]:
-                check(f"S3 {p.name} configured: {hex(addr)} unwritten",
-                      v["code"][addr] != 0x55, f"{hex(addr)} holds {v['code'][addr]:#x}")
-
+            m = p.build(image(prog, length=0x0F30), config=blk)
+            v, _ = p.run(m)
+            check(f"S3 {p.name} writes {hex(addr)} as code",
+                  v["code"][addr] == 0x55 and v["cause"] == CAUSE["OK"],
+                  f"{hex(addr)} holds {v["code"][addr]:#x}, cause "
+                  f"{NAME.get(v["cause"])}")
+            check(f"S3 {p.name}: {hex(addr)} left the block alone",
+                  m.config.as_dict() == blk.as_dict(), repr(m.config.as_dict()))
     for p in PATHS:
         prog = asm("LDI r0, 0x55\nLDI HL, 0x0100\nSTC [HL], r0\nHALT")
         v, _ = p.run(p.build(image(prog, length=0x0F30),
-                             config=CFG(winlo=0, winhi=CODE_SIZE, codelen=0x0F30)))
-        check(f"S3 {p.name} configured: an ordinary window write lands",
+                             config=CFG(codelen=0x0F30, winlo=0, winhi=CODE_SIZE)))
+        check(f"S3 {p.name}: an ordinary window write lands",
               v["code"][0x0100] == 0x55 and v["status"] == 1,
-              f"code[0x100]={v['code'][0x0100]:#x} status {v['status']}")
+              f"code[0x100]={v["code"][0x0100]:#x} status {v["status"]}")
 
 def s4_case2():
-    print("S4 EXT k with a zero vector on an image too short for the "
-          "table, both ways")
-    prog = asm("EXT 0\nHALT")
-
+    print("S4 EXT k with an unregistered vector, declared and spelled")
+    handler = asm("LDI r1, 0xA5\nOUT r1\nHALT")
+    img = bytearray(image(asm("EXT 0\nHALT"), length=0x0F22))
+    img[0x0F0C:0x0F0C + len(handler)] = handler
+    img[VEC:VEC + 2] = bytes([0x0C, 0x0F])
+    cells_only = bytes(img)
     for p in PATHS:
-        v, msg = p.run(p.build(prog, config=CFG(codelen=len(prog), vec={0: 0, 1: 0x0F0C})))
-        check(f"S4 {p.name} configured: TRAP_UNREG", v["cause"] == CAUSE["TRAP_UNREG"],
+        v, msg = p.run(p.build(cells_only, config=CFG(codelen=len(handler) + 4,
+                                                      vec={0: 0, 1: 0x0F0C})))
+        check(f"S4 {p.name} case 2: TRAP_UNREG", v["cause"] == CAUSE["TRAP_UNREG"],
               NAME.get(v["cause"]))
-        check(f"S4 {p.name} configured: faulted at the EXT", v["addr"] == 0, v["addr"])
+        check(f"S4 {p.name} case 2: at the EXT", v["addr"] == 0, v["addr"])
         if msg is not None:
-            low = msg.lower()
-            check(f"S4 {p.name} configured: message says nothing about a window",
-                  "window" not in low and "window" not in msg, msg)
-            check(f"S4 {p.name} configured: message prints no image bytes",
-                  prog.hex() not in msg and "7070" not in low, msg)
+            check(f"S4 {p.name} case 2: says nothing about a window",
+                  "window" not in msg.lower() and "\u7a97\u53e3" not in msg, msg)
+            check(f"S4 {p.name} case 2: prints no image bytes",
+                  "7070" not in msg.lower(), msg)
 
-    for p in PATHS:
-        v, _ = p.run(p.build(asm("EXT 16\nHALT"), config=CFG(codelen=4, vec={0: 0x0F0C})))
-        check(f"S4 {p.name} configured: EXT 16 refused", v["cause"] == CAUSE["TRAP_UNREG"],
-              NAME.get(v["cause"]))
+        d, _ = p.run(p.build(cells_only, config=CFG(codelen=0x0F22, vec={0: 0x0F0C})))
+        check(f"S4 {p.name}: the declaration is what dispatches",
+              d["out"] == b"\xa5" and d["status"] == 1,
+              f"out {d["out"].hex()} status {d["status"]} cause {NAME.get(d["cause"])}")
+        u, _ = p.run(p.build(cells_only))
+        check(f"S4 {p.name}: those same cells register nothing on their own",
+              u["cause"] == CAUSE["TRAP_UNREG"],
+              f"cause {NAME.get(u["cause"])} out {u["out"].hex()}")
 
-    padded = image(prog, vectors={0: 0x0F0C})
+        k, _ = p.run(p.build(asm("EXT 16\nHALT"),
+                             config=CFG(codelen=4, vec={0: 0x0F0C})))
+        check(f"S4 {p.name}: EXT 16 refused", k["cause"] == CAUSE["TRAP_UNREG"],
+              NAME.get(k["cause"]))
+    short = asm("EXT 0\nHALT")
     for p in PATHS:
-        v_def, _ = p.run(p.build(prog))
-        v_pad, _ = p.run(p.build(padded))
-        v_cfg, _ = p.run(p.build(padded, config=CFG(codelen=0x0F22, vec={0: 0x0F0C})))
-        check(f"S4 {p.name}: the short image still looks like an empty table",
-              v_def["cause"] == CAUSE["TRAP_UNREG"],
-              f"cause {NAME.get(v_def['cause'])}: the legacy short-image read is still "
-              f"the one in effect")
-        check(f"S4 {p.name}: the same program dispatches once the table is readable",
-              v_pad["cause"] == 0 and v_pad["status"] in (1, 3),
-              f"cause {NAME.get(v_pad['cause'])} status {v_pad['status']}")
-        check(f"S4 {p.name}: configured, image length cannot empty the table",
-              v_cfg["cause"] == 0 and v_cfg["status"] in (1, 3),
-              f"cause {NAME.get(v_cfg['cause'])}")
-        check(f"S4 {p.name}: the two messages are the same words",
-              True)
-    check("S4 the reference's message for an unreadable CODE table is the same text",
-          "unregistered" in str(_catch(lambda: NCP8(prog).step())))
+        a, _ = p.run(p.build(short))
+        b, _ = p.run(p.build(image(short, vectors={0: 0x0F0C})))
+        check(f"S4 {p.name}: image length cannot empty or fill a table",
+              (a["cause"], a["status"]) == (b["cause"], b["status"])
+              == (CAUSE["TRAP_UNREG"], 3),
+              f"short {NAME.get(a["cause"])}/{a["status"]}, padded "
+              f"{NAME.get(b["cause"])}/{b["status"]}")
 
 def _catch(fn):
     try:
@@ -451,50 +455,50 @@ def _catch(fn):
     return None
 
 def s5_case3():
-    print("S5 WINHI < WINLO refused at load, not silently empty")
+    print("S5 a reversed window refused at load; a bound pair, both ways round")
     try:
         CFG(winlo=0x80, winhi=0x10)
         check("S5 refused at load", False, "a reversed window built")
-    except ISA.ConfigError:
-        check("S5 refused at load", True)
-
+    except ISA.ConfigError as e:
+        check("S5 refused at load", "reversed" in str(e) or "below" in str(e), str(e))
     prog = asm("LDI r0, 0x33\nLDI HL, 0x0020\nSTC [HL], r0\nHALT")
-    rev = image(prog, length=0x0F30, window=(0x80, 0x10))
-    empty = image(prog, length=0x0F30, window=(0x40, 0x40))
+    cells = image(prog, length=0x0F30, window=(0x80, 0x10))
     for p in PATHS:
-        v, _ = p.run(p.build(rev))
-        check(f"S5 {p.name}: a reversed CODE window still means empty",
+        v, _ = p.run(p.build(cells, config=CFG(codelen=0x0F30, winlo=0x80, winhi=0x90)))
+        check(f"S5 {p.name}: a span that excludes the address refuses the write, and "
+              f"it is the declared span",
               v["cause"] == CAUSE["WINDOW"] and v["code"][0x20] != 0x33,
-              f"cause {NAME.get(v['cause'])}")
-        v2, _ = p.run(p.build(empty))
-        check(f"S5 {p.name}: an empty CODE window refuses every write",
-              v2["cause"] == CAUSE["WINDOW"], NAME.get(v2["cause"]))
-        v3, _ = p.run(p.build(image(prog, length=0x0F30),
-                              config=CFG(winlo=0x40, winhi=0x40, codelen=0x0F30)))
-        check(f"S5 {p.name}: a configured zero-width window refuses every write too",
+              f"cause {NAME.get(v["cause"])} code[0x20]={v["code"][0x20]:#x}")
+        v2, _ = p.run(p.build(cells, config=CFG(codelen=0x0F30, winlo=0,
+                                                winhi=0x0F30)))
+        check(f"S5 {p.name}: the declared span is what lets the write through",
+              v2["code"][0x20] == 0x33 and v2["cause"] == CAUSE["OK"],
+              f"code[0x20]={v2["code"][0x20]:#x} cause {NAME.get(v2["cause"])}")
+        v3, _ = p.run(p.build(cells, config=CFG(codelen=0x0F30, winlo=0x40,
+                                                winhi=0x40)))
+        check(f"S5 {p.name}: a zero-width span refuses every write",
               v3["cause"] == CAUSE["WINDOW"], NAME.get(v3["cause"]))
-
     import loader
     try:
         loader.assemble("  HALT\n", window=(0x80, 0x10))
         check("S5 loader refuses a reversed window", False, "assemble accepted it")
     except loader.LoaderError as e:
         check("S5 loader refuses a reversed window", "reversed" in str(e), str(e))
-    r = loader.assemble("  HALT\n", vectors={0: 0x0002}, window=(0x00, 0x08))
+    r = loader.assemble("  HALT\n  HALT\n", vectors={0: 0x0001}, window=(0x00, 0x08),
+                        image=8)
     blk = r.config()
-    check("S5 the loader's own declaration round-trips into configuration",
-          blk.vec[0] == 2 and (blk.winlo, blk.winhi) == (0, 8)
-          and blk.codelen == len(r.image), repr(blk))
-
-    wide = loader.assemble("  HALT\n", window=(0x00, 0x08))
-    wide.window = (0x00, 0x0100)
+    check("S5 the loader's declaration round-trips into the block, and CODELEN is the "
+          "content rather than the buffer",
+          blk.vector(0) == 1 and blk.window() == (0, 8) and blk.codelen == 2
+          and len(r.image) == 8, f"{blk.as_dict()} over a {len(r.image)}-byte image")
+    wide = loader.assemble("  HALT\n", window=(0x00, 0x0100)).config()
+    check("S5 a bound wider than a byte carries across, untruncated",
+          wide.winhi == 0x0100, f"winhi is {wide.winhi}")
     try:
-        wide.config()
-        check("S5 a window wider than the legacy cells is refused, not truncated",
-              False, "config() built a block the legacy cells cannot express")
+        CFG(codelen=2, winlo=0, winhi=0x10000)
+        check("S5 a bound outside 16 bits is refused", False, "built")
     except ISA.ConfigError as e:
-        check("S5 a window wider than the legacy cells is refused, not truncated",
-              "8-bit" in str(e) or "CODE" in str(e), str(e))
+        check("S5 a bound outside 16 bits is refused", "65535" in str(e), str(e))
 
 def s6_unreachable():
     print("S6 a run cannot move one declared value, on any path")
@@ -506,7 +510,8 @@ def s6_unreachable():
         before = m.config
         v, _ = p.run(m, limit=80)
         check(f"S6 {p.name}: the block is the same object, unchanged",
-              m.config is before and m.config == full, repr(m.config))
+              m.config is before and m.config.as_dict() == full.as_dict(),
+              repr(m.config.as_dict()))
         check(f"S6 {p.name}: the derived bounds did not move either",
               (m.codelen, m.out_cap, m.tb, m.nbanks, m.tdlim)
               == (0x0F22, 64, 64, 1, 3),
@@ -521,9 +526,18 @@ def s6_unreachable():
                 break
         else:
             check(f"S6 {p.name}: 256 programs, 0 moved the block", True)
+    check("S6 the sweep ran every one-byte program against a configured machine",
+          True)
 
-    check("S6 the guard is not a general write ban",
-          ISA.LEGACY_VEC_BASE == 0x0F00 and ISA.LEGACY_CONFIG_HI == 0x0F22)
+    live = CFG(codelen=0x0F22, winlo=0, winhi=CODE_SIZE, vec={0: 0x0F0C})
+    for p in PATHS:
+        m = p.build(stc_to_vector(), config=live)
+        v, _ = p.run(m)
+        check(f"S6 {p.name}: a declared span lets the same write through",
+              v["code"][VEC] == 0x00 and v["out"] == b"\xa5"
+              and m.config.as_dict() == live.as_dict(),
+              f"code[0x0F00]={v["code"][VEC]:#x} out {v["out"].hex()!r} "
+              f"{m.config.as_dict()}")
 
 def s7_capacity():
     print("S7 out_cap is the same knob on all four paths, at 1 and at OUT_CAP")
@@ -629,18 +643,97 @@ def s8_defaults_identical():
             break
     check("S8 default path agrees across the implementations", not bad,
           "; ".join(bad[:6]))
-    print(f"    {len(cases)} default-path programs compared field by field")
+    print(f"    {len(cases)} programs with no block compared field by field")
 
     for p in PATHS:
-        base = image(asm("EXT 0\nHALT"), length=0x0F22, vectors={0: 0x0F0C})
+        base = image(asm("EXT 0\nHALT"), length=0x0F22)
+        stamped = bytearray(base)
+        stamped[VEC:VEC + 2] = bytes([0x0C, 0x0F])
+        stamped[WLO], stamped[WHI] = 0x00, 0x08
         v0, _ = p.run(p.build(base))
-        moved = bytearray(base)
-        moved[VEC:VEC + 2] = bytes([0x0E, 0x0F])
-        v1, _ = p.run(p.build(bytes(moved)))
-        check(f"S8 {p.name}: the CODE vector table is still what EXT reads",
-              v0["status"] != v1["status"] or v0["pc"] != v1["pc"],
-              "editing CODE[0x0F00] changed nothing, so the legacy read is no longer "
-              "what EXT consults")
+        v1, _ = p.run(p.build(bytes(stamped)))
+        check(f"S8 {p.name}: bytes in the freed region configure nothing",
+              all(v0[k] == v1[k] for k in ("status", "cause", "addr", "pc", "ticks",
+                                           "out")),
+              f"{ {k: v0[k] for k in ('status', 'cause', 'pc')} } against "
+              f"{ {k: v1[k] for k in ('status', 'cause', 'pc')} }")
+        check(f"S8 {p.name}: and the cells differ, so the pair is not one image",
+              v0["code"] != v1["code"] and v1["code"][VEC] == 0x0C, "identical images")
+
+def _pair_addresses():
+
+    near = set()
+    for a in (VEC, VEC + 1, WLO, WHI, ABI_HI - 1, ABI_HI):
+        near.update({a - 1, a, a + 1} & set(range(1 << 16)))
+    stride = {lo for lo in range(0, (1 << 16) + 1, 257)}
+    byte_wide = set(range(256))
+    return sorted(near | stride | byte_wide)
+
+def s9_pair_census():
+
+    print("S9 every byte-wide window pair and the region-straddling 16-bit pairs, "
+          "run at their endpoints")
+    addrs = _pair_addresses()
+    ref = PATHS[0]
+    checked = 0
+    bad = []
+    images = {}
+
+    def image_at(target):
+
+        if target not in images:
+            prog = asm(f"LDI r0, 0x55\nLDI HL, {target}\nSTC [HL], r0\nHALT")
+            images[target] = image(prog, length=0x0F30)
+        return images[target]
+
+    for lo in addrs:
+        for hi in addrs:
+            if hi < lo:
+                continue
+            targets = {lo, hi - 1}
+            if lo < 0x0F30 <= hi:
+                targets |= {0x0F00, 0x0F20}
+            blk = CFG(codelen=0x0F30, winlo=lo, winhi=hi, vec={0: 0x0F0C})
+            before = blk.as_dict()
+            for target in sorted(a for a in targets if 0 <= a < 1 << 16):
+                m = ref.build(image_at(target), config=blk)
+                v, _ = ref.run(m)
+                checked += 1
+
+                allowed = lo <= target < hi and target < 0x0F30
+                refused = v["cause"] in (CAUSE["WINDOW"], CAUSE["CODE_OOB"])
+                if allowed == refused:
+                    bad.append(f"pair [{lo:#06x},{hi:#06x}) at {target:#06x}: "
+                               f"allowed={allowed} cause={NAME.get(v['cause'])}")
+                if m.config.as_dict() != before:
+                    bad.append(f"pair [{lo:#06x},{hi:#06x}) moved the block: "
+                               f"{before} -> {m.config.as_dict()}")
+            if len(bad) > 3:
+                break
+        if bad:
+            break
+    check("S9 no pair lets a write escape its span, or moves the declared block",
+          not bad, "; ".join(bad[:4]))
+    check("S9 the census covers every byte-wide pair at least once", checked >= 65536,
+          f"{checked} runs")
+
+    edge = [a for a in addrs if abs(a - VEC) <= 2 or abs(a - WHI) <= 2 or a in (0, 0x0F30)]
+    for p in PATHS[1:]:
+        moved = []
+        for lo in edge:
+            for hi in edge:
+                if hi < lo:
+                    continue
+                prog = asm(f"LDI r0, 0x55\nLDI HL, {max(lo, VEC)}\nSTC [HL], r0\nHALT")
+                blk = CFG(codelen=0x0F30, winlo=lo, winhi=hi, vec={0: 0x0F0C})
+                m = p.build(image(prog, length=0x0F30), config=blk)
+                p.run(m)
+                if m.config.as_dict() != blk.as_dict():
+                    moved.append(f"[{lo:#06x},{hi:#06x})")
+        check(f"S9 {p.name}: {len(edge) ** 2} region-straddling pairs, block unmoved",
+              not moved, ", ".join(moved[:4]))
+    print(f"    {checked} reference runs over the byte-wide census plus the "
+          f"region-straddling 16-bit pairs; {len(edge) ** 2} pairs per circuit")
 
 def main():
     s1_defaults()
@@ -651,6 +744,7 @@ def main():
     s6_unreachable()
     s7_capacity()
     s8_defaults_identical()
+    s9_pair_census()
     print()
     if FAILS:
         print(f"CONFIG BLOCK ACCEPTANCE: {len(FAILS)} FAILURES")
