@@ -8,14 +8,26 @@ round trip.
 """
 import random
 
-from sympy import primerange
+def _is_prime(n):
+    if n < 2:
+        return False
+    d = 2
+    while d * d <= n:
+        if n % d == 0:
+            return False
+        d += 1
+    return True
+
+def primes_below(limit):
+    return [n for n in range(2, limit) if _is_prime(n)]
 
 def W_star(p):
     X = 3 * p - 2
     return X.bit_length() - (1 if (X & (X - 1)) == 0 else 0)
 
 def test_bitwidth_formula():
-    ps = list(primerange(2, 2048))
+    ps = primes_below(2048)
+    assert len(ps) == 309, (len(ps), ps[-5:])
     for p in ps:
         W = W_star(p)
         assert 2 ** W > 3 * p - 3, (p, W)
