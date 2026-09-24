@@ -14,6 +14,8 @@
 | input | byte stream | `IN`, cursor `ipos` |
 | output | byte stream, capacity 8192 | `OUT`; see 2.3 |
 | `tick` | counter | bounded by a tick budget |
+| `fault_reason` | 8 bit | which rule the machine stopped on; `0` means no fault |
+| `fault_addr` | 16 bit | the address of the instruction that faulted |
 
 Status: `0` running, `1` halted, `2` tick budget exhausted, `3` error.
 
@@ -35,6 +37,19 @@ advances only on a successful tick.
 A 16-bit memory access checks both of its bytes before either one is read or
 written, so a violating tick cannot commit half a word. The same rule applies to
 `PUSHW`/`POPW`, which occupy two stack slots.
+
+An error tick records *why* and *where*, in two machine fields that are part of the
+state: `fault_reason` holds the cause and `fault_addr` holds the address of the
+instruction whose execution faulted. `fault_addr` is the program counter at the start of
+the tick, not the value left after the instruction's own fetches advanced it, so it names
+the instruction a reader can look up rather than a byte inside it.
+
+Two properties hold, in both directions, and both are checked on every path:
+`fault_reason != 0` exactly when `status = 3`, and at most one cause is recorded per tick.
+The list of causes lives in one place, `isa_table.FAULT_CAUSES`, numbered densely from
+`0` = no fault; this document does not restate it, because a second copy of a table is how
+two sources of truth start disagreeing. `test_spec_conformance.py` checks the table against
+the machine.
 
 ### 2.1 Terminal status is sticky
 

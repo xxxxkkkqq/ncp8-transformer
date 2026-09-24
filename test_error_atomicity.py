@@ -20,17 +20,18 @@ enumeration instead.
 """
 from __future__ import annotations
 
-from golden_sim import NCP8, MachineError, asm
+from golden_sim import MachineError, NCP8, asm
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
-from test_state_contract import assert_widths
+from test_state_contract import FAULT_WRITES, VIEW_FIELDS, assert_widths, ref_view
 
 DATA_SIZE = 4096
 VEC = 0x0F00
 WLO, WHI = 0x0F20, 0x0F21
 VEC_TGT = 0x0040
 CALL_TGT = 0x1F00
-STATUS = {"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}
+
+PC_SITES = (0, 256)
 
 STACK_SP = (0, 1, 2, 3, 4094, 4095, 4096)
 LIMIT_ADDRS = (0, 4095, 4096)
@@ -43,21 +44,18 @@ INPUTS = b"\xAB\xCD"
 
 DATA_IMAGE = bytes((i * 7 + 13) & 0xFF for i in range(DATA_SIZE))
 
-def build_code(head, vec0=None):
+def build_code(head, vec0=None, pc=0):
 
-    b = bytearray(bytes(head).ljust(WHI + 2, b"\x00"))
+    b = bytearray(bytes(head).ljust(max(WHI + 2, pc + len(head) + 2), b"\x00"))
+    b[pc:pc + len(head)] = bytes(head)
     if vec0 is not None:
         b[VEC:VEC + 2] = (vec0 & 0xFFFF).to_bytes(2, "little")
     return bytes(b)
 
-def ref_view(g):
-    return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
-                ipos=g.ipos, oplen=len(g.out), tick=g.tick, status=STATUS[g.status])
-
-def run_reference(code, sp, hl, de):
+def run_reference(code, sp, hl, de, pc=0):
 
     g = NCP8(code, data=DATA_IMAGE, inputs=INPUTS)
-    g.load_state(INIT_R, hl, de, sp, INIT_C, INIT_Z, TICK0)
+    g.load_state(INIT_R, hl, de, sp, INIT_C, INIT_Z, TICK0, PC=pc)
     try:
         g.step()
         raised = False
@@ -65,10 +63,10 @@ def run_reference(code, sp, hl, de):
         raised = True
     return raised, ref_view(g), list(g.data), bytes(g.code), bytes(g.out)
 
-def run_circuit(Machine, code, sp, hl, de):
+def run_circuit(Machine, code, sp, hl, de, pc=0):
 
     c = Machine(code, data=DATA_IMAGE, inputs=INPUTS)
-    c.load_state(INIT_R, hl, de, sp, INIT_C, INIT_Z, TICK0)
+    c.load_state(INIT_R, hl, de, sp, INIT_C, INIT_Z, TICK0, PC=pc)
     try:
         c.step()
         raised = False
@@ -81,25 +79,29 @@ def run_circuit(Machine, code, sp, hl, de):
     code_img = bytes(c.CODE.cpu().tolist()[:len(code)])
     return raised, snap, data, code_img, c.out()
 
-def check_case(name, code, sp, hl, de, expect_err, expect_commit=None):
+def check_case(name, code, sp, hl, de, expect_err, expect_commit=None, pc=0):
 
-    runs = [("reference", run_reference(code, sp, hl, de)),
-            ("torch", run_circuit(TorchCircuit, code, sp, hl, de)),
-            ("triton", run_circuit(TritonCircuit, code, sp, hl, de))]
-    ref_pre = dict(r=list(INIT_R), HL=hl, DE=de, SP=sp, PC=0, C=INIT_C, Z=INIT_Z,
-                   ipos=0, oplen=0, tick=TICK0, status=0)
+    runs = [("reference", run_reference(code, sp, hl, de, pc)),
+            ("torch", run_circuit(TorchCircuit, code, sp, hl, de, pc)),
+            ("triton", run_circuit(TritonCircuit, code, sp, hl, de, pc))]
+    ref_pre = dict(r=list(INIT_R), HL=hl, DE=de, SP=sp, PC=pc, C=INIT_C, Z=INIT_Z,
+                   ipos=0, oplen=0, tick=TICK0, status=0, fault_reason=0, fault_addr=0)
+    assert set(ref_pre) == set(VIEW_FIELDS), (
+        "this suite's field list and the comparison set have drifted apart")
     for label, (raised, post, data, code_img, out) in runs:
         assert_widths(post, (name, label, "post-state"))
         if expect_err:
             assert raised, (name, label, "the violating tick did not report an error")
-            if label == "reference":
-
-                assert post == ref_pre, (name, label, "reference error tick was not atomic", ref_pre, post)
-            else:
-                assert post["status"] == 3, (name, label, "expected status 3", post)
-                for k, v in ref_pre.items():
-                    if k != "status":
-                        assert post[k] == v, (name, label, "error tick changed a state field", k, v, post[k])
+            assert post["status"] == 3, (name, label, "expected status 3", post)
+            for k, v in ref_pre.items():
+                if k in FAULT_WRITES:
+                    continue
+                assert post[k] == v, (name, label, "error tick changed a state field", k, v, post[k])
+            assert post["fault_reason"] != 0, (
+                name, label, "an error tick stopped without naming a cause", post)
+            assert post["fault_addr"] == pc, (
+                name, label, "fault_addr must be the faulting instruction's address",
+                pc, post)
             assert data == list(DATA_IMAGE), (name, label, "error tick changed DATA")
             assert code_img == code, (name, label, "error tick changed CODE")
             assert out == b"", (name, label, "error tick changed the output stream", out)
@@ -108,32 +110,31 @@ def check_case(name, code, sp, hl, de, expect_err, expect_commit=None):
             assert not raised, (name, label, "a legal boundary tick reported an error")
             assert post == exp_state, (name, label, "legal tick state mismatch", exp_state, post)
             assert data == list(exp_data), (name, label, "legal tick DATA mismatch")
-            assert out == exp_out, (name, label, "legal tick output mismatch", exp_out, out)
+            assert out == exp_out, (name, label, "legal tick output mismatch", exp_out, post)
 
     r_raised, r_post, r_data, r_code, r_out = runs[0][1]
-    keys = [k for k in ref_pre if k != "status"] if expect_err else list(ref_pre)
     for label, (raised, post, data, code_img, out) in runs[1:]:
         assert raised == r_raised, (name, label, "error verdict differs from the reference")
-        assert all(post[k] == r_post[k] for k in keys), \
+        assert all(post[k] == r_post[k] for k in VIEW_FIELDS), \
             (name, label, "state differs from the reference", post, r_post)
         assert (data, code_img, out) == (r_data, r_code, r_out), \
             (name, label, "memory or output differs from the reference")
     return "err" if expect_err else "ok"
 
-def legal_expect(kind, sp, hl, de, imm=None):
+def legal_expect(kind, sp, hl, de, imm=None, pc=0):
 
     r = list(INIT_R)
     d = bytearray(DATA_IMAGE)
     out = b""
-    st = dict(r=r, HL=hl, DE=de, SP=sp, PC=1, C=INIT_C, Z=INIT_Z, ipos=0, oplen=0,
-              tick=TICK0 + 1, status=0)
-    ret_lo, ret_hi = (0 + 3) & 0xFF, (0 + 3) >> 8
+    st = dict(r=r, HL=hl, DE=de, SP=sp, PC=pc + 1, C=INIT_C, Z=INIT_Z, ipos=0,
+              oplen=0, tick=TICK0 + 1, status=0, fault_reason=0, fault_addr=0)
+    ret_lo, ret_hi = (pc + 3) & 0xFF, (pc + 3) >> 8
     if kind in ("PUSHW HL", "PUSHW DE", "POPW HL", "POPW DE", "STW [HL], DE",
                 "STW [DE], HL", "LDW DE, [HL]", "LDW HL, [DE]",
                 "MOVW SP, HL", "MOVW SP, DE"):
-        st["PC"] = 2
+        st["PC"] = pc + 2
     if kind in ("LDX r0, [HL+i]", "STX [HL+i], r0", "ADD SP, i8"):
-        st["PC"] = 3
+        st["PC"] = pc + 3
     if kind == "PUSH r0":
         st["SP"] = sp - 1
         d[sp - 1] = r[0]
@@ -276,83 +277,98 @@ def _seed_last_byte(addr):
 def test_stack_boundaries():
     tot = {"ok": 0, "err": 0}
     for kind, head in STACK_CASES:
-        code = build_code(head, vec0=VEC_TGT if kind.startswith("EXT") else None)
-        for sp in STACK_SP:
-            expect_err = STACK_ERR[kind](sp)
-            commit = None if expect_err else legal_expect(kind, sp, 0, 0)
-            tot[check_case(f"{kind} @ SP={sp}", code, sp, 0, 0, expect_err, commit)] += 1
-        print(f"  {kind:9s}: SP {STACK_SP} -> "
-              f"{sum(1 for sp in STACK_SP if STACK_ERR[kind](sp))} error / "
-              f"{sum(1 for sp in STACK_SP if not STACK_ERR[kind](sp))} legal")
-    assert tot == {"ok": 47, "err": 16}, tot
-    print(f"  stack instructions x SP boundary: {sum(tot.values())} cases "
-          f"(error {tot['err']} + legal {tot['ok']})")
+        for pc in PC_SITES:
+            code = build_code(head, vec0=VEC_TGT if kind.startswith("EXT") else None,
+                              pc=pc)
+            for sp in STACK_SP:
+                expect_err = STACK_ERR[kind](sp)
+                commit = None if expect_err else legal_expect(kind, sp, 0, 0, pc=pc)
+                tot[check_case(f"{kind} @ SP={sp} PC={pc}", code, sp, 0, 0,
+                               expect_err, commit, pc)] += 1
+        print(f"  {kind:9s}: SP {STACK_SP} at PC {PC_SITES} -> "
+              f"{sum(1 for sp in STACK_SP if STACK_ERR[kind](sp)) * len(PC_SITES)} error / "
+              f"{sum(1 for sp in STACK_SP if not STACK_ERR[kind](sp)) * len(PC_SITES)} legal")
+    assert tot == {"ok": 94, "err": 32}, tot
+    print(f"  stack instructions x SP boundary x {len(PC_SITES)} addresses: "
+          f"{sum(tot.values())} cases (error {tot['err']} + legal {tot['ok']})")
     return tot
 
 def test_memory_boundaries():
     tot = {"ok": 0, "err": 0}
     for kind, head, ptr in MEM_CASES:
-        code = build_code(head)
-        for addr in LIMIT_ADDRS:
-            hl, de = (addr, 0) if ptr == "HL" else (0, addr)
-            expect_err = addr >= DATA_SIZE
-            commit = None if expect_err else legal_expect(kind, DATA_SIZE, hl, de)
-            tot[check_case(f"{kind} @ {ptr}={addr}", code, DATA_SIZE, hl, de,
-                           expect_err, commit)] += 1
-    assert tot == {"ok": 12, "err": 6}, tot
-    print(f"  memory instructions x HL/DE in {LIMIT_ADDRS}: {sum(tot.values())} cases "
-          f"(error {tot['err']} + legal {tot['ok']})")
+        for pc in PC_SITES:
+            code = build_code(head, pc=pc)
+            for addr in LIMIT_ADDRS:
+                hl, de = (addr, 0) if ptr == "HL" else (0, addr)
+                expect_err = addr >= DATA_SIZE
+                commit = None if expect_err else legal_expect(kind, DATA_SIZE, hl, de,
+                                                              pc=pc)
+                tot[check_case(f"{kind} @ {ptr}={addr} PC={pc}", code, DATA_SIZE, hl, de,
+                               expect_err, commit, pc)] += 1
+    assert tot == {"ok": 24, "err": 12}, tot
+    print(f"  memory instructions x HL/DE in {LIMIT_ADDRS} x {len(PC_SITES)} addresses: "
+          f"{sum(tot.values())} cases (error {tot['err']} + legal {tot['ok']})")
     return tot
 
 def test_wide_memory_boundaries():
 
     tot = {"ok": 0, "err": 0}
     for kind, head, ptr in WIDE_CASES:
-        code = build_code(head)
-        for addr in WIDE_ADDRS:
-            hl, de = (addr, 0) if ptr == "HL" else (0, addr)
-            expect_err = addr + 1 >= DATA_SIZE
-            commit = None if expect_err else legal_expect(kind, DATA_SIZE, hl, de)
-            tot[check_case(f"{kind} @ {ptr}={addr}", code, DATA_SIZE, hl, de,
-                           expect_err, commit)] += 1
-        print(f"  {kind:13s}: {ptr} {WIDE_ADDRS} -> "
-              f"{sum(1 for a in WIDE_ADDRS if a + 1 >= DATA_SIZE)} error / "
-              f"{sum(1 for a in WIDE_ADDRS if a + 1 < DATA_SIZE)} legal")
-    assert tot == {"ok": 16, "err": 8}, tot
-    print(f"  16-bit memory instructions x {ptr} in {WIDE_ADDRS}: {sum(tot.values())} cases "
-          f"(error {tot['err']} + legal {tot['ok']})")
+        for pc in PC_SITES:
+            code = build_code(head, pc=pc)
+            for addr in WIDE_ADDRS:
+                hl, de = (addr, 0) if ptr == "HL" else (0, addr)
+                expect_err = addr + 1 >= DATA_SIZE
+                commit = None if expect_err else legal_expect(kind, DATA_SIZE, hl, de,
+                                                              pc=pc)
+                tot[check_case(f"{kind} @ {ptr}={addr} PC={pc}", code, DATA_SIZE, hl, de,
+                               expect_err, commit, pc)] += 1
+        print(f"  {kind:13s}: {ptr} {WIDE_ADDRS} at PC {PC_SITES} -> "
+              f"{sum(1 for a in WIDE_ADDRS if a + 1 >= DATA_SIZE) * len(PC_SITES)} error / "
+              f"{sum(1 for a in WIDE_ADDRS if a + 1 < DATA_SIZE) * len(PC_SITES)} legal")
+    assert tot == {"ok": 32, "err": 16}, tot
+    print(f"  16-bit memory instructions x {ptr} in {WIDE_ADDRS} x {len(PC_SITES)} "
+          f"addresses: {sum(tot.values())} cases (error {tot['err']} + legal {tot['ok']})")
     return tot
 
 def test_frame_boundaries():
 
     tot = {"ok": 0, "err": 0}
     for kind, src, hl, imm, expect_err in FRAME_CASES:
-        code = build_code(asm(src))
-        commit = None if expect_err else legal_expect(kind, DATA_SIZE, hl, 0, imm)
-        tot[check_case(f"{src} @ HL={hl}", code, DATA_SIZE, hl, 0, expect_err, commit)] += 1
-    assert tot == {"ok": 6, "err": 4}, tot
-    print(f"  frame-relative accesses: {sum(tot.values())} cases "
-          f"(error {tot['err']} + legal {tot['ok']})")
+        for pc in PC_SITES:
+            code = build_code(asm(src), pc=pc)
+            commit = None if expect_err else legal_expect(kind, DATA_SIZE, hl, 0, imm,
+                                                          pc=pc)
+            tot[check_case(f"{src} @ HL={hl} PC={pc}", code, DATA_SIZE, hl, 0,
+                           expect_err, commit, pc)] += 1
+    assert tot == {"ok": 12, "err": 8}, tot
+    print(f"  frame-relative accesses x {len(PC_SITES)} addresses: {sum(tot.values())} "
+          f"cases (error {tot['err']} + legal {tot['ok']})")
     return tot
 
 def test_sp_boundaries():
 
     tot = {"ok": 0, "err": 0}
     for sp, imm, expect_err in ADD_SP_CASES:
-        code = build_code(asm(f"ADD SP, {imm}"))
-        commit = None if expect_err else legal_expect("ADD SP, i8", sp, 0, 0, imm)
-        tot[check_case(f"ADD SP, {imm} @ SP={sp}", code, sp, 0, 0, expect_err, commit)] += 1
+        for pc in PC_SITES:
+            code = build_code(asm(f"ADD SP, {imm}"), pc=pc)
+            commit = None if expect_err else legal_expect("ADD SP, i8", sp, 0, 0, imm,
+                                                          pc=pc)
+            tot[check_case(f"ADD SP, {imm} @ SP={sp} PC={pc}", code, sp, 0, 0,
+                           expect_err, commit, pc)] += 1
     for kind, head, ptr in MOVW_SP_CASES:
-        code = build_code(head)
-        for val in SP_PAIR_VALUES:
-            hl, de = (val, 0) if ptr == "HL" else (0, val)
-            expect_err = val > DATA_SIZE
-            commit = None if expect_err else legal_expect(kind, DATA_SIZE, hl, de)
-            tot[check_case(f"{kind} @ {ptr}={val}", code, DATA_SIZE, hl, de,
-                           expect_err, commit)] += 1
-    assert tot == {"ok": 12, "err": 7}, tot
-    print(f"  stack-pointer writes: {sum(tot.values())} cases "
-          f"(error {tot['err']} + legal {tot['ok']})")
+        for pc in PC_SITES:
+            code = build_code(head, pc=pc)
+            for val in SP_PAIR_VALUES:
+                hl, de = (val, 0) if ptr == "HL" else (0, val)
+                expect_err = val > DATA_SIZE
+                commit = None if expect_err else legal_expect(kind, DATA_SIZE, hl, de,
+                                                              pc=pc)
+                tot[check_case(f"{kind} @ {ptr}={val} PC={pc}", code, DATA_SIZE, hl, de,
+                               expect_err, commit, pc)] += 1
+    assert tot == {"ok": 24, "err": 14}, tot
+    print(f"  stack-pointer writes x {len(PC_SITES)} addresses: {sum(tot.values())} "
+          f"cases (error {tot['err']} + legal {tot['ok']})")
     return tot
 
 if __name__ == "__main__":

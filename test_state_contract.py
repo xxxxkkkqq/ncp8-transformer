@@ -21,7 +21,10 @@ import sys
 
 import torch
 
+import circuit_torch as CT
+import circuit_triton as CTT
 import golden_sim
+import isa_table as ISA
 import programs
 from circuit_torch import OUT_CAP as TORCH_OUT_CAP
 from circuit_torch import TorchCircuit
@@ -33,7 +36,7 @@ from golden_sim import AssemblyError, MachineError, NCP8, asm
 REF_OUT_CAP = getattr(golden_sim, "OUT_CAP", None)
 CAP = REF_OUT_CAP if REF_OUT_CAP else TRITON_OUT_CAP
 
-STATUS_NAMES = {0: "RUNNING", 1: "HALT", 2: "OVERRUN", 3: "ERR"}
+STATUS_NAMES = {0: "RUNNING", 1: "HALT", 2: "OVERRUN", 3: "ERROR"}
 
 WIDTHS = {
     "r": (0, 256),
@@ -43,13 +46,36 @@ WIDTHS = {
     "SP": (0, DATA_SIZE + 1),
     "C": (0, 2),
     "Z": (0, 2),
+    "fault_reason": (0, 256),
+    "fault_addr": (0, 1 << 16),
 }
+
+FAULT_WRITES = ("status", "fault_reason", "fault_addr")
+
+VIEW_FIELDS = ("r", "HL", "DE", "SP", "PC", "C", "Z", "ipos", "oplen", "tick",
+               "status", "fault_reason", "fault_addr")
 
 def ref_view(g):
 
-    return dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
+    view = dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
                 ipos=g.ipos, oplen=len(g.out), tick=g.tick,
-                status={"RUNNING": 0, "HALT": 1, "OVERRUN": 2, "ERR": 3}[g.status])
+                status=golden_sim.STATUS_CODE[g.status],
+                fault_reason=g.fault_reason, fault_addr=g.fault_addr)
+    _check_view_fields(view, "reference")
+    return view
+
+def circuit_view(c):
+
+    view = c.snapshot()
+    _check_view_fields(view, type(c).__name__)
+    return view
+
+def _check_view_fields(view, who):
+
+    missing = [k for k in VIEW_FIELDS if k not in view]
+    assert not missing, (who, "snapshot does not report", missing)
+    extra = [k for k in view if k not in VIEW_FIELDS]
+    assert not extra, (who, "snapshot reports fields no comparison reads", extra)
 
 def width_violations(view):
 
@@ -479,11 +505,167 @@ def test_d7_resident_path_carries_the_stream_in():
     print("  D7 resident path: stepping then run_resident() keeps the bytes already "
           "emitted, for every split point of a two-byte stream")
 
+def test_d2_error_is_sticky():
+
+    prog = bytes([0x01, 0x71, 0x00])
+    g = NCP8(prog)
+    step_reference(g, "NOP")
+    raised = False
+    try:
+        g.step()
+    except MachineError:
+        raised = True
+    assert raised, "the faulting tick must still raise for its caller"
+    frozen = ref_view(g)
+    assert frozen["status"] == 3, ("the reference never recorded the error status", frozen)
+    assert (frozen["PC"], frozen["tick"]) == (1, 1), frozen
+    for _ in range(3):
+        step_reference(g, "step after error")
+        assert ref_view(g) == frozen, ("step past an error moved state", frozen, ref_view(g))
+    assert g.run() == bytes(g.out) == b"", "run() on an errored machine must return"
+    for Mach in (TorchCircuit, TritonCircuit):
+        c = Mach(prog)
+        c.step()
+        c.step()
+        frozen = circuit_view(c)
+        assert frozen["status"] == 3, frozen
+        for _ in range(3):
+            c.step()
+            assert circuit_view(c) == frozen, (Mach.__name__, "step past an error", frozen)
+        assert circuit_view(c)["fault_reason"] == ISA.CAUSE["BAD_OPCODE"]
+    b = TritonBatch(1)
+    b.set_program(0, prog)
+    b.run()
+    before = b.snapshot(0)
+    assert before["status"] == 3, before
+    b.step(4)
+    assert b.snapshot(0) == before, ("batch step past an error moved state", before)
+    print("  D2 ERROR is sticky: the faulting tick raises once and records status 3, "
+          "every later step is a no-op in the reference, both circuits and the batch")
+
+def test_d8_error_tick_latches_the_fault_registers():
+
+    cases = [
+
+        ("undefined opcode", bytes([0x71, 0x00]), "BAD_OPCODE", lambda pc, n: ()),
+        ("reserved subcode", bytes([0x70, 0x63, 0x00]), "BAD_SUBCODE",
+         lambda pc, n: ()),
+        ("divide by zero", asm("DIV r0, r1\nHALT"), "DIV_ZERO", "r1=0"),
+        ("data out of range", asm("MOV r0, [HL]\nHALT"), "DATA_OOB", "hl=DATA_SIZE"),
+        ("stack has nothing to pop", asm("POP r0\nHALT"), "STACK_UNDERFLOW",
+         "sp=DATA_SIZE"),
+        ("stack has no room to push", asm("PUSH r0\nHALT"), "STACK_OVERFLOW", "sp=0"),
+        ("code byte past the image", bytes([0x09, 0x00]), "FETCH_OOB", lambda pc, n: ()),
+        ("handler not registered", bytes([0x70, 0x70, 0x00]), "TRAP_UNREG",
+         lambda pc, n: ()),
+        ("LDC past the image", asm("LDC r0, [HL]"), "CODE_OOB", "hl=image"),
+    ]
+    probes = 0
+    for name, head, cause, operand in cases:
+        for pc in (0, 256):
+            code = bytes(pc) + bytes(head)
+            R = [1, 2, 3, 4]
+            hl, sp = 8, 2048
+            if operand == "r1=0":
+                R[1] = 0
+            elif operand == "hl=DATA_SIZE":
+                hl = DATA_SIZE
+            elif operand == "hl=image":
+                hl = len(code)
+            elif operand == "sp=0":
+                sp = 0
+            elif operand == "sp=DATA_SIZE":
+                sp = DATA_SIZE
+            g = NCP8(code, data=bytes(DATA_SIZE))
+            g.load_state(R, hl, 8, sp, 0, 0, 7, PC=pc)
+            try:
+                g.step()
+                raise AssertionError(f"{name} at PC {pc} did not fault on the reference")
+            except MachineError:
+                pass
+            view = ref_view(g)
+            assert_widths(view, ("reference", name, pc))
+            assert view["status"] == 3, (name, pc, view)
+            assert view["fault_reason"] == ISA.CAUSE[cause], (
+                name, pc, "cause", view["fault_reason"], ISA.fault_name(view["fault_reason"]),
+                "expected", cause)
+            assert view["fault_addr"] == pc, (
+                name, pc, "fault_addr must be the instruction address at tick entry",
+                view["fault_addr"])
+            assert (view["PC"], view["tick"], view["r"]) == (pc, 7, list(R)), (
+                name, pc, "the faulting tick wrote a field besides the three it owns",
+                view)
+            for Mach in (TorchCircuit, TritonCircuit):
+                c = Mach(code, data=bytes(DATA_SIZE))
+                c.load_state(R, hl, 8, sp, 0, 0, 7, PC=pc)
+                c.step()
+                cv = circuit_view(c)
+                assert_widths(cv, (Mach.__name__, name, pc))
+                assert cv == view, (Mach.__name__, name, pc, "fault registers differ",
+                                    view, cv)
+            probes += 1
+    assert probes == 18, probes
+    print(f"  D8 fault registers: {probes} faulting ticks at two addresses each latch "
+          f"status 3, the cause and the instruction address, and nothing else")
+
+def test_d8_fault_pairing_is_refused_in_both_directions():
+
+    ok = ISA.CAUSE["DIV_ZERO"]
+    refusals = [("cause while running", dict(status=0, fault_reason=ok),
+                 "is recorded while status is 0"),
+                ("cause on a halted machine", dict(status=1, fault_reason=ok),
+                 "is recorded while status is 1"),
+                ("cause on an overrun machine", dict(status=2, fault_reason=ok),
+                 "is recorded while status is 2"),
+                ("error status with no cause", dict(status=3, fault_reason=0),
+                 "while fault_reason is 0"),
+                ("cause the table does not assign", dict(status=3, fault_reason=19),
+                 "does not assign"),
+                ("cause past the 8-bit field", dict(status=3, fault_reason=256),
+                 "fault_reason is 256, outside [0, 255]"),
+                ("address past the 16-bit field", dict(status=3, fault_reason=ok,
+                                                       fault_addr=65536),
+                 "fault_addr is 65536, outside [0, 65535]")]
+    for what, over, needle in refusals:
+        msgs = []
+        for check in (golden_sim.check_state, CT.check_state, CTT.check_state):
+            kw = dict(status=0, fault_reason=0, fault_addr=0)
+            kw.update(over)
+            msg = refuse(check, [0, 0, 0, 0], 0, 0, DATA_SIZE, 0, 0, **kw)
+            assert msg is not None, (what, check.__module__, "accepted an illegal pairing")
+            assert needle in msg, (what, check.__module__, "message lacks", needle, msg)
+            msgs.append(msg)
+        assert len(set(msgs)) == 1, ("the three check_state wordings differ", msgs)
+
+    b = TritonBatch(1)
+    b.set_program(0, b"\x00")
+    assert refuse(b.set_state, 0, status=3, fault_reason=ok, fault_addr=4) is None, \
+        "a stopped machine with a named cause is a legal state"
+    assert refuse(b.set_state, 0, status=1, fault_reason=0) is None
+    assert refuse(b.set_state, 0, status=0, fault_reason=0, fault_addr=0) is None
+    print("  D8 pairing: fault_reason != 0 iff status == 3 is refused in both "
+          "directions, by all three check_state()s with one wording, and the legal "
+          "pairings still install")
+
+def test_d8_the_only_cause_of_a_tick_is_the_one_named_in_the_table():
+
+    assert ISA.check_fault_table() is True
+    assert len(ISA.FAULT_CAUSES) == 19, ISA.FAULT_CAUSES
+    assert ISA.CAUSE["OK"] == 0 and ISA.fault_name(0) == "OK"
+    assert max(ISA.CAUSE.values()) < 256
+    for Mach, who in ((TorchCircuit, "torch"), (TritonCircuit, "triton")):
+        c = Mach(bytes([0x01]))
+        snap = c.snapshot()
+        assert snap["fault_reason"] in ISA.CAUSE_NAME, (who, snap)
+    print(f"  D8 cause table: {len(ISA.FAULT_CAUSES)} codes, dense from 0, all of them "
+          f"inside the declared fault_reason width")
+
 CHECKS = (
     test_d1_register_write_port_masks,
     test_d1_width_conformance_on_the_bundled_programs,
     test_d2_halt_is_sticky,
     test_d2_overrun_is_sticky,
+    test_d2_error_is_sticky,
     test_d2_run_on_a_stopped_machine_returns,
     test_d3_budget_is_per_step_state,
     test_d3_budget_outranks_the_error_of_its_own_tick,
@@ -500,6 +682,9 @@ CHECKS = (
     test_d6_validation_survives_python_O,
     test_d6_assembly_error_is_not_a_machine_error,
     test_d7_resident_path_carries_the_stream_in,
+    test_d8_error_tick_latches_the_fault_registers,
+    test_d8_fault_pairing_is_refused_in_both_directions,
+    test_d8_the_only_cause_of_a_tick_is_the_one_named_in_the_table,
 )
 
 def run_all():

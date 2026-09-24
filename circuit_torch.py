@@ -26,6 +26,25 @@ OUT_CAP = 8192
 globals().update(ISA.ALU_ID)
 K = ISA.K
 
+_FAULT_SITES = ISA.FAULT_SITE_NAMES
+_FAULT_CODES = [ISA.FAULT_SITE_CAUSE[s] for s in _FAULT_SITES]
+
+def fault_cause(fired, codes):
+
+    fired = (fired > 0).to(torch.int32)
+    codes = torch.as_tensor(codes, dtype=torch.int32, device=fired.device)
+    if fired.ndim != 1 or codes.ndim != 1 or fired.shape[0] != codes.shape[0]:
+        raise ValueError(
+            f"fault_cause takes one signal per site: fired is {tuple(fired.shape)}, "
+            f"codes is {tuple(codes.shape)}. Two ranks would broadcast into an outer "
+            f"product whose sum is a number the cause table never assigned")
+    if fired.shape[0] != len(ISA.FAULT_SITE_ORDER):
+        raise ValueError(f"fault_cause was given {fired.shape[0]} site signals, but "
+                         f"isa_table.FAULT_SITE_ORDER names {len(ISA.FAULT_SITE_ORDER)}")
+    prior = torch.cumsum(fired, 0) - fired
+    first = fired * (prior == 0).to(torch.int32)
+    return (first * codes).sum()
+
 def _rom(rows):
 
     return [torch.tensor(list(col), dtype=torch.int32) for col in rows]
@@ -34,7 +53,8 @@ _ALU, _S0, _S1, _LEN = _rom(ISA.single_rom())
 
 _ALU2, _S02, _S12, _LX2 = _rom(ISA.escape_rom())
 
-def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, where=""):
+def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
+                fault_reason=0, fault_addr=0, where=""):
 
     def outside(field, value, lo, hi):
         raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
@@ -57,6 +77,9 @@ def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, wh
             outside(field, v, 0, "unbounded")
     if status not in (0, 1, 2, 3):
         outside("status", status, 0, 3)
+    bad = ISA.fault_state_error(status, fault_reason, fault_addr, where)
+    if bad is not None:
+        raise ValueError(bad)
 
 class TorchCircuit:
     def __init__(self, code, data=None, inputs=b"", tick_budget=200_000, device="cuda", rom_override=None):
@@ -83,6 +106,9 @@ class TorchCircuit:
             setattr(self, n, torch.zeros(1, dtype=i32, device=dev))
         self.SP += DATA_SIZE
         self.status = torch.zeros(1, dtype=i32, device=dev)
+
+        self.fault_reason = torch.zeros(1, dtype=i32, device=dev)
+        self.fault_addr = torch.zeros(1, dtype=i32, device=dev)
         self.TB = torch.tensor([int(tick_budget)], dtype=i32, device=dev)
         self.tb = int(tick_budget)
         if rom_override is not None:
@@ -110,6 +136,8 @@ class TorchCircuit:
         self.IW0 = torch.tensor(0x0F20, dtype=i32, device=dev)
         self.IW1 = torch.tensor(0x0F21, dtype=i32, device=dev)
         self.RO = torch.arange(OUT_CAP, dtype=i32, device=dev)
+
+        self.fault_codes = torch.tensor(_FAULT_CODES, dtype=i32, device=dev)
         self._acts = None
 
     def set_inputs(self, b):
@@ -124,6 +152,8 @@ class TorchCircuit:
 
         dev, i32 = self.dev, torch.int32
         w = lambda m, a, b: m * a + (1 - m) * b
+
+        pc_entry = self.PC.clone()
 
         zero = torch.zeros((), dtype=i32, device=dev)
         fetch_ok = (self.PC < self.codelen).to(i32)
@@ -206,7 +236,8 @@ class TorchCircuit:
 
         wlo = self._g(self.CODE, self.IW0); whi = self._g(self.CODE, self.IW1)
         code_ok = (self.HL < self.codelen).to(i32)
-        sc_ok = code_ok * (self.HL >= wlo).to(i32) * (self.HL < whi).to(i32)
+
+        win_ok = (self.HL >= wlo).to(i32) * (self.HL < whi).to(i32)
         ldc_v = self._g(self.CODE, self.HL)
 
         v_mulh = ((a * b) >> 8) & 255
@@ -342,19 +373,39 @@ class TorchCircuit:
             + (oh(STW_HLDE) + oh(LDW_DEHL)) * (1 - hl_ok2) \
             + (oh(STW_DEHL) + oh(LDW_HLDE)) * (1 - de_ok2) \
             + (oh(LDX) + oh(STX)) * (1 - fr_ok)
-        st_rows = (oh(POP) * (1 - sp_hi) + oh(RET) * (1 - sp_hi1)
-                   + oh(PUSH) * (1 - sp_lo) + oh(CALL) * (1 - sp_lo2)
-                   + oh(EXT) * (1 - sp_lo2)
-                   + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (1 - sp_lo2)
-                   + (oh(POPW_HL) + oh(POPW_DE)) * (1 - sp_hi2))
-        v2_err = (oh(DIV) * (b == 0).to(i32) + oh(MOD) * (b == 0).to(i32) + oh(EXT) * (1 - ext_ok)
-                  + oh(LDC) * (1 - code_ok) + oh(STC) * (1 - sc_ok))
+
+        push_rows = (oh(PUSH) * (1 - sp_lo) + oh(CALL) * (1 - sp_lo2)
+                     + oh(EXT) * (1 - sp_lo2)
+                     + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (1 - sp_lo2))
+        pop_rows = (oh(POP) * (1 - sp_hi) + oh(RET) * (1 - sp_hi1)
+                    + (oh(POPW_HL) + oh(POPW_DE)) * (1 - sp_hi2))
         v3_err = (oh(MOVW_SP_HL) * (1 - hl_sp_ok) + oh(MOVW_SP_DE) * (1 - de_sp_ok)
                   + oh(ADD_SP) * (1 - sp_add_ok))
 
         out_ovf = (ind * rows_out_en * (self.oplen >= OUT_CAP).to(i32)).sum()
-        err = (ind * (oh(BAD) + (1 - fetch_ok_rows) + rd_rows + st_rows + v2_err + v3_err)).sum() \
-            + out_ovf + (1 - fetch_ok)
+
+        bad_rows = (ind * oh(BAD)).sum()
+        fetch_code = (((1 - fetch_ok)
+                       + esc * (self.PC + ISA.PREFIX_BYTES > self.codelen).to(i32)).sum())
+
+        fired = torch.stack(tuple(v.reshape(()) for v in (
+            fetch_code,
+            bad_rows * (1 - esc),
+            bad_rows * esc,
+            (ind * (1 - fetch_ok_rows)).sum(),
+            (ind * oh(EXT) * (1 - ext_ok)).sum(),
+            (ind * rd_rows).sum(),
+            (ind * push_rows).sum(),
+            (ind * pop_rows).sum(),
+            (ind * (oh(DIV) + oh(MOD)) * (b == 0).to(i32)).sum(),
+            (ind * (oh(LDC) + oh(STC)) * (1 - code_ok)).sum(),
+            (ind * oh(STC) * code_ok * (1 - win_ok)).sum(),
+            (ind * v3_err).sum(),
+            out_ovf,
+        )))
+        cause = fault_cause(fired, self.fault_codes)
+
+        err = (cause != 0).to(i32)
 
         sel = lambda rows: (ind * rows).sum()
         R_w = (ind[:, None] * oh_s0 * rows_R_en[:, None]).sum(0)
@@ -408,6 +459,10 @@ class TorchCircuit:
         new_status = torch.where(over > 0, 2 * torch.ones(1, dtype=i32, device=dev), new_status)
         self.status = running * new_status + (1 - running) * self.status
 
+        fault_w = running * (1 - over) * (err > 0).to(i32)
+        self.fault_reason = torch.where(fault_w > 0, cause.reshape(1), self.fault_reason)
+        self.fault_addr = torch.where(fault_w > 0, pc_entry, self.fault_addr)
+
         self.R = m * ((R_w * R_v + (1 - R_w) * self.R) & 255) + (1 - m) * self.R
         self.HL = (m * sel(rows_HL) + (1 - m) * self.HL) & 0xFFFF
         self.DE = (m * sel(rows_DE) + (1 - m) * self.DE) & 0xFFFF
@@ -421,10 +476,17 @@ class TorchCircuit:
     def _g(self, buf, idx):
         return buf.index_select(0, idx.clamp(0, buf.numel() - 1).reshape(1)).reshape(()).to(torch.int32)
 
-    def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0):
+    def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0, fault_reason=None,
+                   fault_addr=None):
 
-        check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC)
+        fr = int(self.fault_reason.item()) if fault_reason is None else fault_reason
+        fa = int(self.fault_addr.item()) if fault_addr is None else fault_addr
+        check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=int(self.ipos.item()),
+                    oplen=int(self.oplen.item()), status=int(self.status.item()),
+                    fault_reason=fr, fault_addr=fa)
         t = torch.tensor
+        self.fault_reason = t([fr], dtype=torch.int32, device=self.dev)
+        self.fault_addr = t([fa], dtype=torch.int32, device=self.dev)
         self.R = t(R, dtype=torch.int32, device=self.dev)
         self.HL = t([HL], dtype=torch.int32, device=self.dev)
         self.DE = t([DE], dtype=torch.int32, device=self.dev)
@@ -435,10 +497,13 @@ class TorchCircuit:
         self.PC = t([PC], dtype=torch.int32, device=self.dev)
 
     def snapshot(self):
+
         return dict(r=self.R.tolist(), HL=self.HL.item(), DE=self.DE.item(),
                     SP=self.SP.item(), PC=self.PC.item(), C=self.C.item(), Z=self.Z.item(),
                     ipos=self.ipos.item(), oplen=self.oplen.item(), tick=self.tick.item(),
-                    status=int(self.status.item()))
+                    status=int(self.status.item()),
+                    fault_reason=int(self.fault_reason.item()),
+                    fault_addr=int(self.fault_addr.item()))
 
     def out(self):
 

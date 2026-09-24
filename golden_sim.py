@@ -6,7 +6,9 @@ state (registers r0-r3, pointers HL/DE, stack pointer, PC, carry/zero flags,
 input/output streams, tick counter, status) and the exact per-tick transition.
 
 Status codes: 0 = running, 1 = halted, 2 = tick budget exhausted, 3 = error.
-An error tick has no side effects: no register, memory, flag or PC update, and
+An error tick writes only the three fault fields - status, fault_reason (the cause
+code from isa_table's table) and fault_addr (the address of the instruction that
+faulted, taken at tick entry) - and no register, memory, flag, PC or tick update;
 step() rolls back on any exception, not only on a machine error. Stepping a
 machine whose status is not running is a no-op that changes nothing at all and is
 not an error. The tick budget and the output capacity (OUT_CAP bytes) are machine
@@ -33,11 +35,28 @@ OUT_CAP = 8192
 
 R_BITS = 8
 PTR_BITS = 16
+FAULT_BITS = ISA.FAULT_BITS
+
+STATUS_RUNNING = "RUNNING"
+STATUS_HALT = "HALT"
+STATUS_OVERRUN = "OVERRUN"
+STATUS_ERROR = "ERROR"
+STATUS_CODE = {STATUS_RUNNING: 0, STATUS_HALT: 1, STATUS_OVERRUN: 2, STATUS_ERROR: 3}
+
+CAUSE = ISA.CAUSE
 
 class MachineError(Exception):
+
+    def __init__(self, msg, reason=0):
+        super().__init__(msg)
+        self.reason = int(reason)
+
+class FaultCauseMissing(MachineError):
+
     pass
 
-def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, where=""):
+def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
+                fault_reason=0, fault_addr=0, where=""):
 
     def outside(field, value, lo, hi):
         raise ValueError(f"{where}state field {field} is {value}, outside [{lo}, {hi}]")
@@ -60,6 +79,9 @@ def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, wh
             outside(field, v, 0, "unbounded")
     if status not in (0, 1, 2, 3):
         outside("status", status, 0, 3)
+    bad = ISA.fault_state_error(status, fault_reason, fault_addr, where)
+    if bad is not None:
+        raise ValueError(bad)
 
 class NCP8:
     def __init__(self, code, data=None, inputs=b"", tick_budget=200_000):
@@ -84,29 +106,41 @@ class NCP8:
         self.out_cap = OUT_CAP
         self.tick = 0
         self.tb = tick_budget
-        self.status = "RUNNING"
+        self.status = STATUS_RUNNING
+
+        self.fault_reason = CAUSE["OK"]
+        self.fault_addr = 0
         self.trace: list[str] = []
 
-    def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0):
+    def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0, fault_reason=None,
+                   fault_addr=None):
 
-        check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC)
+        fr = self.fault_reason if fault_reason is None else fault_reason
+        fa = self.fault_addr if fault_addr is None else fault_addr
+        check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=self.ipos,
+                    status=STATUS_CODE[self.status], fault_reason=fr, fault_addr=fa)
         self.r = list(R)
         self.HL, self.DE, self.SP, self.C, self.Z = HL, DE, SP, C, Z
         self.tick, self.PC = tick, PC
+        self.fault_reason, self.fault_addr = fr, fa
+
+    def _fault(self, cause, msg):
+
+        raise MachineError(msg, reason=cause)
 
     def _mem(self, addr):
         if not 0 <= addr < DATA_SIZE:
-            raise MachineError(f"DATA out of range: {addr}")
+            self._fault(CAUSE["DATA_OOB"], f"DATA out of range: {addr}")
 
     def _mem16(self, addr):
 
         if not (0 <= addr and addr + 1 < DATA_SIZE):
-            raise MachineError(f"DATA out of range: {addr}")
+            self._fault(CAUSE["DATA_OOB"], f"DATA out of range: {addr}")
         return addr
 
     def _fetch(self, n):
         if self.PC + n > len(self.code):
-            raise MachineError(f"PC out of range: {self.PC}")
+            self._fault(CAUSE["FETCH_OOB"], f"PC out of range: {self.PC}")
         b = self.code[self.PC: self.PC + n]
         self.PC += n
         return b
@@ -114,17 +148,17 @@ class NCP8:
     def _stack_room(self, n):
 
         if not (0 <= self.SP - n and self.SP <= DATA_SIZE):
-            raise MachineError("stack underflow")
+            self._fault(CAUSE["STACK_OVERFLOW"], "stack overflow")
 
     def _stack_have(self, n):
 
         if not (0 <= self.SP and self.SP + n <= DATA_SIZE):
-            raise MachineError("stack overflow")
+            self._fault(CAUSE["STACK_UNDERFLOW"], "stack underflow")
 
     def _emit(self, v):
 
         if len(self.out) >= self.out_cap:
-            raise MachineError(f"output capacity {self.out_cap} exhausted")
+            self._fault(CAUSE["OUT_CAP"], f"output capacity {self.out_cap} exhausted")
         self.out.append(v & 0xFF)
 
     def _push(self, byte):
@@ -143,17 +177,29 @@ class NCP8:
         pc0 = self.PC
         try:
             self._step_inner()
+        except MachineError as e:
+
+            self.PC = pc0
+            reason = e.reason
+            if reason not in ISA.CAUSE_NAME or reason == CAUSE["OK"]:
+                raise FaultCauseMissing(
+                    f"the fault at PC {pc0:#04x} ({e}) carried no cause code from the "
+                    f"cause table, so the error tick cannot record fault_reason") from e
+            self.status = STATUS_ERROR
+            self.fault_reason = reason
+            self.fault_addr = pc0
+            raise
         except BaseException:
             self.PC = pc0
             raise
 
     def _step_inner(self):
 
-        if self.status != "RUNNING":
+        if self.status != STATUS_RUNNING:
             return
 
         if self.tick >= self.tb:
-            self.status = "OVERRUN"
+            self.status = STATUS_OVERRUN
             return
         pc0 = self.PC
 
@@ -162,18 +208,18 @@ class NCP8:
             (sub,) = self._fetch(1)
             row = ISA.ESCAPE.get(sub)
             if row is None:
-                raise MachineError(f"reserved subcode {sub:#04x} (ESC)  @ {pc0:#04x}")
+                self._fault(CAUSE["BAD_SUBCODE"], f"reserved subcode {sub:#04x} (ESC)  @ {pc0:#04x}")
         else:
             row = ISA.SINGLE.get(op)
             if row is None:
-                raise MachineError(f"undefined opcode {op:#04x} @ {pc0:#04x}")
+                self._fault(CAUSE["BAD_OPCODE"], f"undefined opcode {op:#04x} @ {pc0:#04x}")
         sel = row["alu"]
         s0, s1 = row["s0"], row["s1"]
         imm = self._fetch(row["l"])
         m = "???"
 
         if sel == "HALT":
-            self.status = "HALT"; m = "HALT"
+            self.status = STATUS_HALT; m = "HALT"
         elif sel == "NOP": m = "NOP"
         elif sel == "INC_HL": self.HL = (self.HL + 1) & 0xFFFF; m = "INC HL"
         elif sel == "DEC_HL": self.HL = (self.HL - 1) & 0xFFFF; m = "DEC HL"
@@ -251,7 +297,7 @@ class NCP8:
         elif sel in ("DIV", "MOD"):
             a, b = self.r[s0], self.r[s1]
             if b == 0:
-                raise MachineError(f"divide by zero {sel} r{s0}, r{s1} @ {pc0:#04x}")
+                self._fault(CAUSE["DIV_ZERO"], f"divide by zero {sel} r{s0}, r{s1} @ {pc0:#04x}")
             v = a // b if sel == "DIV" else a % b
             self.r[s0] = v; self.Z = int(v == 0); m = f"{sel} r{s0}, r{s1}"
         elif sel == "CMP":
@@ -279,11 +325,11 @@ class NCP8:
             self.DE = self.SP; m = "MOVW DE, SP"
         elif sel == "MOVW_SP_HL":
             if self.HL > DATA_SIZE:
-                raise MachineError(f"MOVW SP, HL out of range {self.HL} @ {pc0:#04x}")
+                self._fault(CAUSE["DATA_OOB"], f"MOVW SP, HL out of range {self.HL} @ {pc0:#04x}")
             self.SP = self.HL; m = "MOVW SP, HL"
         elif sel == "MOVW_SP_DE":
             if self.DE > DATA_SIZE:
-                raise MachineError(f"MOVW SP, DE out of range {self.DE} @ {pc0:#04x}")
+                self._fault(CAUSE["DATA_OOB"], f"MOVW SP, DE out of range {self.DE} @ {pc0:#04x}")
             self.SP = self.DE; m = "MOVW SP, DE"
         elif sel == "PUSHW_HL" or sel == "PUSHW_DE":
             v = self.HL if sel == "PUSHW_HL" else self.DE
@@ -331,7 +377,7 @@ class NCP8:
             sx = (imm[0] ^ 0x80) - 0x80
             sp = (self.SP + sx) & 0xFFFF
             if sp > DATA_SIZE:
-                raise MachineError(f"ADD SP out of range {sp} @ {pc0:#04x}")
+                self._fault(CAUSE["DATA_OOB"], f"ADD SP out of range {sp} @ {pc0:#04x}")
             self.SP = sp; m = f"ADD SP, {sx}"
         elif sel == "ADD_HLDE":
             t = self.HL + self.DE; self.C = t >> 16; self.HL = t & 0xFFFF; m = "ADD HL, DE"
@@ -341,7 +387,7 @@ class NCP8:
             self.HL, self.DE = self.DE, self.HL; m = "XCHG HL, DE"
         elif sel == "LDC":
             if not 0 <= self.HL < len(self.code):
-                raise MachineError(f"LDC out of range {self.HL} @ {pc0:#04x}")
+                self._fault(CAUSE["CODE_OOB"], f"LDC out of range {self.HL} @ {pc0:#04x}")
             self.r[s0] = self.code[self.HL]; m = f"LDC r{s0}, [HL]"
         elif sel == "STC":
 
@@ -349,9 +395,9 @@ class NCP8:
             wl = self.code[WLO] if WLO < len(self.code) else 0
             wh = self.code[WHI] if WHI < len(self.code) else 0
             if not 0 <= self.HL < len(self.code):
-                raise MachineError(f"STC out of range {self.HL} @ {pc0:#04x}")
+                self._fault(CAUSE["CODE_OOB"], f"STC out of range {self.HL} @ {pc0:#04x}")
             if not (wl <= self.HL < wh):
-                raise MachineError(
+                self._fault(CAUSE["WINDOW"],
                     f"STC outside window {self.HL:#x} not in [{wl:#x},{wh:#x}) @ {pc0:#04x}")
             b = bytearray(self.code); b[self.HL] = self.r[s0]; self.code = bytes(b)
             m = f"STC [HL], r{s0}"
@@ -362,13 +408,13 @@ class NCP8:
 
             k = imm[0]
             if k >= 16:
-                raise MachineError(f"EXT k out of range {k} @ {pc0:#04x}")
+                self._fault(CAUSE["TRAP_UNREG"], f"EXT k out of range {k} @ {pc0:#04x}")
             a = 0x0F00 + 2 * k
             tgt = 0
             if a + 1 < len(self.code):
                 tgt = (self.code[a + 1] << 8) | self.code[a]
             if tgt == 0:
-                raise MachineError(f"EXT handler {k} unregistered @ {pc0:#04x}")
+                self._fault(CAUSE["TRAP_UNREG"], f"EXT handler {k} unregistered @ {pc0:#04x}")
             self._stack_room(2)
             self._push(self.PC & 0xFF); self._push((self.PC >> 8) & 0xFF)
             self.PC = tgt; m = f"EXT {k}"
@@ -418,7 +464,9 @@ class NCP8:
                 self.r[s0] = 0; self.C = 1
             m = f"IN r{s0}"
         else:
-            raise MachineError(f"undefined opcode {op:#04x} @ {pc0:#04x}")
+
+            self._fault(CAUSE["BAD_SUBCODE" if row["space"] == "escape" else "BAD_OPCODE"],
+                        f"undefined opcode {op:#04x} @ {pc0:#04x}")
 
         self.trace.append(
             f"{self.tick:6d} {pc0:04X} {m:18s} | r=[{self.r[0]:3d},{self.r[1]:3d},{self.r[2]:3d},{self.r[3]:3d}]"
@@ -427,13 +475,19 @@ class NCP8:
         self.tick += 1
 
     def run(self):
-        while self.status == "RUNNING":
+        while self.status == STATUS_RUNNING:
             self.step()
         return self.out
 
     def snapshot(self):
+
         return dict(r=list(self.r), HL=self.HL, DE=self.DE, SP=self.SP, PC=self.PC,
-                    C=self.C, Z=self.Z, tick=self.tick, status=self.status)
+                    C=self.C, Z=self.Z, tick=self.tick, status=self.status,
+                    fault_reason=self.fault_reason, fault_addr=self.fault_addr)
+
+    def status_code(self):
+
+        return STATUS_CODE[self.status]
 
 class AssemblyError(Exception):
 
