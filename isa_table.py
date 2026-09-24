@@ -187,13 +187,13 @@ CAUSE_DESC = {name: desc for name, desc in FAULT_CAUSES}
 FAULT_CODES = tuple(range(len(FAULT_CAUSES)))
 
 CAUSES_AWAITING_FEATURE = {
-    "TRAP_DEPTH": "TDEPTH/TDLIM are wave F state; EXT has no depth check",
-    "TRAP_FRAME": "TRAPRET (subcode 0xA8) is a wave F instruction",
-    "TRAP_UNBALANCED": "TRAPRET (subcode 0xA8) is a wave F instruction",
-    "BAD_OPERAND": "the must-be-zero refusal of spec 5 is wave F",
-    "BANK_OOB": "MB and the bank family are wave D",
-    "BANK_BUSY": "MB, NBANKS and the group driver are wave D",
-    "PC_ILLEGAL": "spec 4.3 moves the branch-target bound onto the writing tick",
+    "TRAP_DEPTH": "this machine has no trap-depth counter, so EXT cannot overflow one",
+    "TRAP_FRAME": "subcode 0xA8 is unassigned, so no instruction returns from a trap",
+    "TRAP_UNBALANCED": "subcode 0xA8 is unassigned, so no instruction returns from a trap",
+    "BAD_OPERAND": "the must-be-zero operand refusal is not implemented on this machine",
+    "BANK_OOB": "there is no bank selector instruction on this machine",
+    "BANK_BUSY": "NBANKS is carried but no instruction reaches a neighbouring bank",
+    "PC_ILLEGAL": "a branch committing an out-of-image target faults on the tick that writes it",
 }
 
 FAULT_SITE_ORDER = (
@@ -229,6 +229,169 @@ def fault_code(name):
 
 FAULT_BITS = 8
 FAULT_ADDR_BITS = 16
+
+LEGACY_VEC_BASE = 0x0F00
+LEGACY_VEC_COUNT = 16
+LEGACY_WINDOW_LO_CELL = 0x0F20
+LEGACY_WINDOW_HI_CELL = 0x0F21
+LEGACY_CONFIG_HI = LEGACY_WINDOW_HI_CELL + 1
+
+CONFIG_NAMES = ("CODELEN", "WINLO", "WINHI", "VEC", "NBANKS", "TDLIM",
+                "TICKBUDGET", "OUTCAP")
+
+CONFIG_WIDTHS = {"CODELEN": 16, "WINLO": 16, "WINHI": 16, "VEC": 16, "NBANKS": 16,
+                 "TDLIM": 8, "TICKBUDGET": None, "OUTCAP": 16}
+
+OUT_CAP_LIMIT = 1 << 16
+
+class ConfigError(ValueError):
+
+    pass
+
+def _cfg_int(name, value, lo, hi):
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"configuration {name} must be an int in {lo}..{hi}, "
+                          f"got {value!r}")
+    if not lo <= value <= hi:
+        raise ConfigError(f"configuration {name} is {value}, outside {lo}..{hi}")
+    return value
+
+def check_capacity(value, width, field="out_cap"):
+
+    v = _cfg_int(field, value, 0, OUT_CAP_LIMIT - 1)
+    if v < 1:
+        raise ValueError(f"{field}={value} is below 1: a machine with no output "
+                         f"capacity cannot emit the byte that would tell you so")
+    if v & (v - 1):
+        raise ValueError(f"{field}={value} is not a power of two; the store masks "
+                         f"would let a write leave its own output buffer")
+    if v > width:
+        raise ValueError(f"{field}={value} exceeds the {width}-byte allocated output "
+                         f"buffer, so the capacity would not be the bound in force")
+    return v
+
+TICK_BUDGET_DEFAULT = 200_000
+
+def resolve_constraint(cfg_name, ctor_name, ctor_value, ctor_default, cfg_value):
+
+    if cfg_value is None:
+        return ctor_value
+    if ctor_value != ctor_default and ctor_value != cfg_value:
+        raise ConfigError(
+            f"{cfg_name} is declared twice with different values: the constructor "
+            f"argument {ctor_name}={ctor_value} and the configuration block "
+            f"{cfg_name}={cfg_value}; a bound with two sources has no defined "
+            f"winner, so pass one of them or leave {ctor_name} at its default "
+            f"{ctor_default}")
+    return cfg_value
+
+class MachineConfig:
+
+    __slots__ = ("codelen", "winlo", "winhi", "vec", "nbanks", "tdlim",
+                 "tickbudget", "outcap")
+
+    def __init__(self, *, codelen=None, winlo=None, winhi=None, vec=None,
+                 nbanks=None, tdlim=None, tickbudget=None, outcap=None):
+        self.codelen = (None if codelen is None
+                        else _cfg_int("CODELEN", codelen, 0, (1 << 16) - 1))
+        if (winlo is None) != (winhi is None):
+            raise ConfigError("WINLO and WINHI are one declaration: got "
+                              f"WINLO={winlo!r} without WINHI, or WINHI={winhi!r} "
+                              "without WINLO, which would leave half a bound")
+        if winlo is not None:
+            lo = _cfg_int("WINLO", winlo, 0, (1 << 16) - 1)
+            hi = _cfg_int("WINHI", winhi, 0, (1 << 16) - 1)
+            if hi < lo:
+                raise ConfigError(
+                    f"WINDOW: WINHI={hi} (0x{hi:04X}) is below WINLO={lo} "
+                    f"(0x{lo:04X}); a reversed window is refused at load rather than "
+                    f"run as the empty window [0x{lo:04X},0x{lo:04X}), which is how a "
+                    f"typo in one bound would come out looking like disabled "
+                    f"self-modification")
+            self.winlo, self.winhi = lo, hi
+        else:
+            self.winlo = self.winhi = None
+        self.vec = None if vec is None else self._checked_vec(vec)
+        self.nbanks = (None if nbanks is None
+                       else _cfg_int("NBANKS", nbanks, 1, (1 << 16) - 1))
+        self.tdlim = (None if tdlim is None
+                      else _cfg_int("TDLIM", tdlim, 0, (1 << 8) - 1))
+        if tickbudget is not None:
+            tickbudget = _cfg_int("TICKBUDGET", tickbudget, 0, 1 << 62)
+        self.tickbudget = tickbudget
+        if outcap is not None:
+            try:
+                outcap = check_capacity(outcap, OUT_CAP_LIMIT - 1, "OUTCAP")
+            except ValueError as e:
+
+                raise ConfigError(str(e)) from e
+        self.outcap = outcap
+
+    @staticmethod
+    def _checked_vec(vec):
+
+        table = [None] * LEGACY_VEC_COUNT
+        if isinstance(vec, dict):
+            for k, v in vec.items():
+                k = _cfg_int("VEC index", k, 0, LEGACY_VEC_COUNT - 1)
+                table[k] = _cfg_int(f"VEC[{k}]", v, 0, (1 << 16) - 1)
+        else:
+            entries = list(vec)
+            if len(entries) > LEGACY_VEC_COUNT:
+                raise ConfigError(f"VEC has {len(entries)} entries, this machine "
+                                  f"declares {LEGACY_VEC_COUNT} traps")
+            for k, v in enumerate(entries):
+                table[k] = _cfg_int(f"VEC[{k}]", v, 0, (1 << 16) - 1)
+        return tuple(0 if v is None else v for v in table)
+
+    @property
+    def has_window(self):
+        return self.winlo is not None
+
+    @property
+    def has_vec(self):
+        return self.vec is not None
+
+    def vector(self, k):
+
+        if self.vec is None:
+            raise ConfigError("no VEC was declared, so this machine still reads its "
+                              "trap vectors out of CODE; MachineConfig.vector() is "
+                              "not a way to ask the image")
+        return self.vec[k]
+
+    def equivalent_to_default(self):
+
+        return all(getattr(self, n) is None for n in self.__slots__)
+
+    def set_fields(self):
+
+        return [n for n in self.__slots__ if getattr(self, n) is not None]
+
+    def __eq__(self, other):
+        if not isinstance(other, MachineConfig):
+            return NotImplemented
+        return all(getattr(self, n) == getattr(other, n) for n in self.__slots__)
+
+    def __hash__(self):
+        return hash(tuple(getattr(self, n) for n in self.__slots__))
+
+    def __repr__(self):
+        return ("MachineConfig(" + ", ".join(
+            f"{n}={getattr(self, n)!r}" for n in self.__slots__
+            if getattr(self, n) is not None) + ")")
+
+def config_difference(before, after):
+
+    if before == after:
+        return None
+    moved = [n for n in MachineConfig.__slots__
+             if getattr(before, n) != getattr(after, n)]
+    return (f"configuration moved under the machine: {moved} changed, so a tick "
+            f"reached load-time input (before "
+            f"{ {n: getattr(before, n) for n in moved} }, after "
+            f"{ {n: getattr(after, n) for n in moved} })")
 
 def fault_state_error(status, fault_reason, fault_addr=0, where=""):
 
@@ -388,6 +551,43 @@ def check_structure():
     if max(ESC_EOP_ID.values()) > 0x1FF:
         raise DecodeTableError("Triton escape effective opcodes exceed the 9-bit range")
     check_fault_table()
+    return True
+
+def check_config_table():
+
+    if LEGACY_VEC_BASE + 2 * LEGACY_VEC_COUNT != LEGACY_WINDOW_LO_CELL:
+        raise DecodeTableError("the legacy vector table does not end where the window "
+                               "bound cells start, so the region named by "
+                               "LEGACY_CONFIG_HI is not the region the reads cover")
+    if LEGACY_WINDOW_HI_CELL != LEGACY_WINDOW_LO_CELL + 1:
+        raise DecodeTableError("the two legacy window bound cells are not adjacent")
+    if LEGACY_CONFIG_HI != LEGACY_WINDOW_HI_CELL + 1:
+        raise DecodeTableError("the legacy region does not end one past its last cell")
+    if tuple(n.upper() for n in MachineConfig.__slots__) != CONFIG_NAMES:
+        raise DecodeTableError("the configuration block's fields and CONFIG_NAMES "
+                               "disagree, so a survey of one misses a field of the "
+                               "other")
+    if set(CONFIG_WIDTHS) != set(CONFIG_NAMES):
+        raise DecodeTableError("a configuration name has no declared width")
+    if CONFIG_WIDTHS["VEC"] != 16 or LEGACY_VEC_COUNT != 16:
+        raise DecodeTableError("the vector entries and the trap count disagree about "
+                               "how wide a vector is")
+    if not MachineConfig().equivalent_to_default():
+        raise DecodeTableError("an empty configuration block is not the default one")
+    try:
+        MachineConfig(winlo=8, winhi=4)
+    except ConfigError:
+        pass
+    else:
+        raise DecodeTableError("a reversed window is not refused at load, so a reversed "
+                               "bound pair has no gate")
+    for bad in (0, 3, 6, OUT_CAP_LIMIT):
+        try:
+            check_capacity(bad, OUT_CAP_LIMIT - 1)
+        except ValueError:
+            continue
+        raise DecodeTableError(f"a capacity of {bad} is accepted, though it is neither "
+                               f"a positive power of two within the output buffer")
     return True
 
 def check_fault_table():

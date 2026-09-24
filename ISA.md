@@ -269,6 +269,40 @@ contain the tables it is supposed to have:
 Both failure messages describe the *symptom*, not this cause. A builder placing
 these tables must pad the image to at least `0x0F22` bytes.
 
+### 5.3 The same limits can be declared as load-time configuration
+
+`isa_table.MachineConfig` carries the bounds that describe a machine rather than a
+program. Construction validates it once; no instruction can read or write the block.
+
+| field | accepted values | what it bounds |
+|---|---|---|
+| `codelen` | 0..65535 | how many `CODE` bytes are the program |
+| `winlo`, `winhi` | 0..65535, supplied together or not at all | the self-modification window `[winlo, winhi)` |
+| `vec` | at most 16 entries, each 0..65535 | trap entry points; `0` means unregistered |
+| `tickbudget` | 0..2^62 | ticks before `OVERRUN` |
+| `outcap` | 1..65535 | output bytes before the capacity fault |
+| `nbanks` | 1..65535 | carried, not yet consulted by any instruction (memory banks) |
+| `tdlim` | 0..255 | carried, not yet consulted by any instruction (trap depth) |
+
+A field left as `None` is *absent*, and each implementation then uses the source it
+used before the block existed: `codelen` the loaded image length, `tickbudget` and
+`outcap` the constructor arguments, and the window bounds and trap vectors the `CODE`
+cells above. `equivalent_to_default()` reports a block that declares nothing.
+
+Declaring a bound in the block and also moving the matching constructor argument off
+its default to a different number is a load-time refusal (`resolve_constraint`) rather
+than a precedence rule; an argument sitting at its default is not a second declaration.
+A reversed window (`winhi < winlo`) is refused at construction and is never read as the
+empty window. `config_difference(before, after)` names the fields that moved between two
+blocks, which is how the acceptance suite states that no tick of a program changed the
+machine's own constraints.
+
+Until the block is the only source, the window bounds stay 8-bit and the tables above
+stay inside `CODE`, so section 5.1's reachability argument is still what protects them.
+`test_config_block.py` pins both halves: that a declared block changes behaviour
+identically on the reference and both circuits, and that nothing passes a block by
+default yet.
+
 ## 6. Invariants
 
 1. Flags change only through instructions that declare it.

@@ -82,16 +82,39 @@ def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
         raise ValueError(bad)
 
 class TorchCircuit:
-    def __init__(self, code, data=None, inputs=b"", tick_budget=200_000, device="cuda", rom_override=None):
+    def __init__(self, code, data=None, inputs=b"",
+                 tick_budget=ISA.TICK_BUDGET_DEFAULT, device="cuda",
+                 rom_override=None, out_cap=OUT_CAP, config=None):
 
         if len(code) > CODE_SIZE:
             raise ValueError(f"code image is {len(code)} bytes, above CODE_SIZE {CODE_SIZE}")
         if data and len(data) > DATA_SIZE:
             raise ValueError(f"data image is {len(data)} bytes, above DATA_SIZE {DATA_SIZE}")
+        cfg = ISA.MachineConfig() if config is None else config
+        if config is not None and not isinstance(config, ISA.MachineConfig):
+            raise ISA.ConfigError(
+                f"config must be an isa_table.MachineConfig, got a "
+                f"{type(config).__name__}: configuration is validated at load, and a "
+                f"mapping or tuple would arrive unchecked")
+        self.config = cfg
         dev = torch.device(device)
         self.dev = dev
         i32 = torch.int32
-        self.codelen = len(code)
+        self.codelen = len(code) if cfg.codelen is None else cfg.codelen
+        if self.codelen > CODE_SIZE:
+            raise ISA.ConfigError(
+                f"CODELEN={self.codelen} is past the {CODE_SIZE}-byte CODE buffer this "
+                f"machine allocates: the bound has to name storage that exists")
+        if self.codelen > len(code):
+            raise ISA.ConfigError(
+                f"CODELEN={self.codelen} is past the end of the {len(code)}-byte "
+                f"image: the machine would fetch bytes that were never loaded")
+        self.out_cap = ISA.resolve_constraint("OUTCAP", "out_cap", out_cap, OUT_CAP,
+                                              cfg.outcap)
+        ISA.check_capacity(self.out_cap, OUT_CAP)
+
+        self.nbanks = 1 if cfg.nbanks is None else cfg.nbanks
+        self.tdlim = 0 if cfg.tdlim is None else cfg.tdlim
         self.CODE = torch.zeros(CODE_SIZE, dtype=i32, device=dev)
         self.CODE[: len(code)] = torch.tensor(list(code), dtype=i32, device=dev)
         self.DATA = torch.zeros(DATA_SIZE, dtype=i32, device=dev)
@@ -100,7 +123,7 @@ class TorchCircuit:
         self.INPUTS = torch.zeros(1, dtype=i32, device=dev)
         self.inlen = torch.zeros(1, dtype=i32, device=dev)
         self.set_inputs(inputs)
-        self.OUTBUF = torch.zeros(OUT_CAP, dtype=i32, device=dev)
+        self.OUTBUF = torch.zeros(self.out_cap, dtype=i32, device=dev)
         self.R = torch.zeros(4, dtype=i32, device=dev)
         for n in ("HL", "DE", "PC", "SP", "C", "Z", "ipos", "oplen", "tick"):
             setattr(self, n, torch.zeros(1, dtype=i32, device=dev))
@@ -109,8 +132,11 @@ class TorchCircuit:
 
         self.fault_reason = torch.zeros(1, dtype=i32, device=dev)
         self.fault_addr = torch.zeros(1, dtype=i32, device=dev)
-        self.TB = torch.tensor([int(tick_budget)], dtype=i32, device=dev)
-        self.tb = int(tick_budget)
+        self.TB = torch.tensor(
+            [ISA.resolve_constraint("TICKBUDGET", "tick_budget", int(tick_budget),
+                                    ISA.TICK_BUDGET_DEFAULT, cfg.tickbudget)],
+            dtype=i32, device=dev)
+        self.tb = int(self.TB.item())
         if rom_override is not None:
             alu_v, s0_v, s1_v, ln_v = [v.cpu() for v in rom_override]
         else:
@@ -135,7 +161,14 @@ class TorchCircuit:
         self.RC = torch.arange(CODE_SIZE, dtype=i32, device=dev)
         self.IW0 = torch.tensor(0x0F20, dtype=i32, device=dev)
         self.IW1 = torch.tensor(0x0F21, dtype=i32, device=dev)
-        self.RO = torch.arange(OUT_CAP, dtype=i32, device=dev)
+        self.RO = torch.arange(self.out_cap, dtype=i32, device=dev)
+
+        self.cfg_win = None
+        self.cfg_vec = None
+        if cfg.has_window:
+            self.cfg_win = torch.tensor([cfg.winlo, cfg.winhi], dtype=i32, device=dev)
+        if cfg.has_vec:
+            self.cfg_vec = torch.tensor(list(cfg.vec), dtype=i32, device=dev)
 
         self.fault_codes = torch.tensor(_FAULT_CODES, dtype=i32, device=dev)
         self._acts = None
@@ -230,14 +263,25 @@ class TorchCircuit:
         t_hladd = self.HL + self.DE; v_hladd = t_hladd & 0xFFFF; c_hladd = t_hladd >> 16
         v_hlsub = (self.HL - self.DE) & 0xFFFF; c_hlsub = (self.HL < self.DE).to(i32)
 
-        veclo = self._g(self.CODE, 0x0F00 + 2 * imm0)
-        vec = veclo | (self._g(self.CODE, 0x0F00 + 2 * imm0 + 1) << 8)
+        if self.cfg_vec is None:
+            veclo = self._g(self.CODE, 0x0F00 + 2 * imm0)
+            vec = veclo | (self._g(self.CODE, 0x0F00 + 2 * imm0 + 1) << 8)
+        else:
+
+            vec = self._g(self.cfg_vec, imm0)
         ext_ok = (imm0 < 16).to(i32) * (vec != 0).to(i32)
 
-        wlo = self._g(self.CODE, self.IW0); whi = self._g(self.CODE, self.IW1)
+        if self.cfg_win is None:
+            wlo = self._g(self.CODE, self.IW0); whi = self._g(self.CODE, self.IW1)
+        else:
+            wlo, whi = self.cfg_win[0], self.cfg_win[1]
         code_ok = (self.HL < self.codelen).to(i32)
 
-        win_ok = (self.HL >= wlo).to(i32) * (self.HL < whi).to(i32)
+        stc_legacy = (zero if self.cfg_vec is None else
+                      (self.HL >= ISA.LEGACY_VEC_BASE).to(i32)
+                      * (self.HL < ISA.LEGACY_CONFIG_HI).to(i32))
+
+        win_ok = (self.HL >= wlo).to(i32) * (self.HL < whi).to(i32) * (1 - stc_legacy)
         ldc_v = self._g(self.CODE, self.HL)
 
         v_mulh = ((a * b) >> 8) & 255
@@ -382,7 +426,7 @@ class TorchCircuit:
         v3_err = (oh(MOVW_SP_HL) * (1 - hl_sp_ok) + oh(MOVW_SP_DE) * (1 - de_sp_ok)
                   + oh(ADD_SP) * (1 - sp_add_ok))
 
-        out_ovf = (ind * rows_out_en * (self.oplen >= OUT_CAP).to(i32)).sum()
+        out_ovf = (ind * rows_out_en * (self.oplen >= self.out_cap).to(i32)).sum()
 
         bad_rows = (ind * oh(BAD)).sum()
         fetch_code = (((1 - fetch_ok)
@@ -507,7 +551,7 @@ class TorchCircuit:
 
     def out(self):
 
-        n = min(int(self.oplen.item()), OUT_CAP)
+        n = min(int(self.oplen.item()), self.out_cap)
         return bytes(self.OUTBUF[:n].cpu().tolist())
 
     def run(self):

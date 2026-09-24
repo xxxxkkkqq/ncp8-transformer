@@ -421,8 +421,8 @@ main:
     assert err and snap["PC"] == stc_pc and snap["r"][0] == 42, ("out-of-window write was not atomic", stc_pc, snap)
 
     assert snap["status"] == "ERROR" and snap["fault_reason"] == ISA.CAUSE["WINDOW"], \
-        ("outside window", snap)
-    assert snap["fault_addr"] == stc_pc, ("outside window", stc_pc, snap)
+        ("the window fault recorded no cause", snap)
+    assert snap["fault_addr"] == stc_pc, ("the window fault reported the wrong address", stc_pc, snap)
 
     code = asm("LDI HL, 0\nLDC r0, [HL]\nOUT r0\nLDI HL, 1\nLDC r0, [HL]\nOUT r0\nHALT")
     g4 = NCP8(code)
