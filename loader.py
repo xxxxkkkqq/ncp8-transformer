@@ -1,0 +1,906 @@
+"""Loader for NCP-8: source text to a placed image, with symbols and metadata.
+
+Two-pass assembler front end adding what `golden_sim.asm` does not do: directives
+(`.org`, `.byte`, `.word`, `.ascii`, `.equ`), an expression parser for absolute and
+symbol-relative operands, a symbol table, and the load-time metadata the machine reads
+but cannot write - trap vector entries and the self-modification window bounds.
+
+Every refusal is a `LoaderError`, which is deliberately not a `MachineError`: a program
+that never assembled must not be catchable by a handler written for a program that ran
+and faulted. Placements are checked before anything is written, so a collision between
+two declarations is reported rather than resolved by whichever one came last.
+
+Run: python3 loader.py             (self-check)
+"""
+from __future__ import annotations
+
+import re
+
+import disasm
+from golden_sim import AssemblyError, CODE_SIZE, asm
+
+VEC_BASE = 0x0F00
+VEC_COUNT = 16
+VEC_LAST_CELL = VEC_BASE + 2 * (VEC_COUNT - 1)
+VEC_TABLE_END = VEC_BASE + 2 * VEC_COUNT
+WINDOW_LO_CELL = 0x0F20
+WINDOW_HI_CELL = 0x0F21
+
+MIN_IMAGE_FOR_VECTORS = VEC_BASE + 2
+MIN_IMAGE_FOR_WINDOW = WINDOW_HI_CELL + 1
+MIN_IMAGE_FOR_ABI = MIN_IMAGE_FOR_WINDOW
+
+PROTECTED_LO, PROTECTED_HI = VEC_BASE, WINDOW_HI_CELL + 1
+
+class LoaderError(AssemblyError):
+
+    pass
+
+_TOKEN = re.compile(r"\s*(?:(?P<num>0[xXbBoO][0-9a-fA-F_]+|[0-9][0-9_]*)"
+                    r"|(?P<name>[A-Za-z_]\w*)"
+                    r"|(?P<op><<|>>|//|[-+*%&|^~(),/])"
+                    r"|(?P<bad>.))")
+_FUNCS = {"low": lambda v: v & 0xFF, "high": lambda v: (v >> 8) & 0xFF, "abs": abs}
+
+class _Tok:
+    __slots__ = ("kind", "text")
+
+    def __init__(self, kind, text):
+        self.kind, self.text = kind, text
+
+    def __repr__(self):
+        return f"{self.kind}({self.text!r})"
+
+def _lex(expr, lineno):
+    out, pos = [], 0
+    while pos < len(expr):
+        m = _TOKEN.match(expr, pos)
+        if m is None:
+            raise LoaderError(f"cannot tokenize {expr[pos:pos + 8]!r} in {expr!r}", lineno)
+        pos = m.end()
+        for kind in ("num", "name", "op"):
+            if m.group(kind) is not None:
+                out.append(_Tok(kind, m.group(kind)))
+                break
+        else:
+            raise LoaderError(f"unexpected character {m.group('bad')!r} in {expr!r}", lineno)
+    out.append(_Tok("end", ""))
+    return out
+
+class _Expr:
+
+    def __init__(self, toks, text, lineno, symbols):
+        self.toks, self.i = toks, 0
+        self.text, self.lineno, self.symbols = text, lineno, symbols
+
+    def parse(self):
+        v = self.or_()
+        if self.peek().kind != "end":
+            raise LoaderError(f"trailing {self.peek().text!r} in {self.text!r}", self.lineno)
+        return v
+
+    def peek(self):
+        return self.toks[self.i]
+
+    def take(self, text):
+        t = self.peek()
+        if t.kind == "op" and t.text == text:
+            self.i += 1
+            return True
+        return False
+
+    def expect(self, text):
+        if not self.take(text):
+            raise LoaderError(f"expected {text!r} in {self.text!r}", self.lineno)
+
+    def or_(self):
+        v = self.xor()
+        while self.take("|"):
+            v |= self.xor()
+        return v
+
+    def xor(self):
+        v = self.and_()
+        while self.take("^"):
+            v ^= self.and_()
+        return v
+
+    def and_(self):
+        v = self.shift()
+        while self.take("&"):
+            v &= self.shift()
+        return v
+
+    def shift(self):
+        v = self.add()
+        while True:
+            if self.take("<<"):
+                v <<= self.add()
+            elif self.take(">>"):
+                s = self.add()
+                if s < 0:
+                    raise LoaderError(f"negative right shift in {self.text!r}", self.lineno)
+                v >>= s
+            else:
+                return v
+
+    def add(self):
+        v = self.mul()
+        while True:
+            if self.take("+"):
+                v += self.mul()
+            elif self.take("-"):
+                v -= self.mul()
+            else:
+                return v
+
+    def mul(self):
+        v = self.unary()
+        while True:
+            if self.take("*"):
+                v *= self.unary()
+            elif self.take("//"):
+                d = self.unary()
+                if d == 0:
+                    raise LoaderError(f"division by zero in {self.text!r}", self.lineno)
+                v //= d
+            elif self.take("%"):
+                d = self.unary()
+                if d == 0:
+                    raise LoaderError(f"division by zero in {self.text!r}", self.lineno)
+                v %= d
+            elif self.take("/"):
+                raise LoaderError(f"'/' yields a float, use // in {self.text!r}", self.lineno)
+            else:
+                return v
+
+    def unary(self):
+        if self.take("+"):
+            return self.unary()
+        if self.take("-"):
+            return -self.unary()
+        if self.take("~"):
+            return ~self.unary()
+        return self.primary()
+
+    def primary(self):
+        t = self.peek()
+        if t.kind == "num":
+            self.i += 1
+            return int(t.text.replace("_", ""), 0)
+        if t.kind == "name":
+            self.i += 1
+            if self.take("("):
+                if t.text not in _FUNCS:
+                    raise LoaderError(f"unknown function {t.text!r} in {self.text!r}",
+                                      self.lineno)
+                arg = self.or_()
+                self.expect(")")
+                return _FUNCS[t.text](arg)
+            if t.text in self.symbols:
+                return self.symbols[t.text]
+            raise LoaderError(f"undefined symbol {t.text!r} in {self.text!r}", self.lineno)
+        if t.kind == "op" and t.text == "(":
+            self.i += 1
+            v = self.or_()
+            self.expect(")")
+            return v
+        raise LoaderError(f"cannot parse {t.text!r} in {self.text!r}", self.lineno)
+
+class Symbols:
+
+    def __init__(self):
+        self._addr = {}
+        self._const = {}
+
+    def add(self, name, value, lineno, const):
+        if not re.fullmatch(r"[A-Za-z_]\w*", name):
+            raise LoaderError(f"invalid symbol name {name!r}", lineno)
+        if name in self._addr or name in self._const:
+            kind = "constant" if name in self._const else "label"
+            raise LoaderError(f"symbol {name!r} defined twice (already a {kind})", lineno)
+        (self._const if const else self._addr)[name] = int(value)
+
+    def value(self, name):
+        if name in self._addr:
+            return self._addr[name]
+        if name in self._const:
+            return self._const[name]
+        raise LoaderError(f"undefined symbol {name!r}")
+
+    def is_address(self, name):
+        return name in self._addr
+
+    def flat(self):
+        out = dict(self._addr)
+        out.update(self._const)
+        return out
+
+    def as_dict(self):
+        return self.flat()
+
+    def names(self):
+        return set(self._addr) | set(self._const)
+
+    def kind_of(self, name):
+        if name in self._const:
+            return "constant"
+        if name in self._addr:
+            return "address"
+        raise LoaderError(f"undefined symbol {name!r}")
+
+    def __contains__(self, name):
+        return name in self.names()
+
+def expression_names(expr):
+
+    return {m.group("name") for m in _TOKEN.finditer(str(expr)) if m.group("name")}
+
+def evaluate(expr, symbols, lineno, *, forward=None):
+
+    text = str(expr).strip()
+    if not text:
+        raise LoaderError("empty expression", lineno)
+    try:
+        toks = _lex(text, lineno)
+    except LoaderError as e:
+        raise e if e.line is not None else LoaderError(e.msg, lineno)
+    try:
+        return _Expr(toks, text, lineno, symbols).parse()
+    except LoaderError as e:
+        if e.line is not None:
+            raise
+        raise LoaderError(e.msg, lineno)
+
+_KIND_OF_PLACEHOLDER = {"{a16}": "addr16", "{i16}": "addr16", "{i8}": "imm8",
+                        "{k}": "imm8", "{soff}": "soff", "{rcanon}": "reg",
+                        "{off}": "frame"}
+_REG_RE = re.compile(r"^r[0-3]$")
+_MEM_RE = re.compile(r"^\[(?:HL|DE)\]$")
+_FRAME_RE = re.compile(r"^\[HL(?:([+-])([^\]]+))?\]$")
+_FRAME_TEMPLATE = "[HL{off}]"
+
+def _classify_piece(piece):
+
+    if piece == _FRAME_TEMPLATE:
+        return ("frame", None)
+    for ph, kind in _KIND_OF_PLACEHOLDER.items():
+        if ph in piece:
+            if piece != ph:
+                raise LoaderError(f"template operand {piece!r} mixes a placeholder with "
+                                  "other text, which the shape table cannot represent")
+            return (kind, None)
+    if piece == "r?" or _REG_RE.match(piece):
+        return ("reg", None)
+    if _MEM_RE.match(piece):
+        return ("mem", piece)
+    if piece == "[HL*]" or _FRAME_RE.match(piece):
+        return ("frame", None)
+    return ("fixed", piece)
+
+def _generalise(piece):
+
+    out = re.sub(r"\br[0-3]\b", "r?", piece)
+    out = out.replace("{rcanon}", "r?")
+    out = re.sub(r"\[HL\s*(?:[+-]\s*[^\]]+)?\]", "[HL*]", out)
+    return out
+
+def _shape_element(spec):
+
+    kind, fixed = spec
+    if kind == "fixed":
+        return _generalise(fixed)
+    if kind == "mem":
+        return fixed
+    return kind
+
+def build_shapes():
+
+    rows = [(tmpl, size, op) for op, (tmpl, size) in disasm.SINGLE.items()]
+    rows += [(tmpl, size, 0x7000 | sub) for sub, (tmpl, size) in disasm.ESC.items()]
+    groups = {}
+    for tmpl, size, cp in rows:
+        name, _, rest = tmpl.partition(" ")
+        name = name.strip()
+        pieces = [p.strip() for p in rest.split(",")] if rest.strip() else []
+        specs = tuple(_classify_piece(p) for p in pieces)
+        key = (name, tuple(_shape_element(s) for s in specs))
+        got = groups.get(key)
+        if got is None:
+            groups[key] = [name, specs, size, [cp], tmpl]
+            continue
+        if got[2] != size:
+            raise LoaderError(f"operand shape {key!r} covers both a {got[2]}-byte encoding "
+                              f"({got[4]!r}) and a {size}-byte one ({tmpl!r})")
+        got[3].append(cp)
+    table = {}
+    for name, specs, size, cps, tmpl in groups.values():
+        table.setdefault(name, []).append((name, specs, size, tuple(cps), tmpl))
+    for v in table.values():
+        v.sort(key=lambda e: (-len(e[1]), e[3][0]))
+    return table
+
+SHAPES = build_shapes()
+
+def _match_operand(spec, user):
+
+    kind, fixed = spec
+    if kind == "fixed":
+        return user == fixed
+    if kind == "reg":
+        return bool(_REG_RE.match(user))
+    if kind == "mem":
+        return user == fixed or (fixed is None and bool(_MEM_RE.match(user)))
+    if kind == "frame":
+        return bool(_FRAME_RE.match(user.replace(" ", "")))
+    if kind in ("addr16", "imm8", "soff"):
+        return bool(user)
+    raise LoaderError(f"internal: unhandled operand kind {kind!r}")
+
+def _accepted(name):
+    if name not in SHAPES:
+        return "no such mnemonic"
+    return " | ".join(repr(e[4]) for e in sorted(SHAPES[name], key=lambda e: e[4]))
+
+_KIND_WORDS = {"reg": "register operand (want r0-r3)",
+               "mem": "memory operand (want [HL] or [DE])",
+               "frame": "frame operand (want [HL], [HL+i8] or [HL-i8])"}
+
+def _blame(name, args, lineno):
+
+    same_arity = [e for e in SHAPES.get(name, []) if len(e[1]) == len(args)]
+
+    for i, a in enumerate(args):
+        if re.fullmatch(r"r\d+", a) and not _REG_RE.match(a):
+            if any(e[1][i][0] == "reg" for e in same_arity):
+                return (f"{name} {', '.join(args)}: invalid register operand (want r0-r3) "
+                        f"{a!r} in position {i + 1}")
+    if len(same_arity) == 1:
+        specs = same_arity[0][1]
+        for i, (spec, a) in enumerate(zip(specs, args)):
+            if not _match_operand(spec, a):
+                word = _KIND_WORDS.get(spec[0])
+                if word is None:
+                    word = f"operand (must read {spec[1]!r})"
+                return (f"{name} {', '.join(args)}: invalid {word} {a!r} in position {i + 1}")
+    return (f"{name} {', '.join(args)}: matches no assigned encoding")
+
+def match_shape(name, args, lineno):
+
+    cands = []
+    for entry in SHAPES.get(name, []):
+        _n, specs, _size, _cp, _tmpl = entry
+        if len(specs) != len(args):
+            continue
+        if all(_match_operand(spec, a) for spec, a in zip(specs, args)):
+            cands.append(entry)
+    if not cands:
+        raise LoaderError(f"{_blame(name, args, lineno)}; accepted forms for {name!r}: "
+                          f"{_accepted(name)}", lineno)
+    kinds = {tuple(k for k, _ in e[1]) for e in cands}
+    if len(kinds) > 1:
+        raise LoaderError(f"{name} {', '.join(args)}: matches several encodings "
+                          f"{sorted(kinds)}, the text is ambiguous", lineno)
+    return cands[0]
+
+def resolve_line(name, args, lineno):
+
+    try:
+        return match_shape(name, args, lineno), list(args)
+    except LoaderError:
+        if args:
+            raise
+        cands = [e for e in SHAPES.get(name, []) if all(k == "fixed" for k, _ in e[1])]
+        if len(cands) != 1:
+            raise LoaderError(f"{name}: matches no assigned encoding; accepted forms for "
+                              f"{name!r}: {_accepted(name)}", lineno)
+        return cands[0], [f for _k, f in cands[0][1]]
+
+def _render_operand(spec, text, symbols, lineno, name):
+
+    kind = spec[0]
+    if kind in ("fixed", "reg", "mem"):
+        return text
+    if kind == "frame":
+        m = _FRAME_RE.match(text.replace(" ", ""))
+        sign, num = m.group(1), m.group(2)
+        if num is None:
+            return "[HL]"
+        _reject_address_symbols(num, symbols, lineno, name, "frame offset")
+        v = evaluate(num, symbols.flat(), lineno)
+        if sign == "-":
+            v = -v
+        if not -128 <= v <= 127:
+            raise LoaderError(f"{name} frame offset {v} is outside -128..127 "
+                              f"in {text!r}", lineno)
+        return "[HL]" if v == 0 else f"[HL{v:+d}]"
+    if kind in ("imm8", "soff"):
+        _reject_address_symbols(text, symbols, lineno, name, kind)
+    v = evaluate(text, symbols.flat(), lineno)
+    if kind == "addr16":
+        if not 0 <= v <= 0xFFFF:
+            raise LoaderError(f"{name} address {v} is outside 0..65535 in {text!r}", lineno)
+        return f"0x{v:04X}"
+    if kind == "imm8":
+        if not 0 <= v <= 0xFF:
+            raise LoaderError(f"{name} immediate {v} is outside 0..255 in {text!r}", lineno)
+        if name == "EXT" and v >= VEC_COUNT:
+            raise LoaderError(f"EXT {v}: the trap vector table holds indices "
+                              f"0..{VEC_COUNT - 1}, so this code point can never be "
+                              f"dispatched (write the bytes with .byte if that is intended)",
+                              lineno)
+        return f"0x{v:02X}"
+    if kind == "soff":
+        if not -128 <= v <= 127:
+            raise LoaderError(f"{name} needs a signed 8-bit value, {v} is outside "
+                              f"-128..127 in {text!r}", lineno)
+        return str(v)
+    raise LoaderError(f"internal: cannot render operand kind {kind!r}", lineno)
+
+def _reject_address_symbols(text, symbols, lineno, name, slot):
+
+    for ref in sorted(expression_names(text)):
+        if ref in symbols and symbols.is_address(ref):
+            raise LoaderError(f"{name} needs a numeric value in the {slot} slot, but "
+                              f"{ref!r} is a label (a code address) in {text!r}", lineno)
+
+_LABEL = re.compile(r"^([A-Za-z_]\w*):$")
+_DIRECTIVES = {".org", ".byte", ".word", ".ascii", ".equ"}
+_ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\", '"': '"'}
+
+def _strip_comment(raw):
+
+    out, i, in_str = [], 0, False
+    while i < len(raw):
+        ch = raw[i]
+        if in_str:
+            if ch == "\\":
+                out.append(ch)
+                if i + 1 < len(raw):
+                    out.append(raw[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == ";":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out).strip()
+
+def _split_args(s):
+
+    out, buf, i, in_str = [], [], 0, False
+    while i < len(s):
+        ch = s[i]
+        if in_str:
+            if ch == "\\":
+                buf.append(ch)
+                if i + 1 < len(s):
+                    buf.append(s[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == ",":
+            out.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    out.append("".join(buf).strip())
+    return out
+
+class _Item:
+    __slots__ = ("kind", "payload", "lineno", "text")
+
+    def __init__(self, kind, payload, lineno, text):
+        self.kind, self.payload = kind, payload
+        self.lineno, self.text = lineno, text
+
+    def __repr__(self):
+        return f"<{self.kind} {self.payload!r} line {self.lineno}>"
+
+def _ascii_bytes(payload, lineno):
+    payload = payload.strip()
+    if len(payload) < 2 or not payload.startswith('"') or not payload.endswith('"'):
+        raise LoaderError(f'.ascii needs one double-quoted string, got {payload!r}', lineno)
+    body = payload[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\":
+            if i + 1 >= len(body) or body[i + 1] not in _ESCAPES:
+                raise LoaderError(f'.ascii unknown escape {body[i:i + 2]!r}', lineno)
+            out.append(ord(_ESCAPES[body[i + 1]]))
+            i += 2
+            continue
+        if ch == '"':
+            raise LoaderError('.ascii string contains an unescaped quote', lineno)
+        out.append(ord(ch))
+        i += 1
+    return bytes(out)
+
+def _parse(src):
+    items = []
+    for lineno, raw in enumerate(src.splitlines(), 1):
+        line = _strip_comment(raw)
+        if not line:
+            continue
+        m = _LABEL.match(line)
+        if m:
+            items.append(_Item("label", m.group(1), lineno, line))
+            continue
+        name, _, rest = line.partition(" ")
+        name = name.strip()
+        if name in _DIRECTIVES:
+            items.append(_Item(name[1:], rest.strip(), lineno, line))
+            continue
+        if name.startswith("."):
+            raise LoaderError(f"unknown directive {name!r}", lineno)
+        args = [a for a in _split_args(rest)] if rest.strip() else []
+        items.append(_Item("inst", (name, args), lineno, line))
+    return items
+
+def _checked_int(value, what, lo, hi, lineno=None):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise LoaderError(f"{what} must be an int in {lo}..{hi}, got {value!r}", lineno)
+    if not lo <= value <= hi:
+        raise LoaderError(f"{what} is {value}, outside {lo}..{hi}", lineno)
+    return value
+
+def _resolve(value, symbols, what, lo, hi, lineno=None):
+
+    if isinstance(value, str):
+        if value not in symbols:
+            raise LoaderError(f"{what} refers to undefined symbol {value!r}", lineno)
+        value = symbols.value(value)
+    return _checked_int(value, what, lo, hi, lineno)
+
+class LoadResult:
+
+    __slots__ = ("image", "symbols", "entry", "report", "vectors", "window",
+                 "origins", "entry_explicit", "content_extent", "needed")
+
+    def __init__(self, image, symbols, entry, report, vectors, window, origins,
+                 entry_explicit, content_extent, needed):
+        self.image = bytes(image)
+        self.symbols = symbols
+        self.entry = entry
+        self.report = list(report)
+        self.vectors = dict(vectors)
+        self.window = None if window is None else tuple(window)
+        self.origins = origins
+        self.entry_explicit = entry_explicit
+        self.content_extent = content_extent
+        self.needed = needed
+
+    def __len__(self):
+        return len(self.image)
+
+    @property
+    def length(self):
+        return len(self.image)
+
+    def __repr__(self):
+        return (f"<LoadResult {len(self.image)} bytes, entry=0x{self.entry:04X}, "
+                f"{len(self.symbols)} symbols, {len(self.vectors)} vectors>")
+
+    def summary(self):
+        return "\n".join(self.report)
+
+    def to_machine(self, **kw):
+
+        from golden_sim import NCP8
+        return NCP8(self.image, **kw)
+
+def _next_pow2(v):
+    if v <= 1:
+        return 1
+    return 1 << (v - 1).bit_length()
+
+def abi_needed(vectors=None, window=None, content_extent=1):
+
+    need = max(int(content_extent), 1)
+    if vectors:
+        for k in vectors:
+            _checked_int(k, "vector index", 0, VEC_COUNT - 1)
+        need = max(need, VEC_BASE + 2 * (max(vectors) + 1))
+    if window is not None:
+        need = max(need, MIN_IMAGE_FOR_WINDOW)
+    return need
+
+def assemble(src, *, vectors=None, window=None, image=None, entry=None):
+
+    if not isinstance(src, str):
+        raise LoaderError(f"src must be a string, got a {type(src).__name__}")
+    if vectors is not None and not isinstance(vectors, dict):
+        raise LoaderError(f"vectors must be a dict of index -> label_or_int, got "
+                          f"a {type(vectors).__name__}")
+    vectors = {} if vectors is None else dict(vectors)
+    if window is not None and not (isinstance(window, (tuple, list)) and len(window) == 2):
+        raise LoaderError(f"window must be a (lo, hi) pair, got {window!r}")
+    items = _parse(src)
+    symbols = Symbols()
+
+    later = set()
+    for it in items:
+        if it.kind == "label":
+            later.add(it.payload)
+        elif it.kind == "equ":
+            later.add(it.payload.partition(",")[0].strip())
+
+    def value_now(expr, lineno, where):
+
+        try:
+            return evaluate(expr, symbols.flat(), lineno)
+        except LoaderError as e:
+            for ref in expression_names(expr) & later:
+                if ref not in symbols:
+                    raise LoaderError(f"{where} cannot refer to {ref!r}: it is defined "
+                                      f"later in the source", lineno) from None
+            raise
+
+    sizes = []
+    pc = 0
+    for it in items:
+        if it.kind == "label":
+            symbols.add(it.payload, pc, it.lineno, const=False)
+            sizes.append((it, 0))
+            continue
+        if it.kind == "equ":
+            name, _, expr = it.payload.partition(",")
+            name = name.strip()
+            if not expr.strip():
+                raise LoaderError(".equ needs NAME, <expr>", it.lineno)
+            symbols.add(name, value_now(expr, it.lineno, ".equ"), it.lineno, const=True)
+            sizes.append((it, 0))
+            continue
+        if it.kind == "org":
+            target = value_now(it.payload, it.lineno, ".org")
+            _checked_int(target, ".org target", 0, CODE_SIZE, it.lineno)
+            pc = target
+            sizes.append((it, 0))
+            continue
+        if it.kind in ("byte", "word"):
+            args = [a for a in _split_args(it.payload)]
+            if not args or not any(args):
+                raise LoaderError(f".{it.kind} needs at least one expression", it.lineno)
+            for a in args:
+                if not a:
+                    raise LoaderError(f".{it.kind} has an empty expression "
+                                      f"(check for a trailing comma)", it.lineno)
+            n = (1 if it.kind == "byte" else 2) * len(args)
+            sizes.append((it, n))
+            pc += n
+            continue
+        if it.kind == "ascii":
+            n = len(_ascii_bytes(it.payload, it.lineno))
+            sizes.append((it, n))
+            pc += n
+            continue
+        name, args = it.payload
+        shape, _operands = resolve_line(name, args, it.lineno)
+        sizes.append((it, shape[2]))
+        pc += shape[2]
+
+    out, origins, blocks = {}, {}, []
+    hi_water = 0
+
+    def place(kind, addr, data, lineno, text):
+        nonlocal hi_water
+        for i, byte in enumerate(data):
+            a = addr + i
+            if not 0 <= a < CODE_SIZE:
+                raise LoaderError(f"{kind} reaches address 0x{a:X}, outside CODE "
+                                  f"(0..{CODE_SIZE - 1})", lineno)
+            if a in out:
+                raise LoaderError(f"{kind} at 0x{a:04X} overlaps a byte already placed "
+                                  f"there ({origins[a]})", lineno)
+            out[a] = byte
+            origins[a] = f"{kind} at line {lineno}: {text}"
+        blocks.append((kind, addr, len(data), lineno, text))
+        hi_water = max(hi_water, addr + len(data))
+
+    pc = 0
+    for it, _size in sizes:
+        if it.kind == "org":
+            pc = value_now(it.payload, it.lineno, ".org")
+            continue
+        if it.kind in ("label", "equ"):
+            continue
+        if it.kind == "byte":
+            for expr in _split_args(it.payload):
+                v = evaluate(expr, symbols.flat(), it.lineno)
+                _checked_int(v, ".byte value", 0, 0xFF, it.lineno)
+                place("byte", pc, bytes([v]), it.lineno, f"{expr} = {v}")
+                pc += 1
+            continue
+        if it.kind == "word":
+            for expr in _split_args(it.payload):
+                v = evaluate(expr, symbols.flat(), it.lineno)
+                _checked_int(v, ".word value", 0, 0xFFFF, it.lineno)
+                place("word", pc, (v & 0xFFFF).to_bytes(2, "little"), it.lineno,
+                      f"{expr} = {v}")
+                pc += 2
+            continue
+        if it.kind == "ascii":
+            data = _ascii_bytes(it.payload, it.lineno)
+            place("ascii", pc, data, it.lineno, it.payload)
+            pc += len(data)
+            continue
+        name, args = it.payload
+        shape, operands = resolve_line(name, args, it.lineno)
+        _n, specs, size, cps, _tmpl = shape
+        rendered = [_render_operand(spec, a, symbols, it.lineno, name)
+                    for spec, a in zip(specs, operands)]
+        text = name if not rendered else f"{name} {', '.join(rendered)}"
+        try:
+            data = asm(text)
+        except AssemblyError as e:
+            detail = e.msg if isinstance(e, AssemblyError) else str(e)
+            raise LoaderError(f"{it.text!r} as canonical {text!r}: {detail}",
+                              it.lineno) from e
+        if len(data) != size:
+            raise LoaderError(f"{text!r} encoded to {len(data)} bytes, but code point "
+                              f"0x{cps[0]:04X} is {size} bytes in the decoder", it.lineno)
+        if disasm.decode(data, 0).size != size:
+            raise LoaderError(f"internal: {text!r} encoded to {data.hex()} but the decoder "
+                              f"reads {disasm.decode(data, 0).size} bytes at 0x{cps[0]:04X}",
+                              it.lineno)
+        place("code", pc, data, it.lineno, text)
+        pc += size
+
+    content_extent = hi_water
+    for k in sorted(vectors):
+        _checked_int(k, "vector index", 0, VEC_COUNT - 1)
+    needed = abi_needed(vectors, window, content_extent)
+
+    if image is not None:
+        _checked_int(image, "image length", 1, CODE_SIZE)
+        length = image
+        if length < needed:
+            raise LoaderError(_short_image_message(length, needed, content_extent,
+                                                   vectors, window), None)
+    else:
+        floor = needed
+        if vectors or window is not None:
+            floor = max(floor, MIN_IMAGE_FOR_ABI)
+        length = _next_pow2(floor)
+        if length > CODE_SIZE:
+            raise LoaderError(f"content needs {floor} bytes, so the image would be "
+                              f"{length}, above CODE_SIZE {CODE_SIZE}")
+    if length > CODE_SIZE:
+        raise LoaderError(f"image length {length} is above CODE_SIZE {CODE_SIZE}")
+    if content_extent > length:
+        raise LoaderError(f"content reaches 0x{content_extent - 1:04X}, past the end of "
+                          f"the {length}-byte image", None)
+
+    image_bytes = bytearray(length)
+    for a in sorted(out):
+        image_bytes[a] = out[a]
+
+    placed_vectors = {}
+    for k in sorted(vectors):
+        tgt = _resolve(vectors[k], symbols, f"vector {k} target", 0, 0xFFFF)
+        cell = VEC_BASE + 2 * k
+        if cell + 1 >= length:
+            raise LoaderError(
+                f"vector {k} lives at 0x{cell:04X}..0x{cell + 1:04X} but the image is "
+                f"{length} bytes, so the reference never reads it: EXT {k} would report "
+                f"'handler {k} unregistered' however this cell is written "
+                f"(needs at least {cell + 2} bytes)", None)
+        for a in (cell, cell + 1):
+            if a in out:
+                raise LoaderError(f"vector {k} would overwrite a byte already placed at "
+                                  f"0x{a:04X} ({origins[a]})", None)
+        if tgt == 0:
+            raise LoaderError(
+                f"vector {k} targets address 0, which the reference reads as 'handler {k} "
+                f"not registered', so the trap fails instead of running anything. Point it "
+                f"at a handler, or if the unregistered entry is intended write it as a "
+                f"literal: .org 0x{cell:04X} / .word 0", None)
+        if tgt >= length:
+            raise LoaderError(f"vector {k} targets 0x{tgt:04X}, past the end of the "
+                              f"{length}-byte image: the handler's first fetch would fault "
+                              f"as an out-of-range PC instead of running", None)
+        image_bytes[cell] = tgt & 0xFF
+        image_bytes[cell + 1] = tgt >> 8
+        origins[cell] = origins[cell + 1] = f"vector {k} -> 0x{tgt:04X}"
+        placed_vectors[k] = tgt
+        blocks.append(("vector", cell, 2, None, f"vector {k} -> 0x{tgt:04X}"))
+
+    placed_window = None
+    if window is not None:
+        lo = _resolve(window[0], symbols, "window lo", 0, 0xFF)
+        hi = _resolve(window[1], symbols, "window hi", 0, 0xFF)
+        if hi < lo:
+            raise LoaderError(f"window bounds are reversed: lo=0x{lo:02X} hi=0x{hi:02X}",
+                              None)
+        if WINDOW_HI_CELL >= length:
+            raise LoaderError(
+                f"the window bounds live at 0x{WINDOW_LO_CELL:04X}..0x{WINDOW_HI_CELL:04X} "
+                f"but the image is {length} bytes, so the reference sees an undeclared "
+                f"[0x0000,0x0000) window and every STC faults as 'outside window' "
+                f"(needs at least {MIN_IMAGE_FOR_WINDOW} bytes)", None)
+
+        if not (hi <= PROTECTED_LO or lo >= PROTECTED_HI):
+            raise LoaderError(
+                f"window [0x{lo:04X}, 0x{hi:04X}) overlaps the protected read-only cells "
+                f"[0x{PROTECTED_LO:04X}, 0x{PROTECTED_HI:04X}): STC could rewrite a trap "
+                f"vector or the window bounds themselves", None)
+        for cell, which in ((WINDOW_LO_CELL, "lo"), (WINDOW_HI_CELL, "hi")):
+            if cell in out:
+                raise LoaderError(f"window {which} would overwrite a byte already placed "
+                                  f"at 0x{cell:04X} ({origins[cell]})", None)
+        image_bytes[WINDOW_LO_CELL] = lo
+        image_bytes[WINDOW_HI_CELL] = hi
+        origins[WINDOW_LO_CELL] = f"window lo -> 0x{lo:04X}"
+        origins[WINDOW_HI_CELL] = f"window hi -> 0x{hi:04X}"
+        placed_window = (lo, hi)
+        blocks.append(("window", WINDOW_LO_CELL, 2, None,
+                       f"window [0x{lo:04X}, 0x{hi:04X})"))
+
+    if entry is None:
+        entry_explicit = False
+        entry = symbols.value("main") if "main" in symbols else 0
+    else:
+        entry_explicit = True
+        entry = _resolve(entry, symbols, "entry", 0, 0xFFFF)
+        if entry >= length:
+            raise LoaderError(f"entry 0x{entry:04X} is past the end of the {length}-byte "
+                              f"image", None)
+
+    rep = [f"image: {length} bytes "
+           + ("(length requested exactly)" if image is not None
+              else f"(default: smallest power of two covering the needed "
+                   f"{needed} bytes"
+                   + (", ABI floor 0x0F22 because tables are declared"
+                      if (vectors or window is not None) else "") + ")")]
+    rep.append(f"content: {content_extent} bytes of code/data, needing "
+               f"{needed} bytes with the declared tables")
+    for kind, addr, size, lineno, text in blocks:
+        where = f"line {lineno}" if lineno is not None else "declared by argument"
+        rep.append(f"{kind:5s} 0x{addr:04X} {size:3d}B  {text}   [{where}]")
+    rep.append(f"entry: 0x{entry:04X} "
+               + ("(given)" if entry_explicit else
+                  ("(symbol main)" if "main" in symbols else
+                   "(no entry given and no symbol main: the load address 0)")))
+    rep.append(f"symbols: {len(symbols.flat())}")
+    for name in sorted(symbols.flat()):
+        rep.append(f"        {name:16s} 0x{symbols.value(name):04X} ({symbols.kind_of(name)})")
+    return LoadResult(image_bytes, symbols.as_dict(), entry, rep, placed_vectors,
+                      placed_window, origins, entry_explicit, content_extent, needed)
+
+def _short_image_message(length, needed, content_extent, vectors, window):
+
+    parts = [f"image length {length} bytes is too short for this program"]
+    why = []
+    if content_extent > length:
+        why.append(f"the code/data itself reaches 0x{content_extent - 1:04X}")
+    for k in sorted(vectors):
+        cell = VEC_BASE + 2 * k
+        if cell + 1 >= length:
+            why.append(f"vector {k} at 0x{cell:04X}..0x{cell + 1:04X} would be unreadable,"
+                       f" so EXT {k} faults as 'handler {k} unregistered'")
+    if window is not None and WINDOW_HI_CELL >= length:
+        why.append(f"the window bounds at 0x{WINDOW_LO_CELL:04X}..0x{WINDOW_HI_CELL:04X}"
+                   f" would be unreadable, so every STC faults as 'outside window'")
+    if not why:
+        why.append(f"the declared tables need {needed} bytes")
+    return "; ".join(parts + why + [f"needs at least {needed} bytes"])
+
+def describe(result):
+
+    return "\n".join(result.report)
+
+if __name__ == "__main__":
+    r = assemble("main:\n  LDI r0, 1\n  HALT\nhandler:\n  RET\n",
+                 vectors={0: "handler"}, window=(0x00, 0x08), entry="main")
+    print(describe(r))

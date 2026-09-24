@@ -35,9 +35,28 @@ python3 test_recursion.py             # multiply, nested CALL/RET, stack overflo
 python3 test_batched_execution.py     # batched/resident executor vs reference
 python3 mini_interpreter.py           # a 16-opcode interpreter implemented in NCP-8
 python3 selfread.py                   # programs that read their own PC/SP/flags
+python3 test_toolchain.py             # loader, disassembler, profiler, debugger
 ```
 
 The reference-only suites run on CPU. The circuit suites need CUDA.
+
+## Toolchain
+
+The machine is specified in integers, so reading it needs no emulation of anything
+except itself. Four modules, each usable on its own:
+
+| module | what it does |
+|---|---|
+| `disasm.py` | decodes one instruction from an image, and reports an encoding that is legal but not canonical rather than folding it |
+| `loader.py` | source text to a placed image: directives, expressions, symbols, and the load-time declarations the machine reads but cannot write |
+| `profile.py` | committed ticks attributed by code point and by PC, with faults and budget overruns accounted separately |
+| `debug.py` | breakpoints, watchpoints, per-tick frames, and `replay()`, which re-runs a recording and demands an exact match |
+
+Every one of these refuses to invent behaviour: an unassigned encoding, an ambiguous
+operand form, or a collision between two load-time declarations is an error naming what
+was asked for and why it cannot be honoured. `test_toolchain.py` checks the round trip
+`assemble -> disassemble -> assemble` byte-for-byte over every assigned encoding, and
+checks that a tampered debugging frame is caught.
 
 ## Properties the test suite pins down
 
