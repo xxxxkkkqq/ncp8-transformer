@@ -17,121 +17,22 @@ Conventions:
 from __future__ import annotations
 import torch
 
+import isa_table as ISA
+
 DATA_SIZE = 4096
 CODE_SIZE = 4096
 OUT_CAP = 8192
 
-NOP, ADD, SUB, ADC, SBB, MOV, TST, SHL, SHR, DJNZ, CLC = range(11)
-LDI, ADDI, SUBI, ADCI = 11, 12, 13, 14
-MOV_R_HL, MOV_HL_R, MOV_R_DE, MOV_DE_R = 15, 16, 17, 18
-PUSH, POP, OUT, IN = 19, 20, 21, 22
-INC_HL, DEC_HL, INC_DE = 23, 24, 25
-OUTM, OUTDE = 26, 27
-JMP, JZ, JNZ, JC, JNC = 28, 29, 30, 31, 32
-CALL, RET = 33, 34
-LDI_HL, LDI_DE, ADDI_HL, ADDI_DE = 35, 36, 37, 38
-HALT, BAD = 39, 40
-JPHL, GETPC, GETSP, GETF = 41, 42, 43, 44
+globals().update(ISA.ALU_ID)
+K = ISA.K
 
-AND, OR, XOR, MUL = 45, 46, 47, 48
-DIV, MOD, CMP = 49, 50, 51
-NOT, NEG, ROL, ROR = 52, 53, 54, 55
-ADD_HLDE, SUB_HLDE, XCHG, EXT = 56, 57, 58, 59
-STC, LDC = 60, 61
+def _rom(rows):
 
-MOVW_HL_DE, MOVW_DE_HL, MOVW_HL_SP, MOVW_DE_SP, MOVW_SP_HL, MOVW_SP_DE = 62, 63, 64, 65, 66, 67
-PUSHW_HL, PUSHW_DE, POPW_HL, POPW_DE = 68, 69, 70, 71
-STW_HLDE, STW_DEHL, LDW_DEHL, LDW_HLDE = 72, 73, 74, 75
-LDX, STX, ADD_SP, MULH = 76, 77, 78, 79
-K = 80
+    return [torch.tensor(list(col), dtype=torch.int32) for col in rows]
 
-def _rom2():
+_ALU, _S0, _S1, _LEN = _rom(ISA.single_rom())
 
-    alu = [BAD] * 256; s0 = [0] * 256; s1 = [0] * 256; lx = [0] * 256
-
-    def put(sub, a, r0=0, r1=0, l=0):
-        alu[sub], s0[sub], s1[sub], lx[sub] = a, r0, r1, l
-    for f in range(16):
-        put(0x00 + f, DIV, (f >> 2) & 3, f & 3)
-        put(0x10 + f, MOD, (f >> 2) & 3, f & 3)
-        put(0x20 + f, CMP, (f >> 2) & 3, f & 3)
-    for r in range(4):
-        put(0x40 | r, NOT, r, r); put(0x44 | r, NEG, r, r)
-        put(0x48 | r, ROL, r, r); put(0x4C | r, ROR, r, r)
-    put(0x60, ADD_HLDE); put(0x61, SUB_HLDE); put(0x62, XCHG)
-    put(0x70, EXT, 0, 0, l=1)
-    for r in range(4):
-        put(0x80 | r, STC, r, r)
-        put(0x84 | r, LDC, r, r)
-
-    for k, sub in enumerate((0x30, 0x31, 0x32, 0x33, 0x34, 0x35)):
-        put(sub, MOVW_HL_DE + k)
-    for k, sub in enumerate((0x38, 0x39, 0x3A, 0x3B)):
-        put(sub, PUSHW_HL + k)
-    for k, sub in enumerate((0x3C, 0x3D, 0x3E, 0x3F)):
-        put(sub, STW_HLDE + k)
-    for r in range(4):
-        put(0x50 | r, LDX, r, r, l=1)
-        put(0x54 | r, STX, r, r, l=1)
-    put(0x58, ADD_SP, 0, 0, l=1)
-    for f in range(16):
-        put(0x90 + f, MULH, (f >> 2) & 3, f & 3)
-    t = lambda xs: torch.tensor(xs, dtype=torch.int32)
-    return t(alu), t(s0), t(s1), t(lx)
-
-_ALU2, _S02, _S12, _LX2 = _rom2()
-
-def _rom():
-    alu = [BAD] * 256; s0 = [0] * 256; s1 = [0] * 256; ln = [1] * 256
-
-    def put(op, a, r0=0, r1=0, l=1):
-        alu[op], s0[op], s1[op], ln[op] = a, r0, r1, l
-
-    put(0x00, HALT); put(0x01, NOP)
-    put(0x02, INC_HL); put(0x03, DEC_HL); put(0x04, INC_DE); put(0x05, CLC)
-    put(0x06, OUTM); put(0x07, OUTDE); put(0x08, RET)
-    put(0x09, JMP, l=3); put(0x0A, JZ, l=3); put(0x0B, JNZ, l=3)
-    put(0x0C, JC, l=3); put(0x0D, JNC, l=3); put(0x0E, CALL, l=3)
-    put(0x0F, LDI_HL, l=3); put(0x10, LDI_DE, l=3)
-    put(0x11, ADDI_HL, l=2); put(0x12, ADDI_DE, l=2)
-    put(0x13, JPHL)
-    for r in range(4):
-        put(0x14 | r, GETPC, r, r)
-        put(0x18 | r, GETSP, r, r)
-        put(0x1C | r, GETF, r, r)
-    for f in range(16):
-        put(0x20 + f, AND, (f >> 2) & 3, f & 3)
-        put(0x30 + f, OR, (f >> 2) & 3, f & 3)
-        put(0x40 + f, XOR, (f >> 2) & 3, f & 3)
-        put(0x50 + f, MUL, (f >> 2) & 3, f & 3)
-    put(0x70, BAD, l=2)
-    for f in range(16):
-        put(0x80 + f, ADD, (f >> 2) & 3, f & 3)
-        put(0x90 + f, SUB, (f >> 2) & 3, f & 3)
-        put(0xA0 + f, ADC, (f >> 2) & 3, f & 3)
-        put(0xB0 + f, SBB, (f >> 2) & 3, f & 3)
-        put(0xC0 + f, MOV, (f >> 2) & 3, f & 3)
-    for r in range(4):
-        put(0xD0 | r, LDI, r, r, 2)
-        put(0xD4 | r, ADDI, r, r, 2)
-        put(0xD8 | r, SUBI, r, r, 2)
-        put(0xDC | r, ADCI, r, r, 2)
-        put(0x60 | r, SHL, r, r)
-        put(0x64 | r, SHR, r, r)
-        put(0x68 | r, TST, r, r)
-        put(0x6C | r, DJNZ, r, r, 3)
-        put(0xE0 | r, MOV_R_HL, r, r)
-        put(0xE4 | r, MOV_HL_R, r, r)
-        put(0xE8 | r, MOV_R_DE, r, r)
-        put(0xEC | r, MOV_DE_R, r, r)
-        put(0xF0 | r, PUSH, r, r)
-        put(0xF4 | r, POP, r, r)
-        put(0xF8 | r, OUT, r, r)
-        put(0xFC | r, IN, r, r)
-    t = lambda xs: torch.tensor(xs, dtype=torch.int32)
-    return t(alu), t(s0), t(s1), t(ln)
-
-_ALU, _S0, _S1, _LEN = _rom()
+_ALU2, _S02, _S12, _LX2 = _rom(ISA.escape_rom())
 
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0, where=""):
 
@@ -236,9 +137,11 @@ class TorchCircuit:
             esc = zero
             fetch_ok = torch.ones(1, dtype=i32, device=dev)
         else:
-            esc = (op == 0x70).to(i32)
-            imm0 = torch.where(esc > 0, self._g(self.CODE, self.PC + 2), self._g(self.CODE, self.PC + 1))
-            imm1 = torch.where(esc > 0, self._g(self.CODE, self.PC + 3), self._g(self.CODE, self.PC + 2))
+            esc = (op == ISA.ESCAPE_PREFIX).to(i32)
+            imm0 = torch.where(esc > 0, self._g(self.CODE, self.PC + ISA.PREFIX_BYTES),
+                               self._g(self.CODE, self.PC + 1))
+            imm1 = torch.where(esc > 0, self._g(self.CODE, self.PC + ISA.PREFIX_BYTES + 1),
+                               self._g(self.CODE, self.PC + 2))
         ind = (self.ROW == op).to(i32) * (1 - esc) + ((self.ROW == sub).to(i32)) * esc
 
         _oh1 = self._oh
@@ -246,7 +149,7 @@ class TorchCircuit:
         _s0t, _s1t, _lnt = self.OH_S0, self.OH_S1, self.ln_t
         oh_s0 = _s0t * (1 - esc) + self.ohs0e * esc
         oh_s1 = _s1t * (1 - esc) + self.ohs1e * esc
-        ln_e = _lnt * (1 - esc) + (2 + self.lx2_t) * esc
+        ln_e = _lnt * (1 - esc) + (ISA.PREFIX_BYTES + self.lx2_t) * esc
         t16 = imm0 | (imm1 << 8)
 
         a = (self.R * (ind[:, None] * oh_s0).sum(0)).sum()
