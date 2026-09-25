@@ -104,7 +104,7 @@ def disasm(image, start=0, count=None):
                 break
             body = image[pc:pc + ln]
             imm = body[2] if ln == 3 else 0
-            note = sub == 0x70 and imm >= 16
+            note = False
             text = tmpl.format(off=_off(imm), soff=str(_off(imm) or 0), k=imm)
             rows.append((pc, bytes(body), text, note))
             pc += ln

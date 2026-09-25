@@ -231,11 +231,10 @@ any single-byte opcode not listed in 4.1-4.5.
 
 ### 4.7 Encodings that carry more bits than they use
 
-Three assigned encodings have an operand byte with bits the decoder does not read, and the
+Two assigned encodings have an operand byte with bits the decoder does not read, and the
 disassembler marks them non-canonical: `ADDI HL, r` and `ADDI DE, r` take the register index
-from the low two bits of their operand byte (252 of its 256 values each), and `EXT k` is
-canonical only for a `k` inside the declared trap vector table (240 values are not). Those two
-cases are not the same kind of thing, and the machine treats them differently.
+from the low two bits of their operand byte, so 252 of its 256 values each spell an instruction
+that another of those bytes already spells.
 
 For `ADDI HL` and `ADDI DE` the remaining bits are don't-care: `11 04` and `11 00` add the same
 register, set the same flags and advance the same way. That is measured on all four
@@ -243,17 +242,12 @@ implementations for every operand value that leaves the rendered instruction unc
 assumed, and executing such an instruction leaves the byte as it was loaded -- the machine reads
 `CODE`, it does not canonicalise it.
 
-For `EXT k` the high bits are not don't-care: they select a vector, and an index outside the
-declared table is a fault (`TRAP_UNREG`) rather than a different register. The disassembler
-prints those encodings as `EXT k` with `k` past the table. Every value of the operand byte is
-spellable: `EXT 16` assembles to `70 70 10`, both assembler front ends accept it, and the
-fault is the machine's own answer at run time to an unregistered vector. Whether a vector is
-registered is a property of the configuration a machine was loaded under, so no load-time
-assembler can decide it.
-
-What is still open on these encodings is a labelling question rather than a toolchain gap: the
-disassembler calls `k` past the declared table non-canonical under the rule that
-non-canonical means bits the decoder does not read, while the machine reads the whole byte.
+`EXT k` is not like them, and no value of its operand byte is non-canonical: all eight bits
+select a vector, so each of the 256 bytes means something different. What a `k` outside the
+declared table means is a fault at run time (`TRAP_UNREG`), not a different register, and every
+one of those bytes is spellable on both front ends. Whether a vector is registered is a property
+of the configuration a machine was loaded under, so no load-time assembler can decide it, and an
+encoding the machine runs is not a must-be-zero pattern.
 
 Programs are compared between implementations by the bytes in `CODE` and what each tick commits,
 so two images that differ only in the unread bits of an alias are different images; narrowing an

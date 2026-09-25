@@ -449,8 +449,7 @@ def _domain_checks():
 
     checks = [
 
-        ("k", lambda v: bytes([0x70, 0x70, v]), range(0, isa_table.VEC_COUNT),
-         [isa_table.VEC_COUNT, isa_table.VEC_COUNT + 1, 200, 255]),
+        ("k", lambda v: bytes([0x70, 0x70, v]), range(0, 256), []),
         ("rcanon", lambda v: bytes([0x11, v]), range(0, 4), [4, 8, 0x7F, 0xFF]),
     ]
     out = []
