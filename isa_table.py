@@ -327,6 +327,15 @@ def resolve_constraint(cfg_name, ctor_name, ctor_value, ctor_default, cfg_value)
             f"{ctor_default}")
     return cfg_value
 
+def window_error(winlo, winhi, codelen, where=""):
+
+    if winhi > codelen:
+        return (f"{where}window [0x{winlo:04X},0x{winhi:04X}) does not fit inside a "
+                f"program of {codelen} bytes (0x{codelen:04X}): WINHI={winhi} is past "
+                f"the end of the program the machine was loaded with, so the span names "
+                f"cells no program occupies")
+    return None
+
 class MachineConfig:
 
     __slots__ = ("codelen", "winlo", "winhi", "vec", "nbanks", "tdlim",
@@ -350,6 +359,10 @@ class MachineConfig:
                     f"run as the empty window [0x{lo:04X},0x{lo:04X}), which is how a "
                     f"typo in one bound would come out looking like disabled "
                     f"self-modification")
+            if self.codelen is not None:
+                bad = window_error(lo, hi, self.codelen)
+                if bad is not None:
+                    raise ConfigError(bad)
             self.winlo, self.winhi = lo, hi
         else:
             self.winlo = self.winhi = None
@@ -405,6 +418,12 @@ class MachineConfig:
     def window(self):
 
         return DEFAULT_WINDOW if self.winlo is None else (self.winlo, self.winhi)
+
+    def check_for_program(self, codelen, where=""):
+
+        if self.winlo is None:
+            return None
+        return window_error(self.winlo, self.winhi, codelen, where)
 
     def equivalent_to_default(self):
 
@@ -911,6 +930,23 @@ def check_config_table():
     else:
         raise DecodeTableError("a reversed window is not refused at load, so a reversed "
                                "bound pair has no gate")
+    try:
+        MachineConfig(codelen=1, winlo=0, winhi=0x2000)
+    except ConfigError as e:
+        if "0x2000" not in str(e) or "program of 1 bytes" not in str(e):
+            raise DecodeTableError("a window past a declared CODELEN is refused without "
+                                   f"naming the span and the program: {e}")
+    else:
+        raise DecodeTableError("a window past a declared CODELEN is accepted, so a span "
+                               "naming cells no program occupies has no gate")
+    if MachineConfig(codelen=1, winlo=0, winhi=1).check_for_program(1) is not None:
+        raise DecodeTableError("a window ending at the last program byte is refused, "
+                               "though WINHI is exclusive")
+    if MachineConfig(winlo=0, winhi=0x2000).check_for_program(1) is None:
+        raise DecodeTableError("a block that leaves CODELEN absent states no window bound "
+                               "for the machine that resolves it to the loaded length")
+    if MachineConfig().check_for_program(0) is not None:
+        raise DecodeTableError("an undeclared window is refused against some program")
     for bad in (0, 3, 6, OUT_CAP_LIMIT):
         try:
             check_capacity(bad, OUT_CAP_LIMIT - 1)

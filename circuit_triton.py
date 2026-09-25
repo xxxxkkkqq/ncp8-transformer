@@ -1041,6 +1041,10 @@ class TritonBatch:
         cb = bytes(code)
         if len(cb) > CODE_SIZE:
             raise ValueError(f"machine {i}: code is {len(cb)} bytes, above CODE_SIZE {CODE_SIZE}")
+
+        bad = self.config.check_for_program(len(cb), f"machine {i}: ")
+        if bad is not None:
+            raise ISA.ConfigError(bad)
         self.CODE[i] = 0
         if cb:
             self.CODE[i, :len(cb)] = torch.tensor(list(cb), dtype=torch.int32, device=self.dev)
@@ -1222,6 +1226,10 @@ class TritonCircuit:
             raise ISA.ConfigError(
                 f"CODELEN={self.codelen} is past the end of the {len(code)}-byte "
                 f"image: the machine would fetch bytes that were never loaded")
+
+        bad = cfg.check_for_program(self.codelen, "TritonCircuit: ")
+        if bad is not None:
+            raise ISA.ConfigError(bad)
         self.out_cap = ISA.resolve_constraint("OUTCAP", "out_cap", out_cap, OUT_CAP,
                                               cfg.outcap)
         ISA.check_capacity(self.out_cap, OUT_CAP)

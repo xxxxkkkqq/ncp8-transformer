@@ -142,7 +142,8 @@ RUN_ONE = (".equ SLOT, 4\nmain:\n  LDI r0, 40\n  LDI r2, 3\nloop:\n  ADDI r0, 1\
 RUN_KW = {"image": 0x400, "vectors": {0: "handler"}, "entry": "main"}
 
 DECL_UNITS = [".org 0x0000\nmain:\n  LDI HL, 0x0100\n  LDI r0, 1\n  STC [HL], r0\n  HALT\n",
-              ".equ SPAN, 0x0110\n.org 0x0100\nhandler:\n  RET\n"]
+              ".equ SPAN, 0x0110\n.org 0x0100\nhandler:\n  RET\n  .org 0x010F\n"
+              "  .byte 0\n"]
 DECL_ONE = DECL_UNITS[0] + DECL_UNITS[1]
 DECL_KW = {"image": 0x400, "vectors": {0: "handler"}, "window": (0x0100, "SPAN"),
            "entry": "main"}

@@ -90,11 +90,19 @@ for sub, t in {0xB8: "LDMW DE, [HL]", 0xB9: "LDMW HL, [DE]", 0xBA: "STMW [HL], D
 
 def disasm(image, start=0, count=None):
 
+    return walk(image, start, count, len(image))
+
+def walk(image, start=0, count=None, end=None):
+
     rows, pc, n = [], start, 0
-    while pc < len(image) and (count is None or n < count):
+    if end is None:
+        end = len(image)
+    elif not 0 <= end <= len(image):
+        raise ValueError(f"walk: extent {end} is outside an image of {len(image)} bytes")
+    while pc < end and (count is None or n < count):
         op = image[pc]
         if op == 0x70:
-            if pc + 1 >= len(image):
+            if pc + 1 >= end:
                 rows.append((pc, image[pc:pc + 1], "<truncated escape prefix>", True))
                 break
             sub = image[pc + 1]
@@ -105,8 +113,8 @@ def disasm(image, start=0, count=None):
                 n += 1
                 continue
             tmpl, ln = ESC[sub]
-            if pc + ln > len(image):
-                rows.append((pc, image[pc:], "<truncated operand>", True))
+            if pc + ln > end:
+                rows.append((pc, image[pc:end], "<truncated operand>", True))
                 break
             body = image[pc:pc + ln]
             imm = body[2] if ln == 3 else 0
@@ -123,8 +131,8 @@ def disasm(image, start=0, count=None):
             n += 1
             continue
         tmpl, ln = SINGLE[op]
-        if pc + ln > len(image):
-            rows.append((pc, image[pc:], "<truncated operand>", True))
+        if pc + ln > end:
+            rows.append((pc, image[pc:end], "<truncated operand>", True))
             break
         body = image[pc:pc + ln]
         a16 = f"0x{((body[2] << 8) | body[1]):04X}" if ln == 3 else "0x0000"
@@ -136,6 +144,18 @@ def disasm(image, start=0, count=None):
         pc += ln
         n += 1
     return rows
+
+def program_extent(machine):
+
+    extent = machine.codelen
+    if not 0 <= extent <= len(machine.code):
+        raise ValueError(f"program extent {extent} is outside a CODE region of "
+                         f"{len(machine.code)} cells")
+    return extent
+
+def listing(machine, start=0, count=None):
+
+    return walk(machine.code, start, count, program_extent(machine))
 
 class Row(namedtuple("Row", "addr size codepoint text non_canonical assigned")):
 
@@ -156,32 +176,55 @@ def codepoint(op, sub=None):
         raise ValueError("codepoint: the escape prefix 0x70 needs its subcode")
     return 0x7000 | (sub & 0xFF)
 
-def decode(image, pc):
+def decode(image, pc, end=None):
 
-    if not 0 <= pc < len(image):
-        raise ValueError(f"decode: address {pc} is outside an image of {len(image)} bytes")
+    if end is None:
+        end = len(image)
+    elif not 0 <= end <= len(image):
+        raise ValueError(f"decode: extent {end} is outside an image of {len(image)} "
+                         f"bytes")
+    if not 0 <= pc < end:
+        raise ValueError(f"decode: address {pc} is outside the {end} bytes of code in an "
+                         f"image of {len(image)} bytes")
     op = image[pc]
     if op != 0x70:
         if op not in SINGLE:
             return Row(pc, 1, op, f"DB 0x{op:02X}  (undefined opcode)", True, False)
-        row = disasm(image, pc, 1)[0]
+        row = walk(image, pc, 1, end)[0]
         return Row(pc, len(row[1]), codepoint(op), row[2], row[3], True)
-    if pc + 1 >= len(image):
+    if pc + 1 >= end:
         return Row(pc, 1, 0x7000, "<truncated escape prefix>", True, False)
     sub = image[pc + 1]
     if sub not in ESC:
-        row = disasm(image, pc, 1)[0]
+        row = walk(image, pc, 1, end)[0]
         return Row(pc, 2, codepoint(0x70, sub), row[2], row[3], False)
-    row = disasm(image, pc, 1)[0]
+    row = walk(image, pc, 1, end)[0]
     if row[2] == "<truncated operand>":
         return Row(pc, len(row[1]), codepoint(0x70, sub), row[2], True, False)
     return Row(pc, len(row[1]), codepoint(0x70, sub), row[2], row[3], True)
+
+def decode_machine(machine, pc):
+
+    end = program_extent(machine)
+    if not 0 <= pc < end:
+        return None
+    return decode(machine.code, pc, end)
 
 def coverage():
 
     return (len(SINGLE), len(ESC), 256 - len(ESC), golden_sim.CODE_SIZE)
 
 if __name__ == "__main__":
+    import sys
+
+    def refuses(fn, *a, **kw):
+
+        try:
+            fn(*a, **kw)
+        except Exception as e:
+            return str(e)
+        return None
+
     print(f"decode rows: single-byte {len(SINGLE)}, escape {len(ESC)}, "
           f"reserved subcodes {sum(1 for s in range(256) if s not in ESC)}")
 
@@ -225,3 +268,30 @@ if __name__ == "__main__":
     for v in (0x01, 0x05, 0x7F, 0xFF):
         row = disasm(bytes([0x11, v]))[0]
         print(f"   11 {v:02X} -> {row[2]:16s} non_canonical={row[3]}")
+
+    prog = asm("LDI r0, 1\nADDI r0, 2\nOUT r0\nHALT")
+    m = golden_sim.NCP8(prog)
+    prog_rows = listing(m)
+    region_rows = disasm(bytes(m.code))
+    extent_bad = []
+    if program_extent(m) != m.codelen:
+        extent_bad.append(f"extent {program_extent(m)} != codelen {m.codelen}")
+    if b"".join(r[1] for r in prog_rows) != prog:
+        extent_bad.append(f"the program listing is not the program: "
+                          f"{b''.join(r[1] for r in prog_rows).hex()} vs {prog.hex()}")
+    if len(region_rows) <= len(prog_rows):
+        extent_bad.append(f"the region walk stopped with the program walk at "
+                          f"{len(prog_rows)} rows, so nothing past the program was read")
+    if decode_machine(m, m.codelen) is not None:
+        extent_bad.append("an address past the program decoded as an instruction")
+    if refuses(decode, bytes(m.code), m.codelen, m.codelen) is None:
+        extent_bad.append("decode() accepted an address at the extent it was given")
+    print(f"\nextents: a {len(prog)}-byte program in a {len(m.code)}-cell region: the "
+          f"machine listing walks {len(prog_rows)} rows, an image walk of the same "
+          f"buffer walks {len(region_rows)}")
+    for b in extent_bad:
+        print(f"  EXTENT FAIL {b}")
+    print("VERDICT:", "images and programs walk their own extents" if not extent_bad
+          else f"{len(extent_bad)} extent problems")
+    if bad_bytes or bad_text or extent_bad:
+        sys.exit(1)

@@ -325,17 +325,39 @@ def s2_validation():
     except ISA.ConfigError:
         check("S2 refuses a half window", True)
 
-    for bad, why in ((CFG(codelen=0x0F22), "CODELEN past the loaded image"),
-                     (CFG(winlo=1, winhi=0x10), "a window with no bound cells in it")):
-        pass
     for p in PATHS:
         try:
-            p.build(b"\x00\x00", config=CFG(codelen=4)).view(
-                p.build(b"\x00\x00", config=CFG(codelen=4)))
-            check(f"S2 {p.name} refuses CODELEN past the image", False, why)
+            p.build(b"\x00\x00", config=CFG(codelen=4))
+            check(f"S2 {p.name} refuses CODELEN past the image", False,
+                  "CODELEN past the loaded image built a machine")
         except (ISA.ConfigError, ValueError) as e:
             check(f"S2 {p.name} refuses CODELEN past the image", "CODELEN" in str(e),
                   str(e))
+
+    for p in PATHS + [BATCH_PATH]:
+        try:
+            p.build(b"\x00\x00", config=CFG(winlo=0x00, winhi=0x2000))
+            check(f"S2 {p.name} refuses a window past its program", False,
+                  "a machine was built whose window names cells no program occupies")
+        except ISA.ConfigError as e:
+            msg = str(e)
+            check(f"S2 {p.name} refuses a window past its program and names all three "
+                  f"numbers",
+                  all(n in msg for n in ("0x0000", "0x2000", "2 bytes (0x0002)")), msg)
+        try:
+            m = p.build(b"\x00\x00\x00\x00", config=CFG(winlo=1, winhi=4))
+            check(f"S2 {p.name} accepts a span ending at the last program byte",
+                  m.config.window() == (1, 4), repr(m.config))
+        except ISA.ConfigError as e:
+            check(f"S2 {p.name} accepts a span ending at the last program byte", False,
+                  str(e))
+
+    span = CFG(winlo=1, winhi=0x10)
+    check("S2 a block with no CODELEN declares a span nobody has measured yet",
+          span.window() == (1, 0x10) and span.codelen is None, repr(span))
+    msg = span.check_for_program(2)
+    check("S2 the same span measured against a two-byte program is refused",
+          msg is not None and "0x0010" in msg and "2 bytes" in msg, repr(msg))
     for p in PATHS:
         try:
             p.build(b"\x00\x00", out_cap=16384)
@@ -347,7 +369,8 @@ def s2_validation():
 def s3_case1():
     print("S3 STC at the addresses configuration used to occupy, on every path")
     code = stc_to_vector()
-    declared = CFG(codelen=0x0F22, winlo=0, winhi=CODE_SIZE, vec={0: 0x0F0C})
+
+    declared = CFG(codelen=0x0F22, winlo=0, winhi=0x0F22, vec={0: 0x0F0C})
     rows = {}
     for p in PATHS:
 
@@ -364,7 +387,7 @@ def s3_case1():
 
         prog = asm("LDI r0, 0\nLDI HL, 0x0F00\nSTC [HL], r0\nHALT")
         v2, msg2 = p.run(p.build(prog, config=CFG(codelen=len(prog), winlo=0,
-                                                  winhi=CODE_SIZE)))
+                                                  winhi=len(prog))))
         check(f"S3 {p.name} case 1: refused where there is no code",
               v2["cause"] == CAUSE["CODE_OOB"] and v2["status"] == 3,
               f"cause {NAME.get(v2["cause"])} status {v2["status"]}")
@@ -384,7 +407,7 @@ def s3_case1():
           len({r for r in rows.values()}) == 1, str(rows))
 
     for addr in (VEC, VEC + 1, WLO, WHI, ABI_HI - 1, 0x0F0C):
-        blk = CFG(codelen=0x0F30, winlo=0, winhi=CODE_SIZE, vec={0: 0x0F0C})
+        blk = CFG(codelen=0x0F30, winlo=0, winhi=0x0F30, vec={0: 0x0F0C})
         prog = asm(f"LDI r0, 0x55\nLDI HL, {addr}\nSTC [HL], r0\nHALT")
         for p in PATHS:
             m = p.build(image(prog, length=0x0F30), config=blk)
@@ -398,7 +421,7 @@ def s3_case1():
     for p in PATHS:
         prog = asm("LDI r0, 0x55\nLDI HL, 0x0100\nSTC [HL], r0\nHALT")
         v, _ = p.run(p.build(image(prog, length=0x0F30),
-                             config=CFG(codelen=0x0F30, winlo=0, winhi=CODE_SIZE)))
+                             config=CFG(codelen=0x0F30, winlo=0, winhi=0x0F30)))
         check(f"S3 {p.name}: an ordinary window write lands",
               v["code"][0x0100] == 0x55 and v["status"] == 1,
               f"code[0x100]={v["code"][0x0100]:#x} status {v["status"]}")
@@ -482,16 +505,32 @@ def s5_case3():
         check("S5 loader refuses a reversed window", False, "assemble accepted it")
     except loader.LoaderError as e:
         check("S5 loader refuses a reversed window", "reversed" in str(e), str(e))
-    r = loader.assemble("  HALT\n  HALT\n", vectors={0: 0x0001}, window=(0x00, 0x08),
+
+    r = loader.assemble("  HALT\n  HALT\n", vectors={0: 0x0001}, window=(0x00, 0x02),
                         image=8)
     blk = r.config()
     check("S5 the loader's declaration round-trips into the block, and CODELEN is the "
           "content rather than the buffer",
-          blk.vector(0) == 1 and blk.window() == (0, 8) and blk.codelen == 2
+          blk.vector(0) == 1 and blk.window() == (0, 2) and blk.codelen == 2
           and len(r.image) == 8, f"{blk.as_dict()} over a {len(r.image)}-byte image")
-    wide = loader.assemble("  HALT\n", window=(0x00, 0x0100)).config()
+    try:
+        loader.assemble("  HALT\n  HALT\n", window=(0x00, 0x08), image=8)
+        check("S5 the loader refuses the span the buffer could hold but the content "
+              "cannot", False, "a two-byte load declared a window over eight")
+    except loader.LoaderError as e:
+        check("S5 the loader refuses the span the buffer could hold but the content "
+              "cannot", "does not fit" in str(e) and "2 bytes" in str(e), str(e))
+    wide = loader.assemble("  .org 0x0100\n  HALT\n", window=(0x00, 0x0100)).config()
     check("S5 a bound wider than a byte carries across, untruncated",
           wide.winhi == 0x0100, f"winhi is {wide.winhi}")
+    try:
+        loader.assemble("  HALT\n", window=(0x00, 0x0100))
+        check("S5 the loader refuses a span past the content it placed", False,
+              "a one-byte load declared a window 256 bytes wide")
+    except loader.LoaderError as e:
+        check("S5 the loader refuses a span past the content it placed, naming all "
+              "three numbers",
+              all(n in str(e) for n in ("0x0000", "0x0100", "1 bytes")), str(e))
     try:
         CFG(codelen=2, winlo=0, winhi=0x10000)
         check("S5 a bound outside 16 bits is refused", False, "built")
@@ -501,7 +540,7 @@ def s5_case3():
 def s6_unreachable():
     print("S6 a run cannot move one declared value, on any path")
     code = stc_to_vector()
-    full = CFG(winlo=0, winhi=CODE_SIZE, codelen=0x0F22, vec={0: 0x0F0C}, nbanks=1,
+    full = CFG(winlo=0, winhi=0x0F22, codelen=0x0F22, vec={0: 0x0F0C}, nbanks=1,
                tdlim=3, tickbudget=64, outcap=64)
     for p in PATHS:
         m = p.build(code, config=full)
@@ -527,7 +566,7 @@ def s6_unreachable():
     check("S6 the sweep ran every one-byte program against a configured machine",
           True)
 
-    live = CFG(codelen=0x0F22, winlo=0, winhi=CODE_SIZE, vec={0: 0x0F0C})
+    live = CFG(codelen=0x0F22, winlo=0, winhi=0x0F22, vec={0: 0x0F0C})
     for p in PATHS:
         m = p.build(stc_to_vector(), config=live)
         v, _ = p.run(m)
@@ -673,7 +712,9 @@ def s9_pair_census():
           "run at their endpoints")
     addrs = _pair_addresses()
     ref = PATHS[0]
+    CODELEN = 0x0F30
     checked = 0
+    unfittable = 0
     bad = []
     images = {}
 
@@ -681,17 +722,29 @@ def s9_pair_census():
 
         if target not in images:
             prog = asm(f"LDI r0, 0x55\nLDI HL, {target}\nSTC [HL], r0\nHALT")
-            images[target] = image(prog, length=0x0F30)
+            images[target] = image(prog, length=CODELEN)
         return images[target]
 
     for lo in addrs:
         for hi in addrs:
             if hi < lo:
                 continue
+            if hi > CODELEN:
+
+                try:
+                    CFG(codelen=CODELEN, winlo=lo, winhi=hi)
+                    bad.append(f"pair [{lo:#06x},{hi:#06x}) over a program of "
+                               f"{CODELEN} bytes was accepted")
+                except ISA.ConfigError as e:
+                    if "does not fit" not in str(e) or f"0x{hi:04X}" not in str(e):
+                        bad.append(f"pair [{lo:#06x},{hi:#06x}) refused without naming "
+                                   f"the span and the program: {e}")
+                unfittable += 1
+                continue
             targets = {lo, hi - 1}
             if lo < 0x0F30 <= hi:
                 targets |= {0x0F00, 0x0F20}
-            blk = CFG(codelen=0x0F30, winlo=lo, winhi=hi, vec={0: 0x0F0C})
+            blk = CFG(codelen=CODELEN, winlo=lo, winhi=hi, vec={0: 0x0F0C})
             before = blk.as_dict()
             for target in sorted(a for a in targets if 0 <= a < 1 << 16):
                 m = ref.build(image_at(target), config=blk)
@@ -714,6 +767,8 @@ def s9_pair_census():
           not bad, "; ".join(bad[:4]))
     check("S9 the census covers every byte-wide pair at least once", checked >= 65536,
           f"{checked} runs")
+    check("S9 every pair past the program is refused at load", unfittable > 0,
+          f"{unfittable} pairs refused, {checked} runs")
 
     edge = [a for a in addrs if abs(a - VEC) <= 2 or abs(a - WHI) <= 2 or a in (0, 0x0F30)]
     for p in PATHS[1:]:
@@ -730,8 +785,9 @@ def s9_pair_census():
                     moved.append(f"[{lo:#06x},{hi:#06x})")
         check(f"S9 {p.name}: {len(edge) ** 2} region-straddling pairs, block unmoved",
               not moved, ", ".join(moved[:4]))
-    print(f"    {checked} reference runs over the byte-wide census plus the "
-          f"region-straddling 16-bit pairs; {len(edge) ** 2} pairs per circuit")
+    print(f"    {checked} reference runs over the census of spans that fit the program, "
+          f"{unfittable} pairs past it refused at load, plus {len(edge) ** 2} "
+          f"region-straddling pairs per circuit")
 
 def main():
     s1_defaults()

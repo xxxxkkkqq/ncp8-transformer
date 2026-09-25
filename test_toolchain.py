@@ -323,6 +323,56 @@ def test_all_encodings_walk_one_image():
     print(f"  one image of {len(image)} bytes holding all {len(rows)} assigned encodings "
           f"walks back exactly ({n} rows)")
 
+def test_a_machine_listing_walks_the_program_not_the_region():
+
+    load = loader.assemble("  LDI r0, 1\n  ADDI r0, 2\nloop:\n  SUBI r0, 1\n  JNZ loop\n"
+                           "  HALT\n", image=64)
+    m = load.to_machine()
+    extent = disasm.program_extent(m)
+    require(extent == m.codelen == load.content_extent and extent < len(m.code),
+            f"the extent is {extent}, the machine's bound {m.codelen}, the load's "
+            f"content {load.content_extent}, the region {len(m.code)} cells")
+    require(len(m.code) == CODE_SIZE,
+            f"a machine built from a {len(load.image)}-byte image holds {len(m.code)} "
+            f"cells, not the {CODE_SIZE} every machine is built with")
+    rows = disasm.listing(m)
+    require(b"".join(r[1] for r in rows) == bytes(m.code)[:extent],
+            f"the machine listing covers {b''.join(r[1] for r in rows).hex()} against "
+            f"the program {bytes(m.code)[:extent].hex()}")
+    require(rows[-1][2] == "HALT", f"the program's last row is {rows[-1][2]!r}")
+    region = disasm.disasm(bytes(m.code))
+    require(len(region) > len(rows),
+            f"an image walk of the same buffer listed {len(region)} rows against the "
+            f"program's {len(rows)}, so the two walks are not being told apart")
+    exact = disasm.disasm(load.image[:load.content_extent])
+    require(len(exact) == len(rows)
+            and b"".join(r[1] for r in exact) == load.image[:extent],
+            f"a walk of the {extent} program bytes alone gave {len(exact)} rows against "
+            f"the machine listing's {len(rows)}")
+    d = debug.Debug(load.image, config=load.config(), PC=extent + 1)
+    require(disasm.program_extent(d.m) == extent,
+            "the debugger's machine does not answer with the load's own bound")
+    fr = d.step()
+    require(fr.codepoint == debug.PC_OUTSIDE_IMAGE and fr.code == b"" and fr.raised,
+            f"an address inside the region but past the program decoded as "
+            f"{fr.text!r} and ran {fr!r}")
+    require(d.m.fault_reason == ISA.CAUSE["FETCH_OOB"] and not fr.committed(),
+            f"the frame past the program stopped with {d.m.fault_reason} "
+            f"({ISA.CAUSE_NAME.get(d.m.fault_reason)})")
+    fall = loader.assemble("  INC HL\n", image=64)
+    q = profiler.run(fall.image, config=fall.config(), tick_budget=8)
+    require(q.length == fall.content_extent == 1,
+            f"the profile states a program of {q.length} bytes for a "
+            f"{len(fall.image)}-byte image with a {fall.content_extent}-byte content")
+    require(q.steps == 2 and len(q.faults) == 1 and len(q.rows) == 1,
+            f"a program that falls off its own end profiled as {q.steps} steps, "
+            f"{len(q.faults)} faults, {len(q.rows)} rows")
+    require(q.stopped == "fault", f"the profile stopped {q.stopped}")
+    print(f"  a {extent}-byte program in a {CODE_SIZE}-cell region: the machine listing "
+          f"walks {len(rows)} rows, a walk of the buffer {len(region)}; the debugger "
+          f"names the first address past the program FETCH_OOB and the profile states "
+          f"the program's length")
+
 def test_reserved_cannot_re_assemble():
 
     undef = [op for op in range(256) if op != 0x70 and op not in disasm.SINGLE]
@@ -538,7 +588,7 @@ def test_loader_declarations_are_configuration():
     require(freed.image[0x0F00:0x0F02] == bytes([0xAD, 0xDE]),
             f"the words at 0x0F00 are not what was written: {freed.image[0x0F00:0x0F02]!r}")
 
-    wide = loader.assemble("  HALT\n", window=(0x00, 0x100))
+    wide = loader.assemble("  .org 0x0100\n  HALT\n", window=(0x00, 0x100))
     require(wide.config().winhi == 0x100,
             f"a 16-bit window bound was not carried across: {wide.config().winhi}")
     for frag in (
@@ -568,7 +618,8 @@ def test_loader_boundaries_both_sides():
     def refused(msg_must, **kw):
         src = kw.pop("src", "  HALT\n")
         msg = refuses(loader.assemble, src, **kw)
-        require(msg is not None, f"accepted what the loader should refuse: {kw}")
+        require(msg is not None, f"{kw} assembled, though the load must refuse it and "
+                                 f"name {msg_must}")
         for frag in msg_must:
             require(frag in msg, f"{kw} refused with {msg!r}, expected to name {frag!r}")
 
@@ -581,7 +632,7 @@ def test_loader_boundaries_both_sides():
     accepted(src="  HALT\n  HALT\n", vectors={0: 1})
     refused(["vector 0", "past the end"], src="  HALT\n", vectors={0: 1})
 
-    accepted(window=(0x0000, 0xFFFF))
+    refused(["window", "does not fit"], window=(0x0000, 0xFFFF))
     refused(["window", "outside 0..65535"], window=(0x0000, 0x10000))
     refused(["image length", "1..4096"], image=0)
     accepted(image=1)
@@ -618,9 +669,13 @@ def test_loader_boundaries_both_sides():
     accepted(src=edge, entry=0x0F01)
     refused(["entry", "past the end", "0x0F02"], src=edge, entry=0x0F02)
 
-    accepted(window=(0x08, 0x08))
-    accepted(window=(0x0000, CODE_SIZE))
+    accepted(src="  .org 0x0008\n  HALT\n", window=(0x08, 0x08))
+    accepted(src="  .org 0x0FFF\n  .byte 7\n", window=(0x0000, CODE_SIZE))
     refused(["reversed", "0x0008", "0x0007"], window=(0x08, 0x07))
+
+    accepted(src="  .org 0x000F\n  HALT\n", window=(0x0000, 0x0010))
+    refused(["window", "does not fit", "0x0011", "16 bytes"],
+            src="  .org 0x000F\n  HALT\n", window=(0x0000, 0x0011))
 
     def stc(target, *, winhi, filler=0x0100):
 
@@ -637,12 +692,12 @@ def test_loader_boundaries_both_sides():
     require(m.fault_reason == ISA.CAUSE["WINDOW"] and m.code[0x00FF] == 0x00,
             f"a write outside the window, inside the content, was not refused by the "
             f"window: cause {m.fault_reason} ({msg})")
-    m, msg = stc(0x0100, winhi=CODE_SIZE)
+    m, msg = stc(0x0100, winhi=0x0101)
     require(m.fault_reason == ok and m.code[0x0100] == 0xEE,
             f"the last address of the content was not written under the widest "
             f"window: {msg}")
-    m, msg = stc(0x0F00, winhi=CODE_SIZE)
-    require(m.fault_reason == ISA.CAUSE["CODE_OOB"] and 0x0F00 >= len(m.code),
+    m, msg = stc(0x0F00, winhi=0x0101)
+    require(m.fault_reason == ISA.CAUSE["CODE_OOB"] and 0x0F00 >= m.codelen,
             f"a write at 0x0f00 under a window that covers it was not refused by the "
             f"content bound: cause {m.fault_reason} ({msg})")
     require("window" not in str(msg or "").lower(),
@@ -714,9 +769,10 @@ DECLARED_CASES = (
     declared("self-modification inside the declared span",
              [(0, SELFMOD)], 0x100, SELFMOD, dict(window=(0x00, 0x08), image=0x100),
              window=(0x00, 0x08), expect=dict(status="HALT", out=b"\x2a")),
+
     declared("the same write outside the declared span",
-             [(0, SELFMOD)], 0x100, SELFMOD, dict(window=(0x10, 0x18), image=0x100),
-             window=(0x10, 0x18), expect=dict(status="ERROR", cause="WINDOW")),
+             [(0, SELFMOD)], 0x100, SELFMOD, dict(window=(0x08, 0x10), image=0x100),
+             window=(0x08, 0x10), expect=dict(status="ERROR", cause="WINDOW")),
     declared("program bytes where configuration used to live",
              [(0, "  JMP 0x0F00\n"), (0x0F00, "  LDI r0, 3\n  HALT\n")], 0x0F03,
              "  JMP code\n  .org 0x0F00\ncode:\n  LDI r0, 3\n  HALT\n",
@@ -971,8 +1027,9 @@ def test_loader_default_image_length():
     require(plain.length == 0x20 and plain.config().codelen == 0x11,
             f"content reaching 0x0011 gave {plain.length} bytes, codelen "
             f"{plain.config().codelen}")
+
     for kw in (dict(vectors={0: 0x10}), dict(window=(0, 8)),
-               dict(vectors={0: 0x10}, window=(0, 0x100))):
+               dict(vectors={0: 0x10}, window=(0, 0x11))):
         r = loader.assemble(at_10, **kw)
         require(r.image == plain.image and len(r) == len(plain)
                 and r.config().codelen == plain.config().codelen,
@@ -1066,9 +1123,12 @@ def test_profile_reports_every_number_it_carries():
 
     r = loader.assemble(FLOW_SRC, image=64)
     p = profiler.run_result(r, tick_budget=1000)
-    require((p.total_ticks, p.steps, p.budget, p.length, p.out) == (11, 11, 1000, 64, b""),
+
+    require((p.total_ticks, p.steps, p.budget, p.length, p.out)
+            == (11, 11, 1000, r.content_extent, b""),
             f"ticks {p.total_ticks}, steps {p.steps}, budget {p.budget}, "
-            f"length {p.length}, out {p.out!r}")
+            f"length {p.length} against a content extent of {r.content_extent}, "
+            f"out {p.out!r}")
     require(p.status == "HALT" and p.stopped == "halt", f"{p.status} / {p.stopped}")
     require(p.distinct_codepoints == 7 and p.distinct_pcs == 7,
             f"{p.distinct_codepoints} code points, {p.distinct_pcs} PCs")
@@ -1133,6 +1193,8 @@ def test_profile_bills_the_instruction_that_ran():
 target:
   NOP
   HALT
+  .org 0x001F
+  .byte 0
 """, window=(0x00, 0x20), image=0x0F22, entry="main")
     p = profiler.run_result(r, tick_budget=1000)
     require(p.out == bytes([5]), f"the profiled run emitted {p.out!r}; the patched byte "
@@ -1393,6 +1455,8 @@ def test_debugger_records_what_the_machine_did():
 sub:
   LDI r0, 7
   RET
+  .org 0x001F
+  .byte 0
 """, window=(0x00, 0x20), image=64)
     t = debug.record(mod.image, config=mod.config())
     here = [f for f in t.frames if f["pc"] == mod.symbols["sub"]]
@@ -1571,6 +1635,7 @@ def main():
         test_round_trip_all_encodings,
         test_zero_operand_swept,
         test_all_encodings_walk_one_image,
+        test_a_machine_listing_walks_the_program_not_the_region,
         test_reserved_cannot_re_assemble,
         test_reserved_faults_on_the_machine,
         test_non_canonical_don_tcare_bits,

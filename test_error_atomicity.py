@@ -64,7 +64,7 @@ def run_reference(code, sp, hl, de, pc=0, vec0=None):
         raised = False
     except MachineError:
         raised = True
-    return raised, ref_view(g), list(g.data), bytes(g.code), bytes(g.out)
+    return raised, ref_view(g), list(g.data), bytes(g.code)[:len(code)], bytes(g.out)
 
 def run_circuit(Machine, code, sp, hl, de, pc=0, vec0=None):
 

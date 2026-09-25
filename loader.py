@@ -756,6 +756,11 @@ def _finish(symbols, placer, vectors, window, image, entry):
                               f"A reversed span is refused here rather than loaded as the "
                               f"empty window, because the empty window is a declaration "
                               f"meaning 'no STC writes anything'", None)
+        fits = ISA.window_error(lo, hi, content_extent)
+        if fits is not None:
+            raise LoaderError(fits + f"; the extent is the content this load placed, so "
+                              f"a span past it names addresses no program of this "
+                              f"image occupies", None)
         placed_window = (lo, hi)
         declarations.append(f"window [0x{lo:04X}, 0x{hi:04X})")
 
@@ -877,6 +882,35 @@ def describe(result):
     return "\n".join(result.report)
 
 if __name__ == "__main__":
-    r = assemble("main:\n  LDI r0, 1\n  HALT\nhandler:\n  RET\n",
-                 vectors={0: "handler"}, window=(0x00, 0x08), entry="main")
+    import sys
+
+    SRC = "main:\n  LDI r0, 1\n  HALT\nhandler:\n  RET\n"
+    r = assemble(SRC, vectors={0: "handler"}, window=(0x00, 0x04), entry="main")
     print(describe(r))
+
+    def refuses_span(lo, hi):
+
+        try:
+            assemble(SRC, vectors={0: "handler"}, window=(lo, hi), entry="main")
+        except LoaderError as e:
+            return str(e)
+        return None
+
+    span_bad = []
+    if refuses_span(0x00, 0x04) is not None:
+        span_bad.append(f"the span ending at the last program byte was refused: "
+                        f"{refuses_span(0x00, 0x04)}")
+    msg = refuses_span(0x00, 0x08)
+    if msg is None:
+        span_bad.append("a span over cells no program occupies loaded without a refusal")
+    elif not all(n in msg for n in ("0x0000", "0x0008", "4 bytes")):
+        span_bad.append(f"a span past the content was refused without naming the two "
+                        f"bounds and the content: {msg}")
+    print(f"spans: a {r.content_extent}-byte content loads with [0x0000,0x0004) and "
+          f"refuses [0x0000,0x0008)")
+    for b in span_bad:
+        print("  SPAN FAIL", b)
+    print("VERDICT:", "a declared window is a span inside the content the load placed"
+          if not span_bad else f"{len(span_bad)} span problem(s)")
+    if span_bad:
+        sys.exit(1)

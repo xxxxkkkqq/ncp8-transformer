@@ -97,7 +97,7 @@ def one_esc_step(Machine, sub, seed, vec=0, pc=0):
         assert cv == gv, (sub, seed, pc, "the circuit's fault tick differs from the reference",
                           gv, cv)
         assert list(c.DATA.cpu().tolist()) == pre_data, (sub, seed, "DATA was modified")
-        assert bytes(c.CODE.cpu().tolist()[:len(code)]) == pre_code, (sub, seed, "CODE was modified")
+        assert bytes(c.CODE.cpu().tolist()[:len(code)]) == pre_code[:len(code)], (sub, seed, "CODE was modified")
         return "err"
     gv = _golden_view(g)
     assert_widths(gv, (Machine.__name__, "reference post-tick", sub, seed, pc))
@@ -189,7 +189,7 @@ def _lockstep(Machine, name, code, data=b"", inputs=b"", max_tick=4000, expect=N
         assert_widths(cv, (name, "circuit final"))
         assert all(cv[k] == gs[k] for k in gs), (name, "final state mismatch", gs, cv)
         assert list(g.data) == c.DATA.cpu().tolist(), (name, "final DATA mismatch")
-        assert bytes(c.CODE.cpu().tolist()[:len(code)]) == bytes(g.code), (name, "final CODE mismatch")
+        assert bytes(c.CODE.cpu().tolist()[:len(code)]) == bytes(g.code)[:len(code)], (name, "final CODE mismatch")
     assert c.out() == bytes(g.out), (name, "output mismatch", c.out(), bytes(g.out))
     if expect is not None:
         assert bytes(g.out) == expect, (name, "expected output mismatch", bytes(g.out).hex(), expect.hex())
@@ -217,7 +217,7 @@ main:
                   config=CFG(winlo=0x00, winhi=0x08), expect=bytes([42]))
     print(f"[{name}] controlled self-modification lockstep {n} ticks (immediate 7 -> 42 patched, output matches)")
 
-    n = _lockstep(Machine, "out of window", base, config=CFG(winlo=0x10, winhi=0x18))
+    n = _lockstep(Machine, "out of window", base, config=CFG(winlo=0x08, winhi=0x10))
     n = _lockstep(Machine, "zero-width window", base, config=CFG(winlo=0x00, winhi=0x00))
     n = _lockstep(Machine, "no window declared", base)
     print(f"[{name}] out-of-window / zero-width / undeclared window: both "

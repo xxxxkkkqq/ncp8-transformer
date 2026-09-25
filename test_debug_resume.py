@@ -43,12 +43,11 @@ CASES = [
     ("self-modifies",
      "  LDI HL, 0x0008\n  LDI r1, 144\n  STC [HL], r1\n  LDI r0, 1\n  LDI r1, 1\n"
      "  ADD r0, r1\n  OUT r0\n  HALT", b"",
-     ISA.MachineConfig(winlo=0x0000, winhi=0x0010), None),
+     ISA.MachineConfig(winlo=0x0000, winhi=0x000E), None),
     ("fills its output", "loop:\n  LDI r0, 66\n  OUT r0\n  JMP loop", b"", None, 8),
     ("budget exhausted", "loop:\n  ADDI r0, 1\n  JMP loop", b"", None, None),
 ]
 
-WINDOW = ISA.MachineConfig(winlo=0x0000, winhi=0x0010)
 FAILS = []
 COUNTS = {"checkpoints": 0, "frames compared": 0}
 
@@ -57,15 +56,6 @@ def check(name, condition, detail=""):
         FAILS.append(f"{name}: {detail}")
         print(f"  FAIL {name}  {detail}")
     return bool(condition)
-
-def pinned(name, defect_present, reason):
-
-    if defect_present:
-        print(f"  EXPECTED-RED {name}  {reason}")
-        return False
-    FAILS.append(f"{name}: the pinned defect no longer holds")
-    print(f"  FAIL {name}  the pinned defect is gone and the row still claims it")
-    return False
 
 def same_frame(a, b):
 
@@ -149,11 +139,13 @@ def one_case(case):
         where = [f"{n}: {g!r} vs {w!r}" for n, g, w in pairs if g != w]
         check(f"{label}: resume at frame {at} ends on the same machine", not where,
               f"tick {r.m.tick} status {r.m.status}; " + "; ".join(where)[:220])
-        pinned(f"{label}: a resumed machine's CODE image is the width its record carries",
-               len(r.m.code) != len(end.code),
-               f"a machine loaded with {len(end.code)} program bytes holds {len(r.m.code)} "
-               f"after its own record is installed, because the record carries the image at "
-               f"{CODE_SIZE} bytes and the machine does not")
+
+        check(f"{label}: a resumed machine is the shape the record was taken from",
+              len(r.m.code) == len(end.code) == len(record["CODE"]) == CODE_SIZE
+              and r.m.codelen == end.codelen == record["block"]["codelen"],
+              f"the run's machine holds {len(end.code)} cells with codelen "
+              f"{end.codelen}, the resumed one holds {len(r.m.code)} with codelen "
+              f"{r.m.codelen}, and the record carries a {len(record['CODE'])}-byte image")
 
         written = next((a for f in d.frames for a, _v in (f.writes or ())), None)
 
@@ -194,7 +186,8 @@ def refusals():
     msg = refuse(resume, {k: v for k, v in record.items() if k != "block"})
     check("D5 resume refuses a checkpoint with no configuration block", msg is not None
           and "block" in msg, repr(msg))
-    wide = ISA.MachineConfig(winlo=0x0000, winhi=0x0010, outcap=8)
+    prog = image_of(case[1])
+    wide = ISA.MachineConfig(winlo=0x0000, winhi=len(prog), outcap=8)
     other = Debug(image_of(case[1]), tick_budget=4000, config=wide)
     msg = refuse(other.m.install_state, record)
     check("D5 a checkpoint is refused by a machine under a different block", msg is not None

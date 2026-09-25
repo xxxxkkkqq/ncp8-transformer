@@ -74,8 +74,9 @@ class NCP8:
     def __init__(self, code, data=None, inputs=b"", tick_budget=ISA.TICK_BUDGET_DEFAULT,
                  out_cap=OUT_CAP, config=None):
 
-        if len(code) > CODE_SIZE:
-            raise ValueError(f"code image is {len(code)} bytes, above CODE_SIZE {CODE_SIZE}")
+        loaded = bytes(code)
+        if len(loaded) > CODE_SIZE:
+            raise ValueError(f"code image is {len(loaded)} bytes, above CODE_SIZE {CODE_SIZE}")
         cfg = ISA.MachineConfig() if config is None else config
         if config is not None and not isinstance(config, ISA.MachineConfig):
             raise ISA.ConfigError(
@@ -83,13 +84,16 @@ class NCP8:
                 f"{type(config).__name__}: configuration is validated at load, and a "
                 f"mapping or tuple would arrive unchecked")
         self.config = cfg
-        self.code = bytes(code)
 
-        self.codelen = len(self.code) if cfg.codelen is None else cfg.codelen
-        if self.codelen > len(self.code):
+        self.codelen = len(loaded) if cfg.codelen is None else cfg.codelen
+        if self.codelen > len(loaded):
             raise ISA.ConfigError(
-                f"CODELEN={self.codelen} is past the end of the {len(self.code)}-byte "
+                f"CODELEN={self.codelen} is past the end of the {len(loaded)}-byte "
                 f"image: the machine would fetch bytes that were never loaded")
+        bad = cfg.check_for_program(self.codelen, "NCP8: ")
+        if bad is not None:
+            raise ISA.ConfigError(bad)
+        self.code = loaded.ljust(CODE_SIZE, b"\x00")
         self.data = bytearray(DATA_SIZE)
         if data:
             if len(data) > DATA_SIZE:
@@ -203,6 +207,7 @@ class NCP8:
         self.ipos, self.tick = st["ipos"], st["tick"]
         self.status = STATUS_NAME[st["status"]]
         self.fault_reason, self.fault_addr = st["fault_reason"], st["fault_addr"]
+
         self.code = got.code
 
         self.data[:] = got.data

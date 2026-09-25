@@ -396,7 +396,7 @@ main:
     drive(g)
     assert bytes(g.out) == bytes([42]), ("self-modification had no effect", bytes(g.out))
 
-    for wlo, whi in ((0x10, 0x18), (0x00, 0x00)):
+    for wlo, whi in ((0x08, 0x10), (0x00, 0x00)):
         g2 = NCP8(base, config=window(wlo, whi))
         err = False
         try:
@@ -405,7 +405,7 @@ main:
             err = True
         assert err, f"window[{wlo:#x},{whi:#x}) did not raise"
 
-    g3 = NCP8(base, config=window(0x10, 0x18))
+    g3 = NCP8(base, config=window(0x08, 0x10))
     err, snap = False, None
     try:
         drive(g3)

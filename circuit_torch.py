@@ -97,6 +97,10 @@ class TorchCircuit:
             raise ISA.ConfigError(
                 f"CODELEN={self.codelen} is past the end of the {len(code)}-byte "
                 f"image: the machine would fetch bytes that were never loaded")
+
+        bad = cfg.check_for_program(self.codelen, "TorchCircuit: ")
+        if bad is not None:
+            raise ISA.ConfigError(bad)
         self.out_cap = ISA.resolve_constraint("OUTCAP", "out_cap", out_cap, OUT_CAP,
                                               cfg.outcap)
         ISA.check_capacity(self.out_cap, OUT_CAP)

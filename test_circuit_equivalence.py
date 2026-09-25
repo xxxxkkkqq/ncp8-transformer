@@ -69,7 +69,7 @@ def one_step_agreement(Machine, op, seed, pc=0):
         assert cv == gv, (op, seed, pc, "the circuit's fault tick differs from the reference",
                           gv, cv)
         assert list(c.DATA.cpu().tolist()) == pre_data, (op, seed, "DATA was modified")
-        assert bytes(c.CODE.cpu().tolist()[:len(code)]) == pre_code, (op, seed, "CODE")
+        assert bytes(c.CODE.cpu().tolist()[:len(code)]) == pre_code[:len(code)], (op, seed, "CODE")
         assert c.out() == bytes(g.out), (op, seed, "out")
         return "err"
     else:

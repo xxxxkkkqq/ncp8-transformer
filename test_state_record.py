@@ -65,16 +65,6 @@ def check(name, cond, detail=""):
         print(f"  FAIL {name}  {detail}")
     return bool(cond)
 
-def pinned(name, defect, reason):
-
-    COUNTS["pinned"] = COUNTS.get("pinned", 0) + 1
-    if defect:
-        print(f"  EXPECTED-RED {name}  {reason}")
-        return False
-    FAILS.append(f"{name}: the pinned defect no longer holds")
-    print(f"  FAIL {name}  the pinned defect is gone and the row still claims it")
-    return False
-
 def refuse(fn, *args, **kw):
 
     try:
@@ -153,6 +143,10 @@ class Path:
 
         raise NotImplementedError
 
+    def region(self, h):
+
+        raise NotImplementedError
+
     def tick_view(self, h):
         return dict(self.scalars(h), out=self.stream(h))
 
@@ -189,6 +183,9 @@ class _Ref(Path):
     def images(self, h):
         return padded(h[0].code), bytes(h[0].data)
 
+    def region(self, h):
+        return len(h[0].code), h[0].codelen
+
 class _Tensor(Path):
     name = "torch"
     ctor = TorchCircuit
@@ -218,6 +215,9 @@ class _Tensor(Path):
 
     def images(self, h):
         return self._image(h[0].CODE), self._image(h[0].DATA)
+
+    def region(self, h):
+        return h[0].CODE.numel(), h[0].codelen
 
 class _Triton(_Tensor):
     name = "triton"
@@ -258,6 +258,10 @@ class _Batch(Path):
         b, i = h
         return (padded(bytes(int(v) & 0xFF for v in b.code(i))),
                 bytes(int(v) & 0xFF for v in b.data(i)))
+
+    def region(self, h):
+        b, i = h
+        return int(b.CODE.shape[1]), int(b.CODELENS[i].item())
 
 PATHS = [_Ref(), _Tensor(), _Triton(), _Batch()]
 
@@ -327,14 +331,28 @@ def r1_surface():
         check(f"R1 {p.name} publishes the reference's fields plus its output cursor",
               keys == want, f"differs by {sorted(keys ^ want)}")
 
-    ref = PATHS[0].build(case)
-    held, carried = len(ref[0].code), len(PATHS[0].record(ref)["CODE"])
-    widths = {p.name: len(p.record(p.build(case))["CODE"]) for p in PATHS}
-    pinned("R1 a machine holds the CODE width its record carries",
-           held != carried,
-           f"the reference holds {held} bytes and records {carried}, so installing its own "
-           f"record resizes it; every path records the same width: "
-           f"{sorted(set(widths.values()))}")
+    carried = {p.name: len(p.record(p.build(case))["CODE"]) for p in PATHS}
+    for p in PATHS:
+        h = p.build(case)
+        cells, bound = p.region(h)
+        snap = p.record(h)
+        check(f"R1 {p.name} holds the CODE region its record carries",
+              cells == len(snap["CODE"]) == CODE_SIZE,
+              f"{p.name} holds {cells} cells and records {len(snap['CODE'])}")
+        check(f"R1 {p.name} bounds its program by its own count, not by the region",
+              bound < cells and snap["block"]["codelen"] == bound,
+              f"codelen {bound} in a {cells}-cell region, and the record's block says "
+              f"{snap['block']['codelen']}")
+        p.install(h, snap)
+        shape, restamped = p.region(h), p.record(h)
+        check(f"R1 {p.name} is the same machine after installing its own record",
+              shape == (cells, bound) and restamped == snap,
+              f"shape {shape} against {(cells, bound)}, record differs: "
+              f"{sorted(n for n in snap if snap[n] != restamped[n])}")
+    check("R1 every path records the same CODE width",
+          set(carried.values()) == {CODE_SIZE}, str(carried))
+    print(f"  CODE widths: held and carried {sorted(set(carried.values()))}, one region "
+          f"per machine on {len(PATHS)} paths")
 
 def history(case):
 

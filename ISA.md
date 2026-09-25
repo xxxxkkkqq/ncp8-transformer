@@ -305,7 +305,7 @@ constraint.
 | field | accepted values | what it bounds |
 |---|---|---|
 | `codelen` | 0..65535 | how many `CODE` bytes are the program |
-| `winlo`, `winhi` | 0..65535, supplied together or not at all | the self-modification window `[winlo, winhi)` |
+| `winlo`, `winhi` | 0..65535, supplied together or not at all, and `winhi <= codelen` | the self-modification window `[winlo, winhi)`: a span inside the program it may rewrite. A bound past the last program byte is refused at load, naming the span and the program length |
 | `vec` | at most 16 entries, each 0..65535 | trap entry points; `0` means unregistered |
 | `tickbudget` | 0..2^62 | ticks before `OVERRUN` |
 | `outcap` | a power of two, from 1 up to 32768 | output bytes before the capacity fault; a non-power-of-two is refused because the store masks the write index |
@@ -348,12 +348,16 @@ consequence of an 8-bit field's width, and widening that width would have moved 
 limits inside the memory the machine writes.
 
 Coverage of the census, since 16-bit bounds make the admissible pair set too large to
-state as a total: every one of the 65536 byte-wide `(winlo, winhi)` pairs, every pair
-whose bounds straddle one of the former table addresses, and every pair on a 257-address
-stride across the whole span, each run aiming a write at the pair's own endpoints and
-at the former table addresses and leaving every declared field exactly where the load
-put it. The sweep prints the number of runs it made; the byte-wide set is covered in
-full, and the two circuits are run over the region-straddling pairs.
+state as a total: the pair space splits at the program end. Every pair whose span fits
+inside the program is run - 78417 reference runs - aiming a write at the pair's own
+endpoints and at the former table addresses and leaving every declared field exactly
+where the load put it; the 96120 pairs whose upper bound passes the last program byte
+are refused at load instead, and the refusal is checked to name both the span and the
+program length, so a declaration that used to be silently inert is now a stated
+rejection. The 100 region-straddling pairs are run on each of the two circuits as well.
+The census covers byte-wide pairs, pairs straddling one of the former table addresses,
+and a 257-address stride across the whole span; it prints both counts because which
+pairs are runnable is a property of the program, not of the sweep.
 census is checked to be able to fire: making the upper bound inclusive instead of
 exclusive is rejected at the first pair it examines.
 

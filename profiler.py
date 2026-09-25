@@ -128,10 +128,13 @@ def run(code, *, data=None, inputs=b"", tick_budget=ISA.TICK_BUDGET_DEFAULT,
     m = NCP8(image, data=data, inputs=inputs, tick_budget=tick_budget, config=config)
     p = Profile()
     p.budget = tick_budget
-    p.length = len(image)
+
+    p.length = m.codelen
     while m.status == "RUNNING":
         pc = m.PC
-        if not 0 <= pc < len(image):
+
+        row = disasm.decode_machine(m, pc)
+        if row is None:
 
             p.steps += 1
             try:
@@ -140,8 +143,6 @@ def run(code, *, data=None, inputs=b"", tick_budget=ISA.TICK_BUDGET_DEFAULT,
                 p.faults.append((m.tick, pc, str(e)))
             p.status = m.status
             break
-
-        row = disasm.decode(m.code, pc)
         p.steps += 1
         before = m.tick
         try:

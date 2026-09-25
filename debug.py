@@ -183,11 +183,15 @@ class Debug:
         return bytes(self.m.out)
 
     def decode_here(self):
-        return disasm.decode(self.running_code(), self.m.PC)
+        return disasm.decode_machine(self.m, self.m.PC)
 
     def running_code(self):
 
         return bytes(self.m.code)
+
+    def program(self):
+
+        return self.running_code()[:disasm.program_extent(self.m)]
 
     def step(self):
 
@@ -195,9 +199,9 @@ class Debug:
         m.data.take_writes()
         pc = m.PC
         tick = m.tick
-        code_image = self.running_code()
-        if 0 <= pc < len(code_image):
-            row = disasm.decode(code_image, pc)
+        code_image = self.program()
+        row = disasm.decode_machine(self.m, pc)
+        if row is not None:
             code, cp, text = code_image[pc:pc + row.size], row.codepoint, row.text
             assigned, non_can = row.assigned, row.non_canonical
         else:
