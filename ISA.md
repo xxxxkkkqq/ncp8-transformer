@@ -10,7 +10,7 @@
 | `SP` | 16 bit | stack pointer, starts at 4096 and grows down; legal values are `[0, 4096]` |
 | `PC` | 16 bit | program counter |
 | `C`, `Z` | 1 bit each | carry and zero flags |
-| `CODE` | 4096 bytes | program memory; readable anywhere, written only by `STC`, and only inside the declared window (see 5) |
+| `CODE` | 4096 bytes | program memory. The first `CODELEN` bytes are the program: instruction fetch, `LDC` and `STC` are all bounded by that length, not by the 4096, and `STC` is bounded further by the declared window (see 5) |
 | `DATA` | 4096 bytes | data memory and stack |
 | input | byte stream | `IN`, cursor `ipos` |
 | output | byte stream, capacity 8192 | `OUT`; see 2.3 |
