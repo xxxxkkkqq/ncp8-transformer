@@ -268,6 +268,15 @@ class Debug:
         raise DebugError(f"run_until({what}) never held within {max_steps} steps "
                          f"(PC 0x{self.m.PC:04X}, tick {self.m.tick})")
 
+    def checkpoint(self):
+
+        return self.m.record_state()
+
+    def resume(self, *, breakpoints=(), watchpoints=()):
+
+        return resume(self.checkpoint(), symbols=self.symbols, breakpoints=breakpoints,
+                      watchpoints=watchpoints)
+
     def record(self, *, max_steps=100_000):
 
         return record(self.image, data=bytes(self.m.data), inputs=self.m.inputs,
@@ -384,6 +393,26 @@ def record(code, *, data=None, inputs=b"", tick_budget=ISA.TICK_BUDGET_DEFAULT, 
 
     return run_trajectory(code, data=data, inputs=inputs, tick_budget=tick_budget,
                           PC=PC, max_steps=max_steps, config=config)
+
+def resume(record, *, symbols=None, breakpoints=(), watchpoints=()):
+
+    _require(isinstance(record, dict),
+             f"resume takes a record_state() mapping, got a {type(record).__name__}")
+    block = record.get("block")
+    _require(isinstance(block, dict),
+             "resume takes a record that carries its configuration block: without one there "
+             "is no way to say which bounds the checkpoint was taken under")
+    d = Debug(record["CODE"], data=record["DATA"], inputs=record["inputs"],
+              PC=record["PC"], symbols=symbols,
+              config=ISA.MachineConfig.from_dict(block))
+    d.m.install_state(record)
+
+    d.m.data = TracingData(d.m.data)
+    for addr in breakpoints or ():
+        d.break_at(addr)
+    for addr in watchpoints or ():
+        d.watch(addr)
+    return d
 
 def replay(traj):
 

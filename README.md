@@ -28,6 +28,10 @@ python3 isa_table.py                  # the decode table against the live ROMs a
 python3 test_isa_v2.py                # instruction semantics (reference only)
 python3 test_arithmetic_bounds.py     # bit-width / radix bounds, carry chains
 python3 test_form_domain.py           # every assigned encoding is spellable on both front ends
+python3 banks.py                        # what a group of machines may do to each other's DATA
+python3 test_banks.py                   # page ownership, the selector, and what stays unreachable
+python3 test_linking.py                 # several sources, one image, byte for byte
+python3 test_debug_resume.py            # continue a session from a record, not a replay
 python3 test_asm_strictness.py        # assembler must refuse, never mis-encode
 python3 isa_forms.py                  # one accepted-form table, checked against the encodings
 python3 test_circuit_equivalence.py   # both circuits vs reference, all 256 opcodes

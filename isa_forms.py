@@ -23,6 +23,7 @@ KINDS = {
     "HL": (0, None, "HL", "the 16-bit pointer HL", False),
     "DE": (0, None, "DE", "the 16-bit pointer DE", False),
     "SP": (0, None, "SP", "the stack pointer", False),
+    "MB": (0, None, "MB", "the bank selector", False),
     "[HL]": (0, None, "[HL]", "indirect through DATA[HL]", False),
     "[DE]": (0, None, "[DE]", "indirect through DATA[DE]", False),
     "a16": (2, "{a16}", "a16", "0..65535 branch/call target, or a label that is not a "
@@ -74,7 +75,8 @@ FORMS = {
     "SUB": (("r", "r"), ("HL", "DE")),
     "ADC": (("r", "r"),),
     "SBB": (("r", "r"),),
-    "MOV": (("r", "r"), ("r", "[HL]"), ("[HL]", "r"), ("r", "[DE]"), ("[DE]", "r")),
+    "MOV": (("r", "r"), ("r", "[HL]"), ("[HL]", "r"), ("r", "[DE]"), ("[DE]", "r"),
+            ("MB", "HL"), ("HL", "MB")),
     "SUBI": (("r", "i8"),),
     "ADCI": (("r", "i8"),),
 
@@ -103,6 +105,10 @@ FORMS = {
     "STC": (("[HL]", "r"),),
     "LDC": (("r", "[HL]"),),
     "MULH": (("r", "r"),),
+    "LDM": (("r", "[HL]"),),
+    "STM": (("[HL]", "r"),),
+    "LDMW": (("DE", "[HL]"), ("HL", "[DE]")),
+    "STMW": (("[HL]", "DE"), ("[DE]", "HL")),
 }
 
 _NUM = re.compile(r"^[+-]?(?:0[xXoObB][0-9a-fA-F_]+|[0-9][0-9_]*)$")
@@ -110,7 +116,7 @@ _SYM = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
 _FRAME = re.compile(r"^\[HL(?:([+-])([^\]]+))?\]$")
 _REG_NAME = re.compile(r"^r[0-9]+$")
 
-RESERVED = frozenset(("r0", "r1", "r2", "r3", "HL", "DE", "SP"))
+RESERVED = frozenset(("r0", "r1", "r2", "r3", "HL", "DE", "SP", "MB"))
 
 _FIELD = {"a16": "{a16}", "i16": "{i16}", "i8": "{i8}", "roff": "{rcanon}",
           "soff": "{soff}", "k": "{k}", "off": "{off}"}
@@ -122,6 +128,7 @@ _WORD = {"r": "register operand (want r0-r3)",
          "HL": "pointer operand (must read HL)",
          "DE": "pointer operand (must read DE)",
          "SP": "pointer operand (must read SP)",
+         "MB": "bank selector operand (must read MB)",
          "[HL]": "memory operand (must read [HL])",
          "[DE]": "memory operand (must read [DE])",
          "a16": "address operand",
@@ -147,7 +154,7 @@ def check(kind, text):
     t = text.strip()
     if kind == "r" or kind == "rcanon":
         return bool(re.fullmatch(r"r[0-3]", t))
-    if kind in ("HL", "DE", "SP", "[HL]", "[DE]"):
+    if kind in ("HL", "DE", "SP", "MB", "[HL]", "[DE]"):
         return t == kind
     if kind == "[HL+-i8]":
         m = _FRAME.fullmatch(t.replace(" ", ""))
@@ -280,7 +287,7 @@ def template_shape(template):
         else:
             if re.fullmatch(r"r[0-3]", piece):
                 shape.append("r")
-            elif piece in ("HL", "DE", "SP", "[HL]", "[DE]"):
+            elif piece in ("HL", "DE", "SP", "MB", "[HL]", "[DE]"):
                 shape.append(piece)
             else:
                 raise ValueError(f"template operand {piece!r} matches no operand kind")
@@ -311,7 +318,8 @@ def shape_info():
             got[1].append(cp)
     return {(k): (v[0], tuple(sorted(v[1]))) for k, v in out.items()}
 
-SAMPLE = {"r": "r2", "HL": "HL", "DE": "DE", "SP": "SP", "[HL]": "[HL]", "[DE]": "[DE]",
+SAMPLE = {"r": "r2", "HL": "HL", "DE": "DE", "SP": "SP", "MB": "MB",
+          "[HL]": "[HL]", "[DE]": "[DE]",
           "a16": "0x0F00", "i16": "0x100", "i8": "200", "rcanon": "r3", "soff": "-8",
           "k": "9", "[HL+-i8]": "[HL+4]"}
 

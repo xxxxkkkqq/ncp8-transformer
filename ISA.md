@@ -6,6 +6,7 @@
 |---|---|---|
 | `r` (`r0`-`r3`) | 8 bit each | general registers, published as one four-element list |
 | `HL`, `DE` | 16 bit each | address pointers |
+| `MB` | 16 bit | bank selector: which page of this machine's bank set a memory-bank access reaches |
 | `SP` | 16 bit | stack pointer, starts at 4096 and grows down; legal values are `[0, 4096]` |
 | `PC` | 16 bit | program counter |
 | `C`, `Z` | 1 bit each | carry and zero flags |
@@ -32,7 +33,9 @@ An error tick is atomic: it sets `status = 3` and changes nothing else. This
 covers undefined opcodes, reserved subcodes, instruction fetch past the end of
 `CODE`, data access outside `DATA`, stack underflow/overflow, division or modulo
 by zero, an unregistered trap vector, a self-modification write outside the
-declared window, and a `SP` write that would leave `[0, 4096]`. The tick counter
+declared window, a `SP` write that would leave `[0, 4096]`, `BANK_OOB` for a selector that
+names no page this machine was loaded with, and `BANK_BUSY` for a page whose owner is
+still running. The tick counter
 advances only on a successful tick.
 
 A 16-bit memory access checks both of its bytes before either one is read or
@@ -253,6 +256,40 @@ Programs are compared between implementations by the bytes in `CODE` and what ea
 so two images that differ only in the unread bits of an alias are different images; narrowing an
 alias to its canonical form is a toolchain decision, and no execution path makes it.
 
+### 4.8 Memory banks (escape subcodes 0xB0-0xBD)
+
+A machine reaches `DATA` pages through the 16-bit selector `MB`, over the set it was loaded
+with: `NBANKS` pages, one of which -- at the machine's own index -- is the `DATA` it executes
+and stores into. A group of machines steps together with one page per machine, so a machine's
+selector can name a neighbour's page; the count is declared at load and a driver may not
+assemble a group of a different size, because then the bound would be a property of the driver
+rather than of the program.
+
+| encoding | text | effect | flags |
+|---|---|---|---|
+| 0xB0+r | `LDM r, [HL]` | `r = page[HL]` | untouched |
+| 0xB4+r | `STM [HL], r` | `page[HL] = r` | untouched |
+| 0xB8 | `LDMW DE, [HL]` | `DE` from two bytes at `HL`, low byte first | untouched |
+| 0xB9 | `LDMW HL, [DE]` | `HL` from two bytes at `DE`, low byte first | untouched |
+| 0xBA | `STMW [HL], DE` | two bytes at `HL` from `DE`, low byte first | untouched |
+| 0xBB | `STMW [DE], HL` | two bytes at `DE` from `HL`, low byte first | untouched |
+| 0xBC | `MOV MB, HL` | `MB = HL` | untouched |
+| 0xBD | `MOV HL, MB` | `HL = MB` | untouched |
+
+Two bounds answer before the address is used, and in this order: the selector has to name a page
+this machine was loaded with, and a page that is not the machine's own may be touched only while
+its owner is quiescent -- halted, out of tick budget or already faulted. Which pages are quiet is
+decided once per tick, from the owners' statuses at the group's boundary, so no machine's access
+can depend on whether another had already been stepped in the same tick. Only then does the
+address bound apply, so a store that names a running owner's page reports the ownership fault even
+when its address is also out of range. A tick that fails any of these commits nothing but the
+three fault fields, and `fault_addr` names the instruction that tried.
+
+A lone machine -- which is every machine on the tensor and kernel paths, where no group driver
+exists to hand out pages -- holds exactly its own `DATA`: selector 0 reaches it, and any other
+selector names no page at all.
+
+
 ## 5. Load-time configuration
 
 The bounds that describe a machine rather than a program are handed in beside the
@@ -270,7 +307,7 @@ constraint.
 | `vec` | at most 16 entries, each 0..65535 | trap entry points; `0` means unregistered |
 | `tickbudget` | 0..2^62 | ticks before `OVERRUN` |
 | `outcap` | a power of two, from 1 up to 32768 | output bytes before the capacity fault; a non-power-of-two is refused because the store masks the write index |
-| `nbanks` | 1..65535 | carried, not yet consulted by any instruction (memory banks) |
+| `nbanks` | 1..65535 | how many `DATA` pages a machine may reach through `MB`; a group must match the count (4.8) |
 | `tdlim` | 0..255 | carried, not yet consulted by any instruction (trap depth) |
 
 A field left as `None` is *absent*, and absence has one meaning per field: `codelen`

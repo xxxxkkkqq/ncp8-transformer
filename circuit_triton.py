@@ -61,10 +61,15 @@ def _fault_code_consts():
 
 globals().update(_fault_code_consts())
 
-STATE_ROWS = 16
 S_FAULT_REASON = tl.constexpr(14)
 S_FAULT_ADDR = tl.constexpr(15)
+S_MB = tl.constexpr(16)
+STATE_ROWS = 17
 STATE_ROWS_C = tl.constexpr(STATE_ROWS)
+
+BANK_PAGES = 1
+BANK_PAGES_C = tl.constexpr(BANK_PAGES)
+BANK_OWN_C = tl.constexpr(0)
 
 CFG_VEC_COUNT = tl.constexpr(ISA.VEC_COUNT)
 CFG_LEN = ISA.VEC_COUNT + 2
@@ -160,26 +165,35 @@ for _name, _size in (("CODE_SIZE", CODE_SIZE), ("DATA_SIZE", DATA_SIZE),
 CODE_MASK = tl.constexpr(CODE_SIZE - 1)
 
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
-                fault_reason=0, fault_addr=0, where=""):
+                fault_reason=0, fault_addr=0, mb=0, where=""):
 
     if not 0 <= oplen <= OUT_CAP:
         raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
-    bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "PC": PC, "SP": SP,
-                           "C": C, "Z": Z, "ipos": ipos, "tick": tick, "status": status,
-                           "fault_reason": fault_reason, "fault_addr": fault_addr},
+    bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "MB": mb, "PC": PC,
+                           "SP": SP, "C": C, "Z": Z, "ipos": ipos, "tick": tick,
+                           "status": status, "fault_reason": fault_reason,
+                           "fault_addr": fault_addr},
                           where)
     if bad is not None:
         raise ValueError(bad)
 
 STATE_ROW_OF = {"r": (0, 1, 2, 3), "HL": 4, "DE": 5, "PC": 6, "SP": 7, "C": 8, "Z": 9,
                 "ipos": 10, "tick": 12, "status": 13, "fault_reason": 14,
-                "fault_addr": 15}
+                "fault_addr": 15, "MB": int(S_MB)}
 STATE_ROW_OPLEN = 11
 if set(STATE_ROW_OF) != set(ISA.STATE_FIELD_NAMES):
     raise ISA.DecodeTableError(
         f"the state row layout covers {sorted(STATE_ROW_OF)} while the state table "
         f"names {sorted(ISA.STATE_FIELD_NAMES)}: a field of one is missing from the "
         f"other, so a record taken on this path would be incomplete")
+_ROWS_NAMED = sorted({row for at in STATE_ROW_OF.values()
+                      for row in (at if isinstance(at, tuple) else (at,))}
+                     | {STATE_ROW_OPLEN})
+if _ROWS_NAMED != list(range(STATE_ROWS)):
+    raise ISA.DecodeTableError(
+        f"the state row layout names rows {_ROWS_NAMED} while a row of this machine is "
+        f"{STATE_ROWS} wide: a cell of the state vector would be carried by no field, or "
+        f"a field would live outside the vector")
 
 def _row_state(row):
 
@@ -311,6 +325,10 @@ def _dec_esc(sub):
         eop = ESC_STC + ((sub >> 2) & 1); d = sub & 3; s = sub & 3; lx = 0
     elif sub >= 0x90 and sub <= 0x9F:
         eop = ESC_MULH; d = (sub >> 2) & 3; s = sub & 3; lx = 0
+    elif sub >= 0xB0 and sub <= 0xB7:
+        eop = ESC_LDM + ((sub >> 2) & 1); d = sub & 3; s = sub & 3; lx = 0
+    elif sub >= 0xB8 and sub <= 0xBD:
+        eop = ESC_LDMW_DE_HL + (sub - 0xB8); d = 0; s = 0; lx = 0
     else:
         eop = ESC_BAD; d = 0; s = 0; lx = 0
     return eop, d, s, lx
@@ -330,15 +348,25 @@ def _name_cause(errc, code):
     return errc
 
 @triton.jit
-def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC,
-          CFG):
+def _bank_refusal(MB, NB):
+
+    if (MB >= NB) or (MB >= BANK_PAGES_C):
+        return F_BANK_OOB
+    if MB != BANK_OWN_C:
+        return F_BANK_BUSY
+    return 0
+
+@triton.jit
+def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
 
     r0 = tl.load(S + 0); r1 = tl.load(S + 1); r2 = tl.load(S + 2); r3 = tl.load(S + 3)
     HL = tl.load(S + 4); DE = tl.load(S + 5); PC = tl.load(S + 6); SP = tl.load(S + 7)
     C = tl.load(S + 8); Z = tl.load(S + 9); IPO = tl.load(S + 10); OL = tl.load(S + 11)
+    MB = tl.load(S + S_MB)
 
     nR0, nR1, nR2, nR3 = r0, r1, r2, r3
     nHL, nDE, nSP = HL, DE, SP
+    nMB = MB
     nC, nZ, nIPO = C, Z, IPO
     nOL = OL
     nPC = PC + 1
@@ -658,6 +686,66 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC,
             elif eop == ESC_XCHG:
                 nHL = DE
                 nDE = HL
+            elif eop == ESC_MOV_MB_HL:
+                nMB = HL & 0xFFFF
+            elif eop == ESC_MOV_HL_MB:
+                nHL = MB & 0xFFFF
+            elif eop == ESC_LDM or eop == ESC_STM:
+                why = _bank_refusal(MB, NB)
+                if why != 0:
+                    err = 1
+                    errc = _name_cause(errc, why)
+                elif HL >= DS:
+                    err = 1
+                    errc = _name_cause(errc, F_DATA_OOB)
+                elif eop == ESC_LDM:
+                    v = tl.load(DATA + HL)
+                    nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
+                    nC = C & 1
+                else:
+                    A1 = HL; V1 = _get4(r0, r1, r2, r3, ed); E1 = 1
+                    nC = C & 1
+            elif eop == ESC_LDMW_DE_HL or eop == ESC_LDMW_HL_DE:
+
+                why = _bank_refusal(MB, NB)
+                if why != 0:
+                    err = 1
+                    errc = _name_cause(errc, why)
+                else:
+                    if eop == ESC_LDMW_DE_HL:
+                        adr = HL
+                    else:
+                        adr = DE
+                    if adr + 1 >= DS:
+                        err = 1
+                        errc = _name_cause(errc, F_DATA_OOB)
+                    else:
+                        v = tl.load(DATA + adr) | (tl.load(DATA + adr + 1) << 8)
+                        if eop == ESC_LDMW_DE_HL:
+                            nDE = v
+                        else:
+                            nHL = v
+                        nC = C & 1
+            elif eop == ESC_STMW_HL_DE or eop == ESC_STMW_DE_HL:
+
+                why = _bank_refusal(MB, NB)
+                if why != 0:
+                    err = 1
+                    errc = _name_cause(errc, why)
+                else:
+                    if eop == ESC_STMW_HL_DE:
+                        adr = HL
+                        v = DE
+                    else:
+                        adr = DE
+                        v = HL
+                    if adr + 1 >= DS:
+                        err = 1
+                        errc = _name_cause(errc, F_DATA_OOB)
+                    else:
+                        A1 = adr; V1 = v & 0xFF; E1 = 1
+                        A2 = adr + 1; V2 = (v >> 8) & 0xFF; E2 = 1
+                        nC = C & 1
             elif eop == ESC_EXT:
 
                 if PC + elen > CODELEN:
@@ -847,6 +935,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC,
         tl.store(S + 8, nC); tl.store(S + 9, nZ); tl.store(S + 10, nIPO); tl.store(S + 11, nOL)
         tl.store(S + 12, NT)
         tl.store(S + 13, NST)
+        tl.store(S + S_MB, nMB)
 
         if OEN == 1:
             tl.store(OUTBUF + (OL & (OC - 1)), OVAL)
@@ -862,14 +951,14 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC,
 
 @triton.jit
 def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, BUDGET, CODELEN, INLEN, DS, OC,
-                    CFG):
+                    CFG, NB):
 
     BD = tl.load(BUDGET + 0)
-    _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG)
+    _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB)
 
 @triton.jit
 def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BUDGETS,
-                        STEP_LIMIT, CFG,
+                        STEP_LIMIT, CFG, NB,
                         CS: tl.constexpr, DS: tl.constexpr, INS: tl.constexpr,
                         OCS: tl.constexpr):
 
@@ -887,7 +976,7 @@ def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BU
     tk = tl.load(ST + 12)
     n = 0
     while (st == 0) & ((STEP_LIMIT <= 0) | (n < STEP_LIMIT)):
-        st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, BD, DS, OCS, CF)
+        st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, BD, DS, OCS, CF, NB)
         n += 1
 
 class BatchResult(NamedTuple):
@@ -976,12 +1065,12 @@ class TritonBatch:
 
     def set_state(self, i, r=(0, 0, 0, 0), HL=0, DE=0, PC=0, SP=DATA_SIZE,
                   C=0, Z=0, ipos=0, oplen=0, tick=0, status=0, fault_reason=0,
-                  fault_addr=0):
+                  fault_addr=0, MB=0):
 
         self._row(i)
         check_state(r, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=ipos, oplen=oplen,
                     status=status, fault_reason=fault_reason, fault_addr=fault_addr,
-                    where=f"machine {i}: ")
+                    mb=MB, where=f"machine {i}: ")
         self.STATE[i, 0:4] = torch.tensor(list(r), dtype=torch.int32, device=self.dev)
         self.STATE[i, 4] = HL
         self.STATE[i, 5] = DE
@@ -995,6 +1084,7 @@ class TritonBatch:
         self.STATE[i, 13] = status
         self.STATE[i, 14] = fault_reason
         self.STATE[i, 15] = fault_addr
+        self.STATE[i, int(S_MB)] = MB
 
     def set_budget(self, i, budget):
 
@@ -1025,6 +1115,7 @@ class TritonBatch:
         ncp_resident_kernel[(self.n,)](
             self.CODE, self.DATA, self.INPUTS, self.OUTBUF, self.STATE,
             self.CODELENS, self.INLENS, self.BUDGETS, step_limit, self.CFG,
+            self.nbanks,
             CS=CODE_SIZE, DS=DATA_SIZE, INS=self.max_in, OCS=self.out_cap,
             num_warps=self.num_warps)
 
@@ -1060,7 +1151,7 @@ class TritonBatch:
         s = self.STATE[i].cpu().tolist()
         return dict(r=s[0:4], HL=s[4], DE=s[5], SP=s[7], PC=s[6], C=s[8], Z=s[9],
                     ipos=s[10], oplen=s[11], tick=s[12], status=s[13],
-                    fault_reason=s[14], fault_addr=s[15])
+                    fault_reason=s[14], fault_addr=s[15], MB=s[int(S_MB)])
 
     def data(self, i):
 
@@ -1098,7 +1189,8 @@ def run_batch(codes, datas=None, inputs=None, budgets=None, states=None,
                                  f"need {STATE_ROWS}")
             b.set_state(i, r=row[0:4], HL=row[4], DE=row[5], PC=row[6], SP=row[7],
                         C=row[8], Z=row[9], ipos=row[10], oplen=row[11], tick=row[12],
-                        status=row[13], fault_reason=row[14], fault_addr=row[15])
+                        status=row[13], fault_reason=row[14], fault_addr=row[15],
+                        MB=row[int(S_MB)])
     return b.run()
 
 class TritonCircuit:
@@ -1160,7 +1252,8 @@ class TritonCircuit:
         fa = int(self.S[15].item()) if fault_addr is None else fault_addr
         check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC,
                     ipos=int(self.S[10].item()), oplen=int(self.S[11].item()),
-                    status=int(self.S[13].item()), fault_reason=fr, fault_addr=fa)
+                    status=int(self.S[13].item()), fault_reason=fr, fault_addr=fa,
+                    mb=int(self.S[int(S_MB)].item()))
         self.S[0:4] = torch.tensor(list(R), dtype=torch.int32, device=self.dev)
         self.S[4] = HL; self.S[5] = DE; self.S[6] = PC
         self.S[7] = SP; self.S[8] = C; self.S[9] = Z
@@ -1209,7 +1302,7 @@ class TritonCircuit:
         check_state(st["r"], st["HL"], st["DE"], st["SP"], st["C"], st["Z"],
                     tick=st["tick"], PC=st["PC"], ipos=st["ipos"], oplen=len(got.out),
                     status=st["status"], fault_reason=st["fault_reason"],
-                    fault_addr=st["fault_addr"], where="TritonCircuit: ")
+                    fault_addr=st["fault_addr"], mb=st["MB"], where="TritonCircuit: ")
         _write_row_state(self.S, st)
         self.S[STATE_ROW_OPLEN] = len(got.out)
         self.CODE.copy_(_byte_image(got.code).to(self.dev))
@@ -1221,7 +1314,7 @@ class TritonCircuit:
     def step(self):
         ncp_step_kernel[(1,)](self.CODE, self.DATA, self.INP, self.OUTBUF, self.S,
                               self.BUDGET, self.codelen, self.inlen, DATA_SIZE,
-                              self.out_cap, self.CFG)
+                              self.out_cap, self.CFG, self.nbanks)
 
     @property
     def status(self):
@@ -1248,7 +1341,7 @@ class TritonCircuit:
         s = self.S.cpu().tolist()
         return dict(r=s[0:4], HL=s[4], DE=s[5], SP=s[7], PC=s[6], C=s[8], Z=s[9],
                     ipos=s[10], oplen=s[11], tick=s[12], status=s[13],
-                    fault_reason=s[14], fault_addr=s[15])
+                    fault_reason=s[14], fault_addr=s[15], MB=s[int(S_MB)])
 
     def out(self):
 

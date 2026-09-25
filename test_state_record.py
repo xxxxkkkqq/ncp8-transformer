@@ -65,6 +65,16 @@ def check(name, cond, detail=""):
         print(f"  FAIL {name}  {detail}")
     return bool(cond)
 
+def pinned(name, defect, reason):
+
+    COUNTS["pinned"] = COUNTS.get("pinned", 0) + 1
+    if defect:
+        print(f"  EXPECTED-RED {name}  {reason}")
+        return False
+    FAILS.append(f"{name}: the pinned defect no longer holds")
+    print(f"  FAIL {name}  the pinned defect is gone and the row still claims it")
+    return False
+
 def refuse(fn, *args, **kw):
 
     try:
@@ -316,6 +326,15 @@ def r1_surface():
         want = base | (set() if p.name == "reference" else {"oplen"})
         check(f"R1 {p.name} publishes the reference's fields plus its output cursor",
               keys == want, f"differs by {sorted(keys ^ want)}")
+
+    ref = PATHS[0].build(case)
+    held, carried = len(ref[0].code), len(PATHS[0].record(ref)["CODE"])
+    widths = {p.name: len(p.record(p.build(case))["CODE"]) for p in PATHS}
+    pinned("R1 a machine holds the CODE width its record carries",
+           held != carried,
+           f"the reference holds {held} bytes and records {carried}, so installing its own "
+           f"record resizes it; every path records the same width: "
+           f"{sorted(set(widths.values()))}")
 
 def history(case):
 
@@ -630,7 +649,8 @@ def r5_refusals():
 
     for field, value in (("SP", DATA_SIZE + 1), ("PC", 1 << 16), ("C", 2),
                          ("tick", -1), ("ipos", -1), ("status", 4),
-                         ("fault_reason", 256), ("fault_addr", 1 << 16), ("HL", -1)):
+                         ("fault_reason", 256), ("fault_addr", 1 << 16), ("HL", -1),
+                         ("MB", 1 << 16)):
         for t in targets:
             msg = refuse(install_on, t, dict(snap, **{field: value}), CASE5)
             COUNTS["refusals"] += 1

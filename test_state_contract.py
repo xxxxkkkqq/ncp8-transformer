@@ -42,6 +42,7 @@ WIDTHS = {
     "r": (0, 256),
     "HL": (0, 1 << 16),
     "DE": (0, 1 << 16),
+    "MB": (0, 1 << 16),
     "PC": (0, 1 << 16),
     "SP": (0, DATA_SIZE + 1),
     "C": (0, 2),
@@ -52,12 +53,15 @@ WIDTHS = {
 
 FAULT_WRITES = ("status", "fault_reason", "fault_addr")
 
-VIEW_FIELDS = ("r", "HL", "DE", "SP", "PC", "C", "Z", "ipos", "oplen", "tick",
+VIEW_FIELDS = ("r", "HL", "DE", "MB", "SP", "PC", "C", "Z", "ipos", "oplen", "tick",
                "status", "fault_reason", "fault_addr")
+
+_left_out = [n for n in ISA.STATE_FIELD_NAMES if n not in VIEW_FIELDS]
+assert not _left_out, ("the compared view leaves out state rows", _left_out)
 
 def ref_view(g):
 
-    view = dict(r=list(g.r), HL=g.HL, DE=g.DE, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
+    view = dict(r=list(g.r), HL=g.HL, DE=g.DE, MB=g.MB, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
                 ipos=g.ipos, oplen=len(g.out), tick=g.tick,
                 status=golden_sim.STATUS_CODE[g.status],
                 fault_reason=g.fault_reason, fault_addr=g.fault_addr)
@@ -592,7 +596,7 @@ def test_d8_error_tick_latches_the_fault_registers():
             assert view["fault_addr"] == pc, (
                 name, pc, "fault_addr must be the instruction address at tick entry",
                 view["fault_addr"])
-            assert (view["PC"], view["tick"], view["r"]) == (pc, 7, list(R)), (
+            assert (view["PC"], view["tick"], view["r"], view["MB"]) == (pc, 7, list(R), 0), (
                 name, pc, "the faulting tick wrote a field besides the three it owns",
                 view)
             for Mach in (TorchCircuit, TritonCircuit):

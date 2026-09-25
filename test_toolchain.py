@@ -214,9 +214,12 @@ def test_round_trip_all_encodings():
                         f"the canonical form {back.hex()} of {img.hex()} is itself flagged "
                         f"non-canonical")
                 require(asm(rows2[0][2]) == back, "canonical form is not a fixed point")
-    require(ASSIGNED == 355, f"assigned encoding count moved: {ASSIGNED}, expected 355 "
-                             f"(single {ASSIGNED_SINGLE}, escape {ASSIGNED_ESC})")
-    require(combos == ASSIGNED * len(IMMS) == 1775,
+    table_assigned = len(ISA.SINGLE) + len(ISA.ESCAPE)
+    require(ASSIGNED == table_assigned,
+            f"the front end enumerates {ASSIGNED} assigned code points (single "
+            f"{ASSIGNED_SINGLE}, escape {ASSIGNED_ESC}) while isa_table assigns "
+            f"{table_assigned}: one of them is not stating the same ISA")
+    require(combos == ASSIGNED * len(IMMS),
             f"sweep covered {combos} combinations, want {ASSIGNED}*{len(IMMS)}")
     require(flagged_seen == want_flagged,
             f"the decoder flagged {len(flagged_seen)} of the {combos} swept combinations, "

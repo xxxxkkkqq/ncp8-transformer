@@ -58,13 +58,14 @@ class FaultCauseMissing(MachineError):
     pass
 
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
-                fault_reason=0, fault_addr=0, where=""):
+                fault_reason=0, fault_addr=0, mb=0, where=""):
 
     if not 0 <= oplen <= OUT_CAP:
         raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
-    bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "PC": PC, "SP": SP,
-                           "C": C, "Z": Z, "ipos": ipos, "tick": tick, "status": status,
-                           "fault_reason": fault_reason, "fault_addr": fault_addr},
+    bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "MB": mb, "PC": PC,
+                           "SP": SP, "C": C, "Z": Z, "ipos": ipos, "tick": tick,
+                           "status": status, "fault_reason": fault_reason,
+                           "fault_addr": fault_addr},
                           where)
     if bad is not None:
         raise ValueError(bad)
@@ -115,6 +116,11 @@ class NCP8:
 
         self.nbanks = 1 if cfg.nbanks is None else cfg.nbanks
         self.tdlim = 0 if cfg.tdlim is None else cfg.tdlim
+
+        self.MB = 0
+        self.bank_own = 0
+        self.banks = (self.data,)
+        self.bank_owner_status = None
         self.status = STATUS_RUNNING
 
         self.fault_reason = CAUSE["OK"]
@@ -127,7 +133,8 @@ class NCP8:
         fr = self.fault_reason if fault_reason is None else fault_reason
         fa = self.fault_addr if fault_addr is None else fault_addr
         check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=self.ipos,
-                    status=STATUS_CODE[self.status], fault_reason=fr, fault_addr=fa)
+                    status=STATUS_CODE[self.status], fault_reason=fr, fault_addr=fa,
+                    mb=self.MB)
         self.r = list(R)
         self.HL, self.DE, self.SP, self.C, self.Z = HL, DE, SP, C, Z
         self.tick, self.PC = tick, PC
@@ -153,6 +160,7 @@ class NCP8:
         "r": lambda m: list(m.r),
         "HL": lambda m: m.HL,
         "DE": lambda m: m.DE,
+        "MB": lambda m: m.MB,
         "PC": lambda m: m.PC,
         "SP": lambda m: m.SP,
         "C": lambda m: m.C,
@@ -187,15 +195,17 @@ class NCP8:
         check_state(st["r"], st["HL"], st["DE"], st["SP"], st["C"], st["Z"],
                     tick=st["tick"], PC=st["PC"], ipos=st["ipos"],
                     status=st["status"], fault_reason=st["fault_reason"],
-                    fault_addr=st["fault_addr"], where="NCP8: ")
+                    fault_addr=st["fault_addr"], mb=st["MB"], where="NCP8: ")
         self.r = list(st["r"])
         self.HL, self.DE, self.PC, self.SP = st["HL"], st["DE"], st["PC"], st["SP"]
+        self.MB = st["MB"]
         self.C, self.Z = st["C"], st["Z"]
         self.ipos, self.tick = st["ipos"], st["tick"]
         self.status = STATUS_NAME[st["status"]]
         self.fault_reason, self.fault_addr = st["fault_reason"], st["fault_addr"]
         self.code = got.code
-        self.data = bytearray(got.data)
+
+        self.data[:] = got.data
         self.out = bytearray(got.out)
 
     def _fault(self, cause, msg):
@@ -210,6 +220,55 @@ class NCP8:
 
         if not (0 <= addr and addr + 1 < DATA_SIZE):
             self._fault(CAUSE["DATA_OOB"], f"DATA out of range: {addr}")
+        return addr
+
+    def install_banks(self, pages, own, owner_status):
+
+        pages = tuple(pages)
+        if len(pages) != self.nbanks:
+            raise ISA.ConfigError(
+                f"this machine was loaded with NBANKS={self.nbanks} and a group of "
+                f"{len(pages)} pages: a bank set is declared at load, not assembled by "
+                f"the driver that steps it")
+        if not 0 <= own < len(pages):
+            raise ISA.ConfigError(f"bank index {own} is outside the {len(pages)} pages")
+        if pages[own] is not self.data:
+            raise ISA.ConfigError("the page this machine is told it owns is not its own "
+                                  "DATA, so its reads and writes would leave its bank")
+        if len(owner_status) != len(pages):
+            raise ISA.ConfigError(f"{len(owner_status)} owner statuses for "
+                                  f"{len(pages)} banks: every page's owner has to be "
+                                  f"named for the quiescence rule to be decidable")
+        self.banks = pages
+        self.bank_own = own
+        self.bank_owner_status = tuple(owner_status)
+
+    def _bank_page(self, mb):
+
+        if mb >= self.nbanks or mb >= len(self.banks):
+            self._fault(CAUSE["BANK_OOB"],
+                        f"MB={mb} is outside the {self.nbanks} banks this machine was "
+                        f"loaded with")
+        if mb == self.bank_own:
+            return self.banks[mb]
+        st = self.bank_owner_status
+        if st is None or mb >= len(st) or st[mb] == STATUS_CODE[STATUS_RUNNING]:
+            self._fault(CAUSE["BANK_BUSY"],
+                        f"bank {mb} is being run by its own machine")
+        return self.banks[mb]
+
+    def _bank_mem(self, page, addr):
+
+        if not 0 <= addr < len(page):
+            self._fault(CAUSE["DATA_OOB"],
+                        f"address {addr} is outside the {len(page)}-byte bank page")
+
+    def _bank_mem16(self, page, addr):
+
+        if not (0 <= addr and addr + 1 < len(page)):
+            self._fault(CAUSE["DATA_OOB"],
+                        f"address {addr} and {addr + 1} are not both inside the "
+                        f"{len(page)}-byte bank page")
         return addr
 
     def _fetch(self, n):
@@ -486,6 +545,38 @@ class NCP8:
         elif sel == "MULH":
             v = ((self.r[s0] * self.r[s1]) >> 8) & 0xFF
             self.r[s0] = v; self.Z = int(v == 0); m = f"MULH r{s0}, r{s1}"
+        elif sel == "LDM":
+            page = self._bank_page(self.MB)
+            self._bank_mem(page, self.HL)
+            self.r[s0] = page[self.HL]; m = f"LDM r{s0}, [HL]"
+        elif sel == "STM":
+            page = self._bank_page(self.MB)
+            self._bank_mem(page, self.HL)
+            page[self.HL] = self.r[s0]; m = f"STM [HL], r{s0}"
+        elif sel == "LDMW_DE_HL":
+            page = self._bank_page(self.MB)
+            self._bank_mem16(page, self.HL)
+            self.DE = page[self.HL] | (page[self.HL + 1] << 8); m = "LDMW DE, [HL]"
+        elif sel == "LDMW_HL_DE":
+            page = self._bank_page(self.MB)
+            self._bank_mem16(page, self.DE)
+            self.HL = page[self.DE] | (page[self.DE + 1] << 8); m = "LDMW HL, [DE]"
+        elif sel == "STMW_HL_DE":
+            page = self._bank_page(self.MB)
+            self._bank_mem16(page, self.HL)
+            page[self.HL] = self.DE & 0xFF
+            page[self.HL + 1] = (self.DE >> 8) & 0xFF
+            m = "STMW [HL], DE"
+        elif sel == "STMW_DE_HL":
+            page = self._bank_page(self.MB)
+            self._bank_mem16(page, self.DE)
+            page[self.DE] = self.HL & 0xFF
+            page[self.DE + 1] = (self.HL >> 8) & 0xFF
+            m = "STMW [DE], HL"
+        elif sel == "MOV_MB_HL":
+            self.MB = self.HL & 0xFFFF; m = "MOV MB, HL"
+        elif sel == "MOV_HL_MB":
+            self.HL = self.MB & 0xFFFF; m = "MOV HL, MB"
         elif sel == "EXT":
             k = imm[0]
             if k >= ISA.VEC_COUNT:
@@ -563,7 +654,8 @@ class NCP8:
 
     def snapshot(self):
 
-        return dict(r=list(self.r), HL=self.HL, DE=self.DE, SP=self.SP, PC=self.PC,
+        return dict(r=list(self.r), HL=self.HL, DE=self.DE, MB=self.MB, SP=self.SP,
+                    PC=self.PC,
                     C=self.C, Z=self.Z, ipos=self.ipos, tick=self.tick,
                     status=self.status, fault_reason=self.fault_reason,
                     fault_addr=self.fault_addr)
@@ -596,7 +688,7 @@ def _is_symbol(text):
 def _operand_value(kind, x, name, labels, strict):
 
     s = str(x).strip()
-    if kind in ("HL", "DE", "SP", "[HL]", "[DE]"):
+    if kind in ("HL", "DE", "SP", "MB", "[HL]", "[DE]"):
         return None
     if kind in ("r", "rcanon"):
         return int(s[1])
@@ -682,7 +774,7 @@ def _code(byte_index, shift):
 
 PLACE_KIND = {"r": "code", "rcanon": "byte", "a16": "word", "i16": "word", "i8": "byte",
               "soff": "byte", "k": "byte", "[HL+-i8]": "byte", "HL": None, "DE": None,
-              "SP": None, "[HL]": None, "[DE]": None}
+              "SP": None, "MB": None, "[HL]": None, "[DE]": None}
 
 ENC = {
     ("ADC", ("r", "r")): (b"\xa0", [_code(0, 2), _code(0, 0)]),
@@ -718,12 +810,17 @@ ENC = {
     ("LDI", ("DE", "i16")): (b"\x10", [None, ("word",)]),
     ("LDI", ("HL", "i16")): (b"\x0f", [None, ("word",)]),
     ("LDI", ("r", "i8")): (b"\xd0", [_code(0, 0), ("byte",)]),
+    ("LDM", ("r", "[HL]")): (b"\x70\xb0", [_code(1, 0), None]),
+    ("LDMW", ("DE", "[HL]")): (b"\x70\xb8", [None, None]),
+    ("LDMW", ("HL", "[DE]")): (b"\x70\xb9", [None, None]),
     ("LDW", ("DE", "[HL]")): (b"\x70\x3e", [None, None]),
     ("LDW", ("HL", "[DE]")): (b"\x70\x3f", [None, None]),
     ("LDX", ("r", "[HL+-i8]")): (b"\x70\x50", [_code(1, 0), ("byte",)]),
     ("MOD", ("r", "r")): (b"\x70\x10", [_code(1, 2), _code(1, 0)]),
     ("MOV", ("[DE]", "r")): (b"\xec", [None, _code(0, 0)]),
     ("MOV", ("[HL]", "r")): (b"\xe4", [None, _code(0, 0)]),
+    ("MOV", ("HL", "MB")): (b"\x70\xbd", [None, None]),
+    ("MOV", ("MB", "HL")): (b"\x70\xbc", [None, None]),
     ("MOV", ("r", "[DE]")): (b"\xe8", [_code(0, 0), None]),
     ("MOV", ("r", "[HL]")): (b"\xe0", [_code(0, 0), None]),
     ("MOV", ("r", "r")): (b"\xc0", [_code(0, 2), _code(0, 0)]),
@@ -755,6 +852,9 @@ ENC = {
     ("SHL", ("r",)): (b"\x60", [_code(0, 0)]),
     ("SHR", ("r",)): (b"\x64", [_code(0, 0)]),
     ("STC", ("[HL]", "r")): (b"\x70\x80", [None, _code(1, 0)]),
+    ("STM", ("[HL]", "r")): (b"\x70\xb4", [None, _code(1, 0)]),
+    ("STMW", ("[DE]", "HL")): (b"\x70\xbb", [None, None]),
+    ("STMW", ("[HL]", "DE")): (b"\x70\xba", [None, None]),
     ("STW", ("[DE]", "HL")): (b"\x70\x3d", [None, None]),
     ("STW", ("[HL]", "DE")): (b"\x70\x3c", [None, None]),
     ("STX", ("[HL+-i8]", "r")): (b"\x70\x54", [("byte",), _code(1, 0)]),
