@@ -48,6 +48,11 @@ python3 test_training_records.py      # a label needs four-path agreement and a 
 python3 mini_interpreter.py           # a 16-opcode interpreter implemented in NCP-8
 python3 selfread.py                   # programs that read their own PC/SP/flags
 python3 test_toolchain.py             # loader, disassembler, profiler, debugger
+python3 loader.py                     # directives, symbols, entry, and what it refuses
+python3 disasm.py                     # disassembly, with non-canonical detection
+python3 debug.py                      # breakpoints, watchpoints, replay, checkpoint/resume
+python3 profiler.py                   # per-instruction profile of a run
+python3 programs.py                   # the pinned programs, each re-assembled and checked
 ```
 
 The reference-only suites run on CPU. The circuit suites need CUDA.
