@@ -129,7 +129,6 @@ def expected_flag_and_fold_keys():
         if "{k}" in tmpl and size == 3:
             key = disasm.codepoint(0x70, sub)
             past = {(key, imm) for imm in IMMS if imm >= loader.VEC_COUNT}
-            flagged.update(past)
             refused.update(past)
     return flagged, folds, refused
 
@@ -430,14 +429,16 @@ def test_non_canonical_don_tcare_bits():
                                                      f"non_canonical={row[3]}")
     for k in (0x10, 0x7F, 0xFF):
         row = disasm.disasm(bytes([0x70, 0x70, k]), 0, 1)[0]
-        require(row[2] == f"EXT {k}" and row[3], f"EXT {k} -> {row[2]!r} must be flagged, "
-                                                 f"the vector table has 16 entries")
+        require(row[2] == f"EXT {k}" and not row[3],
+                f"EXT {k} -> {row[2]!r} carries no bits the decoder ignores: every bit of "
+                f"the operand selects a vector, so it is canonical (row says "
+                f"non_canonical={row[3]})")
         msg = refuses(NCP8(bytes([0x70, 0x70, k])).step)
         require(msg is not None and "MachineError" in msg,
                 f"EXT {k} should fault on the machine: {msg}")
     print("  0x11/0x12: 4 canonical operand bytes out of 256 each, the rest reported as "
-          "non-canonical and verified to be the same 4 behaviours; EXT k>=16 reported "
-          "non-canonical and refused by the machine")
+          "non-canonical and verified to be the same 4 behaviours; every EXT k is "
+          "canonical, and the machine stops on the ones with no vector behind them")
 
 def test_truncated_encodings_reported():
 
