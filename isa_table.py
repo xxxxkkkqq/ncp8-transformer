@@ -204,7 +204,6 @@ FAULT_CAUSES = (
     ("TRAP_FRAME", "TRAPRET read a tag that is not 0xA5"),
     ("TRAP_UNBALANCED", "TRAPRET with TDEPTH == 0"),
     ("OUT_CAP", "producing byte number OUT_CAP+1"),
-    ("BAD_OPERAND", "non-canonical encoding (must-be-zero operand bits set)"),
     ("BANK_OOB", "MB >= NBANKS"),
     ("BANK_BUSY", "cross-bank access while the owner is running"),
     ("PC_ILLEGAL", "committed PC outside the image"),
@@ -218,7 +217,6 @@ CAUSES_AWAITING_FEATURE = {
     "TRAP_DEPTH": "this machine has no trap-depth counter, so EXT cannot overflow one",
     "TRAP_FRAME": "subcode 0xA8 is unassigned, so no instruction returns from a trap",
     "TRAP_UNBALANCED": "subcode 0xA8 is unassigned, so no instruction returns from a trap",
-    "BAD_OPERAND": "the must-be-zero operand refusal is not implemented on this machine",
     "BANK_BUSY": "the ownership rule is answered on all four paths, but the three "
                  "circuit paths hold one page each -- their own DATA, at index 0 -- so a "
                  "selector that passes the declared bound names the page it owns and a "

@@ -623,7 +623,9 @@ def test_d8_fault_pairing_is_refused_in_both_directions():
                  "is recorded while status is 2"),
                 ("error status with no cause", dict(status=3, fault_reason=0),
                  "while fault_reason is 0"),
-                ("cause the table does not assign", dict(status=3, fault_reason=19),
+
+                ("cause the table does not assign",
+                 dict(status=3, fault_reason=len(ISA.FAULT_CAUSES)),
                  "does not assign"),
                 ("cause past the 8-bit field", dict(status=3, fault_reason=256),
                  "fault_reason is 256, outside [0, 255]"),
@@ -654,7 +656,7 @@ def test_d8_fault_pairing_is_refused_in_both_directions():
 def test_d8_the_only_cause_of_a_tick_is_the_one_named_in_the_table():
 
     assert ISA.check_fault_table() is True
-    assert len(ISA.FAULT_CAUSES) == 19, ISA.FAULT_CAUSES
+    assert len(ISA.FAULT_CAUSES) == 18, ISA.FAULT_CAUSES
     assert ISA.CAUSE["OK"] == 0 and ISA.fault_name(0) == "OK"
     assert max(ISA.CAUSE.values()) < 256
     for Mach, who in ((TorchCircuit, "torch"), (TritonCircuit, "triton")):

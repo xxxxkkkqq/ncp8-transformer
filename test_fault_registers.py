@@ -282,8 +282,6 @@ ABSENT_PROOFS = {
                    lambda: 0xA8 not in ISA.ESCAPE),
     "TRAP_UNBALANCED": ("TRAPRET is not an assigned code point",
                         lambda: 0xA8 not in ISA.ESCAPE),
-    "BAD_OPERAND": ("a non-canonical operand byte still executes",
-                    lambda: _executes(bytes([0x11, 0x06, 0x00]))),
     "BANK_BUSY": ("a circuit path holds one page, its own, so its bank access has no "
                   "foreign owner to wait for; the reference names the cause as soon as a "
                   "group driver hands it a second page",
@@ -291,14 +289,6 @@ ABSENT_PROOFS = {
     "PC_ILLEGAL": ("a jump past the image faults on the *next* fetch, not the write",
                    lambda: _bad_target_faults_late()),
 }
-
-def _executes(code):
-
-    try:
-        NCP8(code).step()
-    except MachineError:
-        return False
-    return True
 
 def _bad_target_faults_late():
 
