@@ -410,8 +410,6 @@ def resume(record, *, symbols=None, breakpoints=(), watchpoints=()):
               PC=record["PC"], symbols=symbols,
               config=ISA.MachineConfig.from_dict(block))
     d.m.install_state(record)
-
-    d.m.data = TracingData(d.m.data)
     for addr in breakpoints or ():
         d.break_at(addr)
     for addr in watchpoints or ():

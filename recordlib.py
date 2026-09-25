@@ -239,35 +239,78 @@ def default_compile(text):
     loaded = loader.assemble(text)
     return bytes(loaded.image[:loaded.content_extent])
 
-EMITTERS = [("asm-", default_compile)]
+FRONT_END_SOURCES = ("disasm.py", "golden_sim.py", "isa_forms.py", "isa_table.py",
+                     "loader.py")
 
-def register_emitter(prefix, emit):
+def front_end_digest():
+
+    here = Path(__file__).resolve().parent
+    parts = []
+    for name in FRONT_END_SOURCES:
+        parts.append(name.encode("utf-8") + b"\0" + (here / name).read_bytes() + b"\0")
+    return hashlib.sha256(b"".join(parts)).hexdigest()
+
+EMITTERS = [("asm-", default_compile, front_end_digest)]
+
+def register_emitter(prefix, emit, digest=None):
 
     if any(prefix == seen or prefix.startswith(seen) or seen.startswith(prefix)
-           for seen, _ in EMITTERS):
+           for seen, _, _ in EMITTERS):
         raise RecordError([f"emitter prefix {prefix!r} overlaps a registered prefix"])
-    EMITTERS.append((prefix, emit))
+    EMITTERS.append((prefix, emit, digest))
     return len(EMITTERS) - 1
 
-def emitter_problems(rec):
+def emitter_for(version):
 
-    version = str((rec.get("compiler_identity") or {}).get("ncl_version", ""))
-    emit = next((f for prefix, f in EMITTERS if version.startswith(prefix)), None)
+    for prefix, emit, digest in EMITTERS:
+        if str(version).startswith(prefix):
+            return emit, digest
+    return None, None
+
+def emitter_digest(version):
+
+    _, digest = emitter_for(version)
+    return None if digest is None else digest()
+
+def emitter_identity(version, flags=()):
+
+    digest = emitter_digest(version)
+    if digest is None:
+        raise RecordError([f"emitter {version!r} declares no digest, so a record cannot "
+                           f"name its producer unambiguously"])
+    return {"ncl_version": version, "emitter_digest": digest, "flags": list(flags)}
+
+def emitter_problems(rec, name=None):
+
+    ident = rec.get("compiler_identity") or {}
+    version = str(ident.get("ncl_version", ""))
+    emit, digest = emitter_for(version)
     if emit is None:
         return [f"no emitter in this tree compiles records tagged {version!r}"]
+    where = f"record {name!r}" if name else "record"
+    problems = []
+    if digest is not None:
+        live = digest()
+        recorded = str(ident.get("emitter_digest", ""))
+        if recorded != live:
+            problems.append(
+                f"{where} names emitter {version!r} with digest {recorded}, this tree's "
+                f"{version!r} front end digests to {live}: the producer recorded in the "
+                f"record is not the one reading it, so a change to the compiler would "
+                f"relabel this sample silently instead of making a new dataset")
     code = rec.get("code")
     if not is_hex(str(code or "")) or not str(code or ""):
-        return [f"code must be the hex bytes the text compiles to, got {code!r}"]
+        return problems + [f"code must be the hex bytes the text compiles to, got {code!r}"]
     try:
         rebuilt = bytes(emit(rec["text"]))
     except Exception as exc:
-        return [f"the emitter {version} refuses the record's own text: {exc}"]
+        return problems + [f"the emitter {version} refuses the record's own text: {exc}"]
     if rebuilt.hex() != str(code):
         def short(hexed):
             return hexed if len(hexed) <= 64 else hexed[:64] + f"... ({len(hexed) // 2} bytes)"
-        return [f"text compiles to {short(rebuilt.hex())} under {version}, the record's "
-                f"code is {short(str(code))}"]
-    return []
+        problems.append(f"text compiles to {short(rebuilt.hex())} under {version}, the "
+                        f"record's code is {short(str(code))}")
+    return problems
 
 def shaped(spec):
 
@@ -286,8 +329,7 @@ def label(spec, compile_text=None):
         if compile_text is None:
 
             version = str((spec.get("compiler_identity") or {}).get("ncl_version", ""))
-            compile_text = next((f for prefix, f in EMITTERS
-                                 if version.startswith(prefix)), default_compile)
+            compile_text = emitter_for(version)[0] or default_compile
         code = compile_text(spec["text"])
     code = bytes(code)
     data = bytes.fromhex(spec.get("initial_data", "")) or None
@@ -452,10 +494,11 @@ def write_records(path, records, name_of=lambda r: r["text"]):
 
     records = list(records)
     problems = []
-    for i, r in enumerate(records):
+    names = [name_of(r) for r in records]
+    for i, (r, key) in enumerate(zip(records, names)):
         for p in schema_problems(r):
             problems.append(f"record {i}: {p}")
-        for p in emitter_problems(r):
+        for p in emitter_problems(r, name=key):
             problems.append(f"record {i}: {p}")
     fresh = reexecute(records, name_of)
     for key, diffs in fresh.items():

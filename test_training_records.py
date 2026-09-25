@@ -10,6 +10,8 @@ from pathlib import Path
 import golden_sim as G
 import recordlib as R
 
+LIVE = R.emitter_digest("asm-test")
+
 FAILS = []
 
 def check(name, ok, detail=""):
@@ -32,7 +34,8 @@ def good_record():
             "initial_data": "", "budget": 8, "code": "00",
             "config": {"outcap": G.OUT_CAP}, "expected": {"status": 1, "out": ""},
             "machine_commit": "test-commit", "flavor": "reference",
-            "compiler_identity": {"ncl_version": "asm-test", "emitter_digest": "a" * 64, "flags": []}}
+            "compiler_identity": {"ncl_version": "asm-test", "emitter_digest": LIVE,
+                                  "flags": []}}
 
 def main():
 
@@ -145,7 +148,8 @@ def main():
     good = R.label({"kind": "rl", "text": "  LDI r0, 66\n  OUT r0\n  HALT\n",
                     "entry": "main", "input": "", "initial_data": "", "budget": 16,
                     "config": {"outcap": G.OUT_CAP},
-                    "compiler_identity": {"ncl_version": "asm-test", "emitter_digest": "a" * 64, "flags": []}})
+                    "compiler_identity": {"ncl_version": "asm-test", "emitter_digest": LIVE,
+                                          "flags": []}})
     check("label built from a program", good["expected"]["out"] == "42",
           str(good["expected"]))
     stream = R.label({"kind": "sft", "text": "loop:\n  IN r0\n  OUT r0\n  ADDI r1, 1\n"
@@ -153,7 +157,8 @@ def main():
                       "entry": "main", "input": bytes(range(1, 5)).hex(),
                       "initial_data": "", "budget": 40,
                       "config": {"outcap": G.OUT_CAP},
-                      "compiler_identity": {"ncl_version": "asm-test", "emitter_digest": "a" * 64, "flags": []}})
+                      "compiler_identity": {"ncl_version": "asm-test", "emitter_digest": LIVE,
+                                            "flags": []}})
     check("a program that reads a multi-byte input stream is labelable",
           stream["expected"]["out"] == "01020304" and stream["kind"] == "sft",
           str(stream["expected"]))
@@ -243,12 +248,58 @@ def main():
               len(path.read_text(encoding="utf-8").splitlines()) == 1,
               str(len(path.read_text(encoding="utf-8").splitlines())))
 
+    check("the live digest is the one the emitter computes for itself",
+          R.emitter_digest("asm-1") == LIVE and R.emitter_digest("asm-test") == LIVE,
+          f"{R.emitter_digest('asm-1')} vs {LIVE}")
+    stamp = R.emitter_identity("asm-1")
+    check("an identity built here carries exactly the keys the schema names",
+          set(stamp) == set(R.IDENTITY_KEYS) and stamp["emitter_digest"] == LIVE,
+          str(sorted(stamp)))
+    stale = json.loads(json.dumps(good))
+    stale["compiler_identity"]["emitter_digest"] = "0" + LIVE[1:]
+    got = R.emitter_problems(stale, name="stale")
+    check("refusal a record whose producer digest is not this tree's",
+          any("digest" in x for x in got), str(got))
+    check("the drift refusal names the record, both digests and the emitter",
+          any(x.startswith("record 'stale'") and "asm-test" in x and LIVE in x
+              and stale["compiler_identity"]["emitter_digest"] in x and "digest" in x
+              for x in got), str(got))
+    check("a drifted digest is not reported as an unknown producer",
+          not any("no emitter" in x for x in got), str(got))
+    no_ident = {k: v for k, v in json.loads(json.dumps(good)).items()
+                if k != "compiler_identity"}
+    check("refusal a record with no producer named is still refused, and differently",
+          any("no compiler_identity" in x for x in R.schema_problems(no_ident))
+          and any("no emitter" in x for x in R.emitter_problems(no_ident)),
+          f"{R.schema_problems(no_ident)} | {R.emitter_problems(no_ident)}")
+    try:
+        R.label({"kind": "rl", "text": "  HALT\n", "input": "", "initial_data": "",
+                 "budget": 8, "config": {"outcap": G.OUT_CAP},
+                 "compiler_identity": {"ncl_version": "asm-test",
+                                       "emitter_digest": "f" * 64, "flags": []}})
+        check("label refuses to write a record whose producer has moved", False,
+              "label returned")
+    except R.RecordError as e:
+        check("label refuses to write a record whose producer has moved",
+              any("digest" in p for p in e.problems), str(e.problems[:2]))
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "drift.jsonl"
+        try:
+            R.write_records(path, [stale], name_of=lambda r: "stale")
+            check("write refuses a drifted record", False, "write_records returned")
+        except R.RecordError as e:
+            check("write refuses a drifted record naming it",
+                  any("record 'stale'" in p and LIVE in p for p in e.problems),
+                  str(e.problems[:2]))
+        check("the drifted batch left no corpus behind",
+              not path.exists(), str(path.exists()))
+
     cont = R.label({"kind": "cpt",
                     "text": "  LDI r0, 7\n  ADDI r0, 1\n  OUT r0\n  HALT\n",
                     "input": "", "initial_data": "", "budget": 24,
                     "config": {"outcap": G.OUT_CAP},
                     "compiler_identity": {"ncl_version": "asm-test",
-                                          "emitter_digest": "d" * 64, "flags": []}})
+                                          "emitter_digest": LIVE, "flags": []}})
     check("a cpt sample is labelled through the four paths",
           cont["expected"] == {"reassembles_to": cont["code"]}
           and cont["agreement"]["ticks_compared"] > 0

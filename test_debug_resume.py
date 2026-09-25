@@ -232,9 +232,55 @@ def tracing_survives():
           stopped is None and r.stopped == "watchpoint",
           (stopped or f"stopped {r.stopped!r}")[:170])
 
+def data_identity_survives():
+
+    src = "  LDI HL, 8\n  LDI r0, 0x5A\n  MOV [HL], r0\n  ADDI r0, 1\n  HALT"
+    code = asm(src)
+    two = ISA.MachineConfig(nbanks=2)
+    ran = []
+
+    def row(name, condition, detail=""):
+        ran.append(name)
+        return check(name, condition, detail)
+
+    maker = Debug(code, data=bytes(range(64)) * 2, tick_budget=64, config=two)
+    maker.step()
+    rec = maker.checkpoint()
+    row("D7 setup: the record the install carries is one a machine published",
+        bool(rec) and bytes(rec["DATA"][:9]) == bytes(maker.m.data[:9]),
+        f"record DATA {bytes(rec['DATA'])[:12].hex() if rec else None}")
+
+    d = Debug(code, data=bytes(range(64)) * 2, tick_budget=64, config=two)
+    traced = d.m.data
+    row("D7 a session's DATA is the object its store log lives on",
+        isinstance(traced, TracingData), f"a {type(traced).__name__}")
+    refused = refuse(d.m.install_state, rec)
+    if row("D7 the record installs", refused is None, (refused or "")[:170]):
+        row("D7 installing a record keeps the machine's DATA object identity, so a"
+            " session's store log survives the install",
+            d.m.data is traced and isinstance(d.m.data, TracingData),
+            f"after the install DATA is a {type(d.m.data).__name__}"
+            + ("" if d.m.data is traced else ", which is not the object the session traced"))
+
+        d.watch(8)
+        stopped = refuse(d.run, max_steps=8)
+        written = [a for f in d.frames for a, _v in (f.writes or ())]
+        row("D7 the log a session installed still records the stores it makes",
+            stopped is None and 8 in written and d.stopped == "watchpoint",
+            (stopped or f"stopped {d.stopped!r} after {len(d.frames)} frames, "
+             f"writes {written}")[:170])
+
+        foreign = bytearray(64 * 2)
+        refused = refuse(d.m.install_banks, [traced, foreign], 0, (1, 1))
+        row("D7 a machine that installed a record still owns the page its group names",
+            refused is None and d.m.banks[d.m.bank_own] is traced,
+            (refused or f"own page is the named one: {d.m.banks[0] is traced}")[:170])
+    COUNTS["D7 rows"] = COUNTS.get("D7 rows", 0) + len(ran)
+
 def main():
     print(f"debug-resume acceptance: {len(CASES)} programs")
     tracing_survives()
+    data_identity_survives()
     for case in CASES:
         one_case(case)
     refusals()
