@@ -159,8 +159,8 @@ def _per_machine(value, n, default):
         return [default if v is None else v for v in got]
     return [value] * n
 
-TICK_FIELDS = ("r", "HL", "DE", "MB", "PC", "SP", "C", "Z", "ipos", "tick", "status",
-               "fault_reason", "fault_addr", "DATA", "CODE", "out")
+TICK_FIELDS = ("r", "HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "ipos", "tick",
+               "status", "fault_reason", "fault_addr", "DATA", "CODE", "out")
 
 _UNCOMPARED_STATE = tuple(n for n in ISA.STATE_FIELD_NAMES if n not in TICK_FIELDS)
 if _UNCOMPARED_STATE:

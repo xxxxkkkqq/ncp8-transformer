@@ -47,14 +47,16 @@ WIDTHS = {
     "SP": (0, DATA_SIZE + 1),
     "C": (0, 2),
     "Z": (0, 2),
+    "S": (0, 2),
+    "V": (0, 2),
     "fault_reason": (0, 256),
     "fault_addr": (0, 1 << 16),
 }
 
 FAULT_WRITES = ("status", "fault_reason", "fault_addr")
 
-VIEW_FIELDS = ("r", "HL", "DE", "MB", "SP", "PC", "C", "Z", "ipos", "oplen", "tick",
-               "status", "fault_reason", "fault_addr")
+VIEW_FIELDS = ("r", "HL", "DE", "MB", "SP", "PC", "C", "Z", "S", "V", "ipos", "oplen",
+               "tick", "status", "fault_reason", "fault_addr")
 
 _left_out = [n for n in ISA.STATE_FIELD_NAMES if n not in VIEW_FIELDS]
 assert not _left_out, ("the compared view leaves out state rows", _left_out)
@@ -62,7 +64,7 @@ assert not _left_out, ("the compared view leaves out state rows", _left_out)
 def ref_view(g):
 
     view = dict(r=list(g.r), HL=g.HL, DE=g.DE, MB=g.MB, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
-                ipos=g.ipos, oplen=len(g.out), tick=g.tick,
+                S=g.S, V=g.V, ipos=g.ipos, oplen=len(g.out), tick=g.tick,
                 status=golden_sim.STATUS_CODE[g.status],
                 fault_reason=g.fault_reason, fault_addr=g.fault_addr)
     _check_view_fields(view, "reference")
@@ -666,6 +668,139 @@ def test_d8_the_only_cause_of_a_tick_is_the_one_named_in_the_table():
     print(f"  D8 cause table: {len(ISA.FAULT_CAUSES)} codes, dense from 0, all of them "
           f"inside the declared fault_reason width")
 
+FLAG_FORMS = {
+    "ADD": "ADD r0, r1",
+    "ADC": "ADC r0, r1",
+    "ADDI": "ADDI r0, {i}",
+    "ADD_HLDE": "ADD HL, DE",
+    "ADCI": "ADCI r0, {i}",
+    "AND": "AND r0, r1",
+    "CLC": "CLC",
+    "CMP": "CMP r0, r1",
+    "DIV": "DIV r0, r1",
+    "IN": "IN r0",
+    "MOD": "MOD r0, r1",
+    "MUL": "MUL r0, r1",
+    "MULH": "MULH r0, r1",
+    "NEG": "NEG r0",
+    "NOT": "NOT r0",
+    "OR": "OR r0, r1",
+    "ROL": "ROL r0",
+    "ROR": "ROR r0",
+    "SBB": "SBB r0, r1",
+    "SHL": "SHL r0",
+    "SHR": "SHR r0",
+    "SUB": "SUB r0, r1",
+    "SUBI": "SUBI r0, {i}",
+    "SUB_HLDE": "SUB HL, DE",
+    "TST": "TST r0",
+    "XOR": "XOR r0, r1",
+}
+
+FLAG_OPERANDS = ((0x00, 0x00, 0x00), (0x01, 0x01, 0x01), (0x7F, 0x7F, 0x7F),
+                 (0x80, 0x80, 0x80), (0xFF, 0xFF, 0xFF), (0x7F, 0x01, 0x01),
+                 (0x80, 0xFF, 0xFF), (0x01, 0x7F, 0x7F))
+FLAG_SEED_STATES = ((0, 0, 0, 0, b""), (1, 1, 1, 1, b"\x07"),
+                    (1, 0, 1, 0, b""), (0, 1, 0, 1, b"\x07"))
+
+def flag_points(alu):
+
+    for a, b, i in FLAG_OPERANDS:
+        src = FLAG_FORMS[alu].format(i=i) + "\nHALT"
+        for c_in, z_in, s_in, v_in, inp in FLAG_SEED_STATES:
+            yield {"src": src, "r": [a, b, 0, 0], "HL": (a << 8) | i,
+                   "DE": (b << 8) | a, "C": c_in, "Z": z_in, "S": s_in, "V": v_in,
+                   "inputs": inp}
+
+def _flags_of(view):
+
+    return {f: int(view[f]) for f in ISA.FLAG_FIELDS}
+
+def _moved_flags(points, views):
+
+    return {f for p, view in zip(points, views) for f in ISA.FLAG_FIELDS
+            if int(view[f]) != p[f]}
+
+def flag_ticks_reference(points):
+    views = []
+    codes = {}
+    for p in points:
+        code = codes.setdefault(p["src"], asm(p["src"]))
+        g = NCP8(code, inputs=p["inputs"])
+        g.r = list(p["r"])
+        g.HL, g.DE = p["HL"], p["DE"]
+        g.C, g.Z, g.S, g.V = p["C"], p["Z"], p["S"], p["V"]
+        try:
+            g.step()
+        except MachineError:
+            pass
+        views.append(ref_view(g))
+    return views
+
+def _flag_ticks_state_loaded(Mach, points):
+    views = []
+    codes = {}
+    for p in points:
+        m = Mach(codes.setdefault(p["src"], asm(p["src"])), inputs=p["inputs"])
+        m.load_state(p["r"], p["HL"], p["DE"], DATA_SIZE, p["C"], p["Z"], 0,
+                     S=p["S"], V=p["V"])
+        m.step()
+        views.append(circuit_view(m))
+    return views
+
+def flag_ticks_batch(points):
+    batch = TritonBatch(len(points), max_in=1)
+    for k, p in enumerate(points):
+        batch.set_program(k, asm(p["src"]), inputs=p["inputs"])
+        batch.set_state(k, r=p["r"], HL=p["HL"], DE=p["DE"], SP=DATA_SIZE,
+                        C=p["C"], Z=p["Z"], S=p["S"], V=p["V"])
+    batch.step(1)
+    views = []
+    for k in range(len(points)):
+        view = batch.snapshot(k)
+        _check_view_fields(view, "resident batch")
+        views.append(view)
+    return views
+
+def test_d9_declared_flags_are_the_flags_each_path_moves():
+
+    no_form = sorted(set(ISA.FLAG_WRITES) - set(FLAG_FORMS))
+    no_declaration = sorted(set(FLAG_FORMS) - set(ISA.FLAG_WRITES))
+    assert not no_form and not no_declaration, (
+        "this sweep and isa_table.FLAG_WRITES name different flag writers: no program for",
+        no_form, "and no declaration for", no_declaration)
+    paths = (("reference", flag_ticks_reference),
+             ("torch", lambda ps: _flag_ticks_state_loaded(TorchCircuit, ps)),
+             ("triton", lambda ps: _flag_ticks_state_loaded(TritonCircuit, ps)),
+             ("batch", flag_ticks_batch))
+    ticks = 0
+    for alu in sorted(ISA.FLAG_WRITES):
+        points = list(flag_points(alu))
+        declared = set(ISA.FLAG_WRITES[alu])
+        by_path = {}
+        for name, drive in paths:
+            views = drive(points)
+            by_path[name] = views
+            ticks += len(points)
+            moved = _moved_flags(points, views)
+            undeclared = sorted(moved - declared)
+            assert not undeclared, (
+                f"{alu} on the {name} path moves {undeclared}, which "
+                f"isa_table.FLAG_WRITES declares only as {sorted(declared)}")
+            unreached = sorted(declared - moved)
+            assert not unreached, (
+                f"{alu} on the {name} path never moves {unreached}, which "
+                f"isa_table.FLAG_WRITES declares for it")
+        for name, _ in paths[1:]:
+            for p, got, want in zip(points, by_path[name], by_path["reference"]):
+                assert _flags_of(got) == _flags_of(want), (
+                    f"{alu} on the {name} path leaves {_flags_of(got)} where the reference "
+                    f"leaves {_flags_of(want)}, on {p['src'].splitlines()[0]!r} from "
+                    f"r={p['r']} C={p['C']} Z={p['Z']} S={p['S']} V={p['V']}")
+    print(f"  D9 flag producers: {len(ISA.FLAG_WRITES)} declared writers over "
+          f"{len(paths)} paths, {ticks} single ticks, every declared flag reached on every "
+          f"path to the reference's value and no undeclared flag moved")
+
 CHECKS = (
     test_d1_register_write_port_masks,
     test_d1_width_conformance_on_the_bundled_programs,
@@ -691,6 +826,7 @@ CHECKS = (
     test_d8_error_tick_latches_the_fault_registers,
     test_d8_fault_pairing_is_refused_in_both_directions,
     test_d8_the_only_cause_of_a_tick_is_the_one_named_in_the_table,
+    test_d9_declared_flags_are_the_flags_each_path_moves,
 )
 
 def run_all():

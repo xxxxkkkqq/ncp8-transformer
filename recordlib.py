@@ -28,8 +28,8 @@ KIND_EXPECT = {"rl": ("status", "out", "state_delta", "fault_reason"),
                "sft": ("status", "out", "state_delta", "fault_reason"),
                "cpt": ("reassembles_to",)}
 
-COMPARED_FIELDS = tuple(f for f in ("r", "HL", "DE", "MB", "SP", "PC", "C", "Z", "ipos",
-                                    "tick", "status", "fault_reason", "fault_addr")
+COMPARED_FIELDS = tuple(f for f in ("r", "HL", "DE", "MB", "SP", "PC", "C", "Z", "S", "V",
+                                    "ipos", "tick", "status", "fault_reason", "fault_addr")
                         if f != "oplen")
 
 CONFIG_KEYS = tuple(ISA.MachineConfig.__slots__)

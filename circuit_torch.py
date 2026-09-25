@@ -57,12 +57,12 @@ _ALU, _S0, _S1, _LEN = _rom(ISA.single_rom())
 _ALU2, _S02, _S12, _LX2 = _rom(ISA.escape_rom())
 
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
-                fault_reason=0, fault_addr=0, mb=0, where=""):
+                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, where=""):
 
     if not 0 <= oplen <= OUT_CAP:
         raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
     bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "MB": mb, "PC": PC,
-                           "SP": SP, "C": C, "Z": Z, "ipos": ipos, "tick": tick,
+                           "SP": SP, "C": C, "Z": Z, "S": s, "V": v, "ipos": ipos, "tick": tick,
                            "status": status, "fault_reason": fault_reason,
                            "fault_addr": fault_addr},
                           where)
@@ -117,7 +117,8 @@ class TorchCircuit:
         self.set_inputs(inputs)
         self.OUTBUF = torch.zeros(self.out_cap, dtype=i32, device=dev)
         self.R = torch.zeros(4, dtype=i32, device=dev)
-        for n in ("HL", "DE", "MB", "PC", "SP", "C", "Z", "ipos", "oplen", "tick"):
+        for n in ("HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "ipos", "oplen",
+                  "tick"):
             setattr(self, n, torch.zeros(1, dtype=i32, device=dev))
         self.SP += DATA_SIZE
         self.status = torch.zeros(1, dtype=i32, device=dev)
@@ -229,12 +230,23 @@ class TorchCircuit:
         dde1 = self._g(self.DATA, self.DE + 1)
 
         t_add = a + b; v_add = t_add & 255; c_add = t_add >> 8
+
+        s_add = (v_add >> 7) & 1; v_ovf_add = ((a ^ v_add) & (b ^ v_add)) >> 7
         t_adc = a + b + self.C; v_adc = t_adc & 255; c_adc = t_adc >> 8
+        s_adc = (v_adc >> 7) & 1; v_ovf_adc = ((a ^ v_adc) & (b ^ v_adc)) >> 7
         v_sub = (a - b) & 255; c_sub = (a < b).to(i32)
+        s_sub = (v_sub >> 7) & 1; v_ovf_sub = ((a ^ b) & (v_sub ^ a)) >> 7
         t_sbb = a - b - self.C; v_sbb = t_sbb & 255; c_sbb = (t_sbb < 0).to(i32)
+        s_sbb = (v_sbb >> 7) & 1; v_ovf_sbb = ((a ^ b) & (v_sbb ^ a)) >> 7
         t_addi = rr + imm0; v_addi = t_addi & 255; c_addi = t_addi >> 8
+        s_addi = (v_addi >> 7) & 1
+        v_ovf_addi = ((rr ^ v_addi) & (imm0 ^ v_addi)) >> 7
         v_subi = (rr - imm0) & 255; c_subi = (rr < imm0).to(i32)
+        s_subi = (v_subi >> 7) & 1
+        v_ovf_subi = ((rr ^ imm0) & (v_subi ^ rr)) >> 7
         t_adci = rr + imm0 + self.C; v_adci = t_adci & 255; c_adci = t_adci >> 8
+        s_adci = (v_adci >> 7) & 1
+        v_ovf_adci = ((rr ^ v_adci) & (imm0 ^ v_adci)) >> 7
         v_shl = (rr << 1) & 255; c_shl = rr >> 7
         v_shr = rr >> 1; c_shr = rr & 1
         v_dj = (rr - 1) & 255
@@ -244,8 +256,12 @@ class TorchCircuit:
         b_safe = torch.where(b == 0, torch.ones((), dtype=i32, device=dev), b)
         v_div = a // b_safe; v_mod = a % b_safe
         cmp_c = (a < b).to(i32)
+        v_cmp = (a - b) & 255
+        cmp_s = (v_cmp >> 7) & 1
+        cmp_v = ((a ^ b) & (v_cmp ^ a)) >> 7
         v_not = (~rr) & 255
         v_neg = (-rr) & 255; c_neg = (rr != 0).to(i32)
+        s_neg = (v_neg >> 7) & 1
         v_rol = ((rr << 1) | self.C) & 255; c_rol = rr >> 7
         v_ror = (rr >> 1) | (self.C << 7); c_ror = rr & 1
         t_hladd = self.HL + self.DE; v_hladd = t_hladd & 0xFFFF; c_hladd = t_hladd >> 16
@@ -282,7 +298,10 @@ class TorchCircuit:
             + oh(POP) * dsp + oh(IN) * (1 - eof) * inb
             + oh(MOV_R_HL) * dl + oh(MOV_R_DE) * der
             + oh(GETPC) * self.PC + oh(GETSP) * (self.SP & 255)
-            + oh(GETF) * (self.Z + 2 * self.C)
+            + oh(GETF) * (self.Z * ISA.FLAG_BITS_PACKED["Z"]
+                          + self.C * ISA.FLAG_BITS_PACKED["C"]
+                          + self.S * ISA.FLAG_BITS_PACKED["S"]
+                          + self.V * ISA.FLAG_BITS_PACKED["V"])
             + oh(AND) * v_and + oh(OR) * v_or + oh(XOR) * v_xor + oh(MUL) * v_mul
             + oh(DIV) * v_div + oh(MOD) * v_mod
             + oh(NOT) * v_not + oh(NEG) * v_neg + oh(ROL) * v_rol + oh(ROR) * v_ror
@@ -367,6 +386,25 @@ class TorchCircuit:
             + oh(CMP) * ((a == b).to(i32) - self.Z) \
             + oh(MULH) * ((v_mulh == 0).to(i32) - self.Z)
 
+        rows_S = self.S + oh(ADD) * (s_add - self.S) \
+            + oh(ADC) * (s_adc - self.S) \
+            + oh(SUB) * (s_sub - self.S) \
+            + oh(SBB) * (s_sbb - self.S) \
+            + oh(ADDI) * (s_addi - self.S) \
+            + oh(SUBI) * (s_subi - self.S) \
+            + oh(ADCI) * (s_adci - self.S) \
+            + oh(CMP) * (cmp_s - self.S) \
+            + oh(NEG) * (s_neg - self.S)
+
+        rows_V = self.V + oh(ADD) * (v_ovf_add - self.V) \
+            + oh(ADC) * (v_ovf_adc - self.V) \
+            + oh(SUB) * (v_ovf_sub - self.V) \
+            + oh(SBB) * (v_ovf_sbb - self.V) \
+            + oh(ADDI) * (v_ovf_addi - self.V) \
+            + oh(SUBI) * (v_ovf_subi - self.V) \
+            + oh(ADCI) * (v_ovf_adci - self.V) \
+            + oh(CMP) * (cmp_v - self.V)
+
         fall = self.PC + ln_e
         retv = (dsp << 8) | dsp1
         jz_t = w(self.Z.reshape(1), t16, fall); jnz_t = w((1 - self.Z).reshape(1), t16, fall)
@@ -381,6 +419,15 @@ class TorchCircuit:
         rows_PC = w(oh(JC), jc_t, rows_PC)
         rows_PC = w(oh(JNC), jnc_t, rows_PC)
         rows_PC = w(oh(DJNZ), dj_t, rows_PC)
+        rel = (fall + sx) & 0xFFFF
+        js_t = w(self.S.reshape(1), rel, fall)
+        jns_t = w((1 - self.S).reshape(1), rel, fall)
+        vs_t = w(self.V.reshape(1), rel, fall)
+        vc_t = w((1 - self.V).reshape(1), rel, fall)
+        rows_PC = w(oh(JS), js_t, rows_PC)
+        rows_PC = w(oh(JNS), jns_t, rows_PC)
+        rows_PC = w(oh(VS), vs_t, rows_PC)
+        rows_PC = w(oh(VC), vc_t, rows_PC)
         rows_PC = w(oh(JPHL), self.HL, rows_PC)
         rows_PC = w(oh(EXT), vec, rows_PC)
 
@@ -520,6 +567,8 @@ class TorchCircuit:
         self.SP = m * sel(rows_SP) + (1 - m) * self.SP
         self.C = m * sel(rows_C) + (1 - m) * self.C
         self.Z = m * sel(rows_Z) + (1 - m) * self.Z
+        self.S = m * (sel(rows_S) & 1) + (1 - m) * self.S
+        self.V = m * (sel(rows_V) & 1) + (1 - m) * self.V
         self.ipos = m * sel(rows_ipos) + (1 - m) * self.ipos
         self.tick = self.tick + m
 
@@ -527,16 +576,20 @@ class TorchCircuit:
         return buf.index_select(0, idx.clamp(0, buf.numel() - 1).reshape(1)).reshape(()).to(torch.int32)
 
     def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0, fault_reason=None,
-                   fault_addr=None):
+                   fault_addr=None, S=None, V=None):
 
         fr = int(self.fault_reason.item()) if fault_reason is None else fault_reason
         fa = int(self.fault_addr.item()) if fault_addr is None else fault_addr
+        sv = int(self.S.item()) if S is None else S
+        vv = int(self.V.item()) if V is None else V
         check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=int(self.ipos.item()),
                     oplen=int(self.oplen.item()), status=int(self.status.item()),
-                    fault_reason=fr, fault_addr=fa, mb=int(self.MB.item()))
+                    fault_reason=fr, fault_addr=fa, mb=int(self.MB.item()), s=sv, v=vv)
         t = torch.tensor
         self.fault_reason = t([fr], dtype=torch.int32, device=self.dev)
         self.fault_addr = t([fa], dtype=torch.int32, device=self.dev)
+        self.S = t([sv], dtype=torch.int32, device=self.dev)
+        self.V = t([vv], dtype=torch.int32, device=self.dev)
         self.R = t(R, dtype=torch.int32, device=self.dev)
         self.HL = t([HL], dtype=torch.int32, device=self.dev)
         self.DE = t([DE], dtype=torch.int32, device=self.dev)
@@ -558,8 +611,8 @@ class TorchCircuit:
                                  tdlim=self.tdlim, tickbudget=self.tb,
                                  outcap=self.out_cap)
 
-    _RECORD_SCALARS = ("HL", "DE", "MB", "PC", "SP", "C", "Z", "ipos", "tick", "status",
-                       "fault_reason", "fault_addr")
+    _RECORD_SCALARS = ("HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "ipos", "tick",
+                       "status", "fault_reason", "fault_addr")
     _RECORD_READERS = {
         **{n: (lambda m, n=n: int(getattr(m, n).item())) for n in _RECORD_SCALARS},
         "r": lambda m: [int(v) for v in m.R.tolist()],
@@ -590,7 +643,7 @@ class TorchCircuit:
                     tick=st["tick"], PC=st["PC"], ipos=st["ipos"],
                     oplen=len(got.out), status=st["status"],
                     fault_reason=st["fault_reason"], fault_addr=st["fault_addr"],
-                    mb=st["MB"], where="TorchCircuit: ")
+                    mb=st["MB"], s=st["S"], v=st["V"], where="TorchCircuit: ")
         t = torch.tensor
         i32 = torch.int32
         self.R = t(st["r"], dtype=i32, device=self.dev)
@@ -608,6 +661,7 @@ class TorchCircuit:
         return dict(r=self.R.tolist(), HL=self.HL.item(), DE=self.DE.item(),
                     MB=self.MB.item(),
                     SP=self.SP.item(), PC=self.PC.item(), C=self.C.item(), Z=self.Z.item(),
+                    S=self.S.item(), V=self.V.item(),
                     ipos=self.ipos.item(), oplen=self.oplen.item(), tick=self.tick.item(),
                     status=int(self.status.item()),
                     fault_reason=int(self.fault_reason.item()),

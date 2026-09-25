@@ -74,6 +74,8 @@ for sub, t in {0x30: "MOVW HL, DE", 0x31: "MOVW DE, HL", 0x32: "MOVW HL, SP",
 for k in range(4):
     ESC[0x50 | k] = (f"LDX {_r(k)}, [HL{{off}}]", 3)
     ESC[0x54 | k] = (f"STX [HL{{off}}], {_r(k)}", 3)
+for sub, name in ((0x64, "JS"), (0x65, "JNS"), (0x66, "VS"), (0x67, "VC")):
+    ESC[sub] = (f"{name} {{soff}}", 3)
 ESC[0x58] = ("ADD SP, {soff}", 3)
 ESC[0x70] = ("EXT {k}", 3)
 for k in range(4):

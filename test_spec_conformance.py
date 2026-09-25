@@ -188,13 +188,16 @@ def test_escape_subcode_space_is_accounted_for_exactly():
     free = set(ISA.unassigned_escape())
     bank = {s for s in assigned if 0xB0 <= s <= 0xBD}
     assert len(bank) == 14, [hex(b) for b in sorted(bank)]
-    assert len(assigned) == 129, len(assigned)
+    assert {ISA.ESCAPE[s]["alu"] for s in bank} == {
+        "LDM", "STM", "LDMW_DE_HL", "LDMW_HL_DE", "STMW_HL_DE", "STMW_DE_HL",
+        "MOV_MB_HL", "MOV_HL_MB"}
+    branch = {s for s in assigned if 0x64 <= s <= 0x67}
+    assert [ISA.ESCAPE[s]["alu"] for s in sorted(branch)] == ["JS", "JNS", "VS", "VC"]
     assert len(planned) == 8, sorted(hex(p) for p in planned)
     assert planned <= free, [hex(p) for p in planned - free]
-    assert len(free) == 127, len(free)
-    assert len(free - planned) == 119, len(free - planned)
+    assert assigned | free == set(range(256))
+    assert not assigned & free
     assert len(assigned) + len(planned) + len(free - planned) == 256
-    assert not assigned & planned
     ISA.check_structure()
 
 def test_single_byte_space_is_accounted_for_exactly():

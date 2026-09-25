@@ -10,6 +10,7 @@
 | `SP` | 16 bit | stack pointer, starts at 4096 and grows down; legal values are `[0, 4096]` |
 | `PC` | 16 bit | program counter |
 | `C`, `Z` | 1 bit each | carry and zero flags |
+| `S`, `V` | 1 bit each | signed result and signed overflow flags |
 | `CODE` | 4096 bytes | program memory. The first `CODELEN` bytes are the program: instruction fetch, `LDC` and `STC` are all bounded by that length, not by the 4096, and `STC` is bounded further by the declared window (see 5) |
 | `DATA` | 4096 bytes | data memory and stack |
 | input | byte stream | `IN`, cursor `ipos` |
@@ -96,7 +97,7 @@ suites depend on how the interpreter was started.
 
 Flags are only modified by instructions that declare it; moves, loads, pushes,
 pops and pointer increments leave them untouched. `GETF` returns flags packed as
-`Z | (C << 1)`.
+`Z | (C << 1) | (S << 2) | (V << 3)`.
 
 ## 4. Instruction encoding
 
@@ -164,15 +165,15 @@ disturbing a carry chain.
 
 | code | mnemonic | effect | flags |
 |---|---|---|---|
-| 0x80+f | ADD r,s | `r += s` | C,Z |
-| 0x90+f | SUB r,s | `r -= s` | C,Z |
-| 0xA0+f | ADC r,s | `r += s + C` | C,Z |
-| 0xB0+f | SBB r,s | `r -= s + C` | C,Z |
+| 0x80+f | ADD r,s | `r += s` | C,Z,S,V |
+| 0x90+f | SUB r,s | `r -= s` | C,Z,S,V |
+| 0xA0+f | ADC r,s | `r += s + C` | C,Z,S,V |
+| 0xB0+f | SBB r,s | `r -= s + C` | C,Z,S,V |
 | 0xC0+f | MOV r,s | `r = s` | untouched |
 | 0xD0+r | LDI r, i8 | `r = i` | untouched |
-| 0xD4+r | ADDI r, i8 | `r += i` | C,Z |
-| 0xD8+r | SUBI r, i8 | `r -= i` | C,Z |
-| 0xDC+r | ADCI r, i8 | `r += i + C` | C,Z |
+| 0xD4+r | ADDI r, i8 | `r += i` | C,Z,S,V |
+| 0xD8+r | SUBI r, i8 | `r -= i` | C,Z,S,V |
+| 0xDC+r | ADCI r, i8 | `r += i + C` | C,Z,S,V |
 
 ### 4.5 Memory, stack and IO (0xE0-0xFF)
 
@@ -196,7 +197,7 @@ instruction length is counted from the prefix byte.
 |---|---|---|---|
 | 0x00+f | DIV r,s | `r = r / s` (integer); `s == 0` is an error | Z |
 | 0x10+f | MOD r,s | `r = r % s`; `s == 0` is an error | Z |
-| 0x20+f | CMP r,s | sets `Z = (r == s)`, `C = (r < s)`, writes no register | C,Z |
+| 0x20+f | CMP r,s | sets `Z = (r == s)`, `C = (r < s)`, writes no register | C,Z,S,V |
 | 0x30 / 0x31 | MOVW HL, DE / MOVW DE, HL | copy between the two 16-bit pointers | untouched |
 | 0x32 / 0x33 | MOVW HL, SP / MOVW DE, SP | copy `SP` into a pointer | untouched |
 | 0x34 / 0x35 | MOVW SP, HL / MOVW SP, DE | `SP =` pointer; an out-of-range pointer is an error | untouched |
@@ -205,7 +206,7 @@ instruction length is counted from the prefix byte.
 | 0x3C / 0x3D | STW [HL], DE / STW [DE], HL | store 16 bits little-endian | untouched |
 | 0x3E / 0x3F | LDW DE, [HL] / LDW HL, [DE] | load 16 bits little-endian | untouched |
 | 0x40+r | NOT r | `r = ~r` | Z |
-| 0x44+r | NEG r | `r = (-r) & 0xFF` | C,Z |
+| 0x44+r | NEG r | `r = (-r) & 0xFF` | C,Z,S |
 | 0x48+r | ROL r | rotate left through carry (9-bit rotation: C is the ninth bit) | C,Z |
 | 0x4C+r | ROR r | rotate right through carry | C,Z |
 | 0x50+r, i8 | LDX r, [HL+i8] | `r = DATA[(HL + i8) & 0xFFFF]`, `i8` sign-extended to 16 bits | untouched |
@@ -214,6 +215,10 @@ instruction length is counted from the prefix byte.
 | 0x60 | ADD HL, DE | 16-bit pointer addition | C |
 | 0x61 | SUB HL, DE | 16-bit pointer subtraction | C |
 | 0x62 | XCHG HL, DE | swap the pointer pair | untouched |
+| 0x64 | JS soff | jump if `S` | untouched |
+| 0x65 | JNS soff | jump if not `S` | untouched |
+| 0x66 | VS soff | jump if `V` | untouched |
+| 0x67 | VC soff | jump if not `V` | untouched |
 | 0x70 k | EXT k | `PC = vector[k]`, the entry point declared at load; nothing is saved, so a handler does not come back to the trap site | - |
 | 0x80+r | STC [HL], r | `CODE[HL] = r`, allowed only inside the declared window | - |
 | 0x84+r | LDC r, [HL] | `r = CODE[HL]` | untouched |

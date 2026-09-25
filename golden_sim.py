@@ -47,6 +47,18 @@ STATUS_NAME = {c: n for n, c in STATUS_CODE.items()}
 
 CAUSE = ISA.CAUSE
 
+def _sign(result):
+
+    return (result >> 7) & 1
+
+def _overflow_add(a, b, result):
+
+    return ((a ^ result) & (b ^ result)) >> 7 & 1
+
+def _overflow_sub(a, b, result):
+
+    return ((a ^ b) & (result ^ a)) >> 7 & 1
+
 class MachineError(Exception):
 
     def __init__(self, msg, reason=0):
@@ -58,12 +70,12 @@ class FaultCauseMissing(MachineError):
     pass
 
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
-                fault_reason=0, fault_addr=0, mb=0, where=""):
+                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, where=""):
 
     if not 0 <= oplen <= OUT_CAP:
         raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
     bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "MB": mb, "PC": PC,
-                           "SP": SP, "C": C, "Z": Z, "ipos": ipos, "tick": tick,
+                           "SP": SP, "C": C, "Z": Z, "S": s, "V": v, "ipos": ipos, "tick": tick,
                            "status": status, "fault_reason": fault_reason,
                            "fault_addr": fault_addr},
                           where)
@@ -106,6 +118,9 @@ class NCP8:
         self.PC = 0
         self.C = 0
         self.Z = 0
+
+        self.S = 0
+        self.V = 0
         self.inputs = bytes(inputs)
         self.ipos = 0
         self.out = bytearray()
@@ -132,15 +147,18 @@ class NCP8:
         self.trace: list[str] = []
 
     def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0, fault_reason=None,
-                   fault_addr=None):
+                   fault_addr=None, S=None, V=None):
 
         fr = self.fault_reason if fault_reason is None else fault_reason
         fa = self.fault_addr if fault_addr is None else fault_addr
+        sv = self.S if S is None else S
+        vv = self.V if V is None else V
         check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=self.ipos,
                     status=STATUS_CODE[self.status], fault_reason=fr, fault_addr=fa,
-                    mb=self.MB)
+                    mb=self.MB, s=sv, v=vv)
         self.r = list(R)
         self.HL, self.DE, self.SP, self.C, self.Z = HL, DE, SP, C, Z
+        self.S, self.V = sv, vv
         self.tick, self.PC = tick, PC
         self.fault_reason, self.fault_addr = fr, fa
 
@@ -169,6 +187,8 @@ class NCP8:
         "SP": lambda m: m.SP,
         "C": lambda m: m.C,
         "Z": lambda m: m.Z,
+        "S": lambda m: m.S,
+        "V": lambda m: m.V,
         "ipos": lambda m: m.ipos,
         "tick": lambda m: m.tick,
         "status": lambda m: m.status_code(),
@@ -199,11 +219,13 @@ class NCP8:
         check_state(st["r"], st["HL"], st["DE"], st["SP"], st["C"], st["Z"],
                     tick=st["tick"], PC=st["PC"], ipos=st["ipos"],
                     status=st["status"], fault_reason=st["fault_reason"],
-                    fault_addr=st["fault_addr"], mb=st["MB"], where="NCP8: ")
+                    fault_addr=st["fault_addr"], mb=st["MB"], s=st["S"], v=st["V"],
+                    where="NCP8: ")
         self.r = list(st["r"])
         self.HL, self.DE, self.PC, self.SP = st["HL"], st["DE"], st["PC"], st["SP"]
         self.MB = st["MB"]
         self.C, self.Z = st["C"], st["Z"]
+        self.S, self.V = st["S"], st["V"]
         self.ipos, self.tick = st["ipos"], st["tick"]
         self.status = STATUS_NAME[st["status"]]
         self.fault_reason, self.fault_addr = st["fault_reason"], st["fault_addr"]
@@ -401,6 +423,13 @@ class NCP8:
         elif sel == "ADDI_DE":
             s = imm[0] & 3
             self.DE = (self.DE + self.r[s]) & 0xFFFF; m = f"ADDI DE, r{s}"
+        elif sel in ("JS", "JNS", "VS", "VC"):
+
+            d = (imm[0] ^ 0x80) - 0x80
+            test = {"JS": self.S, "JNS": 1 - self.S, "VS": self.V,
+                    "VC": 1 - self.V}[sel]
+            self.PC = (self.PC + d) & 0xFFFF if test else self.PC
+            m = f"{sel} {d:+d}"
         elif sel == "JPHL":
             self.PC = self.HL; m = "JPHL"
         elif sel == "GETPC":
@@ -408,23 +437,39 @@ class NCP8:
         elif sel == "GETSP":
             self.r[s0] = self.SP & 255; m = f"GETSP r{s0}"
         elif sel == "GETF":
-            self.r[s0] = self.Z | (self.C << 1); m = f"GETF r{s0}"
+            self.r[s0] = ISA.flags_byte({"Z": self.Z, "C": self.C, "S": self.S,
+                                         "V": self.V})
+            m = f"GETF r{s0}"
         elif sel == "ADD":
             a, b = self.r[s0], self.r[s1]
-            t = a + b; self.C = t >> 8; self.r[s0] = t & 0xFF
-            self.Z = int((t & 0xFF) == 0); m = f"ADD r{s0}, r{s1}"
+            t = a + b; v = t & 0xFF
+            self.C = t >> 8; self.r[s0] = v
+            self.Z = int(v == 0)
+            self.S = _sign(v); self.V = _overflow_add(a, b, v)
+            m = f"ADD r{s0}, r{s1}"
         elif sel == "SUB":
             a, b = self.r[s0], self.r[s1]
-            self.C = int(a < b); v = (a - b) & 0xFF; self.r[s0] = v
-            self.Z = int(v == 0); m = f"SUB r{s0}, r{s1}"
+            v = (a - b) & 0xFF
+            self.C = int(a < b); self.r[s0] = v
+            self.Z = int(v == 0)
+            self.S = _sign(v); self.V = _overflow_sub(a, b, v)
+            m = f"SUB r{s0}, r{s1}"
         elif sel == "ADC":
             a, b = self.r[s0], self.r[s1]
-            t = a + b + self.C; self.C = t >> 8; self.r[s0] = t & 0xFF
-            self.Z = int((t & 0xFF) == 0); m = f"ADC r{s0}, r{s1}"
+            c = self.C
+            t = a + b + c; v = t & 0xFF
+            self.C = t >> 8; self.r[s0] = v
+            self.Z = int(v == 0)
+            self.S = _sign(v); self.V = _overflow_add(a, b, v)
+            m = f"ADC r{s0}, r{s1}"
         elif sel == "SBB":
             a, b = self.r[s0], self.r[s1]
-            t = a - b - self.C; self.C = int(t < 0); v = t & 0xFF; self.r[s0] = v
-            self.Z = int(v == 0); m = f"SBB r{s0}, r{s1}"
+            c = self.C
+            t = a - b - c; v = t & 0xFF
+            self.C = int(t < 0); self.r[s0] = v
+            self.Z = int(v == 0)
+            self.S = _sign(v); self.V = _overflow_sub(a, b, v)
+            m = f"SBB r{s0}, r{s1}"
         elif sel == "MOV":
             b = self.r[s1]; self.r[s0] = b; m = f"MOV r{s0}, r{s1}"
         elif sel == "AND":
@@ -448,13 +493,18 @@ class NCP8:
             self.r[s0] = v; self.Z = int(v == 0); m = f"{sel} r{s0}, r{s1}"
         elif sel == "CMP":
             a, b = self.r[s0], self.r[s1]
-            self.Z = int(a == b); self.C = int(a < b); m = f"CMP r{s0}, r{s1}"
+            v = (a - b) & 0xFF
+            self.Z = int(a == b); self.C = int(a < b)
+            self.S = _sign(v); self.V = _overflow_sub(a, b, v)
+            m = f"CMP r{s0}, r{s1}"
         elif sel == "NOT":
             v = (~self.r[s0]) & 0xFF; self.r[s0] = v
             self.Z = int(v == 0); m = f"NOT r{s0}"
         elif sel == "NEG":
             t = (-self.r[s0]) & 0xFF; self.C = int(self.r[s0] != 0)
-            self.r[s0] = t; self.Z = int(t == 0); m = f"NEG r{s0}"
+            self.r[s0] = t; self.Z = int(t == 0)
+
+            self.S = _sign(t); m = f"NEG r{s0}"
         elif sel == "ROL":
             v = self.r[s0]; self.C, self.r[s0] = v >> 7, ((v << 1) | self.C) & 0xFF
             self.Z = int(self.r[s0] == 0); m = f"ROL r{s0}"
@@ -601,16 +651,25 @@ class NCP8:
             if sel == "LDI":
                 self.r[s0] = i; m = f"LDI r{s0}, {i}"
             elif sel == "ADDI":
-                t = self.r[s0] + i
-                self.C = t >> 8; self.r[s0] = t & 0xFF
-                self.Z = int((t & 0xFF) == 0); m = f"ADDI r{s0}, {i}"
+                a = self.r[s0]
+                t = a + i; v = t & 0xFF
+                self.C = t >> 8; self.r[s0] = v
+                self.Z = int(v == 0)
+                self.S = _sign(v); self.V = _overflow_add(a, i, v)
+                m = f"ADDI r{s0}, {i}"
             elif sel == "SUBI":
-                a = self.r[s0]; self.C = int(a < i); v = (a - i) & 0xFF
-                self.r[s0] = v; self.Z = int(v == 0); m = f"SUBI r{s0}, {i}"
+                a = self.r[s0]; v = (a - i) & 0xFF
+                self.C = int(a < i); self.r[s0] = v
+                self.Z = int(v == 0)
+                self.S = _sign(v); self.V = _overflow_sub(a, i, v)
+                m = f"SUBI r{s0}, {i}"
             else:
-                t = self.r[s0] + i + self.C
-                self.C = t >> 8; self.r[s0] = t & 0xFF
-                self.Z = int((t & 0xFF) == 0); m = f"ADCI r{s0}, {i}"
+                a = self.r[s0]; c = self.C
+                t = a + i + c; v = t & 0xFF
+                self.C = t >> 8; self.r[s0] = v
+                self.Z = int(v == 0)
+                self.S = _sign(v); self.V = _overflow_add(a, i, v)
+                m = f"ADCI r{s0}, {i}"
         elif sel == "SHL":
             self.C = self.r[s0] >> 7; v = (self.r[s0] << 1) & 0xFF; self.r[s0] = v
             self.Z = int(v == 0); m = f"SHL r{s0}"
@@ -661,7 +720,8 @@ class NCP8:
 
         return dict(r=list(self.r), HL=self.HL, DE=self.DE, MB=self.MB, SP=self.SP,
                     PC=self.PC,
-                    C=self.C, Z=self.Z, ipos=self.ipos, tick=self.tick,
+                    C=self.C, Z=self.Z, S=self.S, V=self.V,
+                    ipos=self.ipos, tick=self.tick,
                     status=self.status, fault_reason=self.fault_reason,
                     fault_addr=self.fault_addr)
 
@@ -806,6 +866,10 @@ ENC = {
     ("INC", ("DE",)): (b"\x04", [None]),
     ("INC", ("HL",)): (b"\x02", [None]),
     ("JC", ("a16",)): (b"\x0c", [("word",)]),
+    ("JS", ("soff",)): (b"\x70\x64", [("byte",)]),
+    ("JNS", ("soff",)): (b"\x70\x65", [("byte",)]),
+    ("VC", ("soff",)): (b"\x70\x67", [("byte",)]),
+    ("VS", ("soff",)): (b"\x70\x66", [("byte",)]),
     ("JMP", ("a16",)): (b"\x09", [("word",)]),
     ("JNC", ("a16",)): (b"\x0d", [("word",)]),
     ("JNZ", ("a16",)): (b"\x0b", [("word",)]),

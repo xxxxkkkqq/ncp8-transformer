@@ -68,6 +68,7 @@ ALU_NAMES = (
     "LDX", "STX", "ADD_SP", "MULH",
     "LDM", "STM", "LDMW_DE_HL", "LDMW_HL_DE", "STMW_HL_DE", "STMW_DE_HL",
     "MOV_MB_HL", "MOV_HL_MB",
+    "JS", "JNS", "VS", "VC",
 )
 ALU_ID = {name: i for i, name in enumerate(ALU_NAMES)}
 K = len(ALU_NAMES)
@@ -82,6 +83,7 @@ ESC_EOP_NAMES = (
     "STW_HLDE", "STW_DEHL", "LDW_DEHL", "LDW_HLDE", "LDX", "STX", "ADD_SP", "MULH",
     "LDM", "STM", "LDMW_DE_HL", "LDMW_HL_DE", "STMW_HL_DE", "STMW_DE_HL",
     "MOV_MB_HL", "MOV_HL_MB",
+    "JS", "JNS", "VS", "VC",
 )
 ESC_EOP_ID = {name: ESC_EOP_BASE + i for i, name in enumerate(ESC_EOP_NAMES)}
 
@@ -177,6 +179,9 @@ for _f in range(16):
 for _k in range(4):
     _escape(0xB0 | _k, "LDM", f"LDM r{_k}, [HL]", _k, _k)
     _escape(0xB4 | _k, "STM", f"STM [HL], r{_k}", _k, _k)
+
+for _sub, _alu in zip(range(0x64, 0x68), ("JS", "JNS", "VS", "VC")):
+    _escape(_sub, _alu, f"{_alu} {{soff}}", l=1, kind="off")
 for _sub, (_alu, _mn) in ((0xB8, ("LDMW_DE_HL", "LDMW DE, [HL]")),
                           (0xB9, ("LDMW_HL_DE", "LDMW HL, [DE]")),
                           (0xBA, ("STMW_HL_DE", "STMW [HL], DE")),
@@ -514,6 +519,8 @@ STATE_FIELDS = (
     StateField("SP", 0, DATA_SIZE, None),
     StateField("C", 0, 1, None),
     StateField("Z", 0, 1, None),
+    StateField("S", 0, 1, None),
+    StateField("V", 0, 1, None),
     StateField("ipos", 0, None, None),
     StateField("tick", 0, None, None),
     StateField("status", 0, 3, None),
@@ -522,6 +529,50 @@ STATE_FIELDS = (
 )
 
 STATE_FIELD_NAMES = tuple(f.name for f in STATE_FIELDS)
+
+FLAG_FIELDS = ("Z", "C", "S", "V")
+FLAG_BITS_PACKED = {name: 1 << i for i, name in enumerate(FLAG_FIELDS)}
+
+FLAG_WRITES = {
+    "CLC": ("C",),
+    "ADD": ("C", "Z", "S", "V"),
+    "ADC": ("C", "Z", "S", "V"),
+    "SUB": ("C", "Z", "S", "V"),
+    "SBB": ("C", "Z", "S", "V"),
+    "ADDI": ("C", "Z", "S", "V"),
+    "SUBI": ("C", "Z", "S", "V"),
+    "ADCI": ("C", "Z", "S", "V"),
+    "CMP": ("C", "Z", "S", "V"),
+    "NEG": ("C", "Z", "S"),
+    "AND": ("Z",),
+    "OR": ("Z",),
+    "XOR": ("Z",),
+    "MUL": ("C", "Z"),
+    "MULH": ("Z",),
+    "DIV": ("Z",),
+    "MOD": ("Z",),
+    "NOT": ("Z",),
+    "ROL": ("C", "Z"),
+    "ROR": ("C", "Z"),
+    "SHL": ("C", "Z"),
+    "SHR": ("C", "Z"),
+    "TST": ("Z",),
+    "ADD_HLDE": ("C",),
+    "SUB_HLDE": ("C",),
+    "IN": ("C",),
+}
+
+def flag_writes(row):
+
+    declared = FLAG_WRITES.get(row["alu"], ())
+    return tuple(f for f in FLAG_FIELDS if f in declared)
+
+def flags_byte(values):
+
+    out = 0
+    for name, bit in FLAG_BITS_PACKED.items():
+        out |= (int(values[name]) & 1) * bit
+    return out
 
 RECORD_IMAGES = ("CODE", "DATA")
 RECORD_STREAMS = ("out", "inputs")
@@ -759,6 +810,38 @@ def check_state_table():
     if leaked:
         raise DecodeTableError(f"a record component names load-time configuration "
                                f"{leaked}")
+    check_flag_table()
+    return True
+
+def check_flag_table():
+
+    if set(FLAG_FIELDS) - set(STATE_FIELD_NAMES):
+        raise DecodeTableError("a condition flag is not a field of the state table: "
+                               f"{sorted(set(FLAG_FIELDS) - set(STATE_FIELD_NAMES))}")
+    for f in STATE_FIELDS:
+        if f.name in FLAG_FIELDS and (f.lo, f.hi, f.cells) != (0, 1, None):
+            raise DecodeTableError(f"flag {f.name} is not declared as one bit")
+    if len(set(FLAG_FIELDS)) != len(FLAG_FIELDS):
+        raise DecodeTableError("the flag list names a flag twice")
+    if sorted(FLAG_BITS_PACKED) != sorted(FLAG_FIELDS):
+        raise DecodeTableError("the GETF packing and the flag list name different flags")
+    unknown = sorted(set(FLAG_WRITES) - set(ALU_ID))
+    if unknown:
+        raise DecodeTableError(f"the flag declaration names selectors the ALU vocabulary "
+                               f"does not have: {unknown}")
+    for alu, flags in FLAG_WRITES.items():
+        extra = sorted(set(flags) - set(FLAG_FIELDS))
+        if extra:
+            raise DecodeTableError(f"{alu} declares flags that are not condition flags: "
+                                   f"{extra}")
+        if not flags:
+            raise DecodeTableError(f"{alu} declares no flag, so it is not a writer")
+    if flags_byte({n: 0 for n in FLAG_FIELDS}) != 0:
+        raise DecodeTableError("the reset flags do not pack as a zero byte")
+    for name, bit in FLAG_BITS_PACKED.items():
+        got = flags_byte({n: int(n == name) for n in FLAG_FIELDS})
+        if got != bit:
+            raise DecodeTableError(f"flag {name} packs as {got}, the byte gives it {bit}")
     return True
 
 check_state_table()
