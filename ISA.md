@@ -245,11 +245,15 @@ assumed, and executing such an instruction leaves the byte as it was loaded -- t
 
 For `EXT k` the high bits are not don't-care: they select a vector, and an index outside the
 declared table is a fault (`TRAP_UNREG`) rather than a different register. The disassembler
-prints those encodings as `EXT k` with `k` past the table and the assembler refuses to emit them,
-so a program containing `EXT 16` can be loaded and run today but cannot be produced from source.
-That is an open gap in the toolchain, not a property of the machine: the encoding is assigned,
-the bytes mean what they mean, and the fault is the machine's own answer to an unregistered
-vector.
+prints those encodings as `EXT k` with `k` past the table. Every value of the operand byte is
+spellable: `EXT 16` assembles to `70 70 10`, both assembler front ends accept it, and the
+fault is the machine's own answer at run time to an unregistered vector. Whether a vector is
+registered is a property of the configuration a machine was loaded under, so no load-time
+assembler can decide it.
+
+What is still open on these encodings is a labelling question rather than a toolchain gap: the
+disassembler calls `k` past the declared table non-canonical under the rule that
+non-canonical means bits the decoder does not read, while the machine reads the whole byte.
 
 Programs are compared between implementations by the bytes in `CODE` and what each tick commits,
 so two images that differ only in the unread bits of an alias are different images; narrowing an

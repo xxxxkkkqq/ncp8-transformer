@@ -27,6 +27,7 @@ pip install torch triton          # triton only needed for circuit_triton.py
 python3 isa_table.py                  # the decode table against the live ROMs and dispatch
 python3 test_isa_v2.py                # instruction semantics (reference only)
 python3 test_arithmetic_bounds.py     # bit-width / radix bounds, carry chains
+python3 test_form_domain.py           # every assigned encoding is spellable on both front ends
 python3 test_asm_strictness.py        # assembler must refuse, never mis-encode
 python3 isa_forms.py                  # one accepted-form table, checked against the encodings
 python3 test_circuit_equivalence.py   # both circuits vs reference, all 256 opcodes

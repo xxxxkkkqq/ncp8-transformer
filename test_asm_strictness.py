@@ -25,7 +25,12 @@ MUST_FAIL = (
     ("ADCI r0, 1000", 1, ("ADCI", "1000", "0..255")),
     ("JMP 0x10000", 1, ("JMP", "65536", "0..65535")),
     ("LDI HL, 70000", 1, ("LDI", "70000", "0..65535")),
-    ("EXT 300", 1, ("EXT", "300", "0..15")),
+
+    ("EXT 300", 1, ("EXT", "300", "0..255")),
+    ("EXT 256", 1, ("EXT", "256", "0..255")),
+    ("EXT -1", 1, ("EXT", "-1", "0..255")),
+    ("EXT 0x100", 1, ("EXT", "256", "0..255")),
+    ("EXT [HL]", 1, ("EXT", "[HL]")),
     ("lab:\nLDI r0, lab", 2, ("label", "lab", "8-bit immediate")),
     ("FOO r0, r1", 1, ("unknown instruction", "FOO")),
     ("JMP 0xZZ", 1, ("0xZZ",)),
@@ -81,6 +86,25 @@ MUST_PASS = (
      bytes([0x70, 0x58, 0xF8, 0x70, 0x58, 0x00, 0x70, 0x58, 0x7F])),
     ("widening multiply high byte", "MULH r0, r1\nMULH r1, r3\nMULH r3, r3",
      bytes([0x70, 0x91, 0x70, 0x97, 0x70, 0x9F])),
+
+    ("trap numbers over the whole operand byte",
+     "EXT 0\nEXT 15\nEXT 16\nEXT 17\nEXT 255",
+     bytes([0x70, 0x70, 0x00, 0x70, 0x70, 0x0F, 0x70, 0x70, 0x10,
+            0x70, 0x70, 0x11, 0x70, 0x70, 0xFF])),
+)
+
+EXT_ACCEPTED = (
+    ("EXT 0", bytes([0x70, 0x70, 0x00])),
+    ("EXT 15", bytes([0x70, 0x70, 0x0F])),
+    ("EXT 16", bytes([0x70, 0x70, 0x10])),
+    ("EXT 255", bytes([0x70, 0x70, 0xFF])),
+)
+EXT_REFUSED = (
+    ("EXT 256", ("EXT", "256", "0..255")),
+    ("EXT -1", ("EXT", "-1", "0..255")),
+    ("EXT 300", ("EXT", "300", "0..255")),
+    ("EXT 0x100", ("EXT", "256", "0..255")),
+    ("EXT [HL]", ()),
 )
 
 def test_must_fail():
@@ -111,6 +135,30 @@ def test_must_pass():
     assert asm(labelled) == want == asm(literal), (asm(labelled).hex(), want.hex())
     print(f"  assembler keeps {len(MUST_PASS) + 2} working cases byte-exact "
           f"(forward/backward labels, DJNZ, 0x/0b/0o/decimal literals, comments)")
+
+def test_ext_operand_byte_on_both_front_ends():
+
+    import loader
+    for text, want in EXT_ACCEPTED:
+        got = asm(text)
+        assert got == want, (text, got.hex(), want.hex())
+        emitted = loader.assemble(text + "\n").image
+        assert emitted[:len(want)] == want, (text, emitted[:len(want)].hex(), want.hex())
+    for text, frags in EXT_REFUSED:
+        for front, emit in (("asm", lambda s: asm(s)),
+                            ("loader", lambda s: loader.assemble(s + "\n").image)):
+            try:
+                out = emit(text)
+            except (AssemblyError, loader.LoaderError) as exc:
+                msg = str(exc)
+            else:
+                raise AssertionError((text, front, "assembled without an error", out.hex()))
+            assert "line 1" in msg, (text, front, msg)
+            for frag in frags:
+                assert frag in msg, (text, front, frag, msg)
+    print(f"  the {len(EXT_ACCEPTED)} trap numbers at the ends of the operand byte and the "
+          f"{len(EXT_REFUSED)} past it agree on both front ends "
+          "(asm and loader.assemble), each refusal naming the line")
 
 def test_error_type():
 
@@ -179,6 +227,7 @@ if __name__ == "__main__":
     print("assembler strictness:")
     test_must_fail()
     test_must_pass()
+    test_ext_operand_byte_on_both_front_ends()
     test_error_type()
     test_validation_survives_optimise()
     print("assembler strictness: all passed")
