@@ -675,9 +675,7 @@ def sabotage(root=None):
     for label, fname, old, new, probe in SABOTAGES:
         work = tempfile.mkdtemp(prefix="fault-sabotage-")
         try:
-            for keep in ("golden_sim.py", "circuit_torch.py", "circuit_triton.py",
-                         "isa_table.py", "test_state_contract.py", "programs.py",
-                         "test_fault_registers.py", "disasm.py"):
+            for keep in sorted(n for n in os.listdir(root) if n.endswith(".py")):
                 shutil.copy(os.path.join(root, keep), work)
             src = os.path.join(work, fname)
             text = open(src, encoding="utf-8").read()
