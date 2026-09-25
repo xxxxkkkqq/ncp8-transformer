@@ -121,11 +121,15 @@ are available:
 
 ## Status
 
-All three implementations cover the full instruction set, including the escape
-space, the user-defined-instruction trap and the self-modification window. No
-opcode is skipped anywhere: the equivalence suite enumerates all 256 opcodes
-against each circuit, and the 256 escape subcodes plus their program-level
-lockstep are enumerated separately for each implementation.
+Three implementations compute the transition -- the reference simulator, the torch
+circuit and the Triton kernel -- and a fourth path, the resident batch that drives that
+kernel a row per machine, is required to agree with them. All four execute the full
+instruction set, including the escape space, the user-defined-instruction dispatch and
+the self-modification window. No opcode is skipped anywhere: the equivalence
+suite enumerates all 256 opcodes against each circuit, and the 256 escape subcodes
+plus their program-level lockstep are enumerated separately for each implementation.
+A training record is writable only when all four agree field by field on every tick
+and a fresh process reproduces the run.
 
 ## License
 
