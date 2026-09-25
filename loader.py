@@ -188,6 +188,7 @@ class Symbols:
     def __init__(self):
         self._addr = {}
         self._const = {}
+        self._line = {}
 
     def add(self, name, value, lineno, const):
         if not re.fullmatch(r"[A-Za-z_]\w*", name):
@@ -196,12 +197,19 @@ class Symbols:
             kind = "constant" if name in self._const else "label"
             raise LoaderError(f"symbol {name!r} defined twice (already a {kind})", lineno)
         (self._const if const else self._addr)[name] = int(value)
+        self._line[name] = lineno
 
     def value(self, name):
         if name in self._addr:
             return self._addr[name]
         if name in self._const:
             return self._const[name]
+        raise LoaderError(f"undefined symbol {name!r}")
+
+    def line_of(self, name):
+
+        if name in self._line:
+            return self._line[name]
         raise LoaderError(f"undefined symbol {name!r}")
 
     def is_address(self, name):
@@ -251,7 +259,7 @@ def evaluate(expr, symbols, lineno, *, forward=None):
 _SHAPE_ENCODING = isa_forms.shape_info()
 
 _FRAME = "[HL+-i8]"
-_PASSTHROUGH = ("r", "rcanon", "HL", "DE", "SP", "[HL]", "[DE]")
+_PASSTHROUGH = ("r", "rcanon", "HL", "DE", "SP", "MB", "[HL]", "[DE]")
 _FRAME_RE = re.compile(r"^\[HL(?:([+-])([^\]]+))?\]$")
 
 def _fits(kind, text):
@@ -506,36 +514,96 @@ def image_needed(content_extent=1):
 
     return max(int(content_extent), 1)
 
-def assemble(src, *, vectors=None, window=None, image=None, entry=None):
+class _Placer:
 
-    if not isinstance(src, str):
-        raise LoaderError(f"src must be a string, got a {type(src).__name__}")
+    __slots__ = ("out", "at", "blocks", "hi_water")
+
+    def __init__(self):
+        self.out = {}
+        self.at = {}
+        self.blocks = []
+        self.hi_water = 0
+
+    def place(self, kind, addr, data, lineno, text, tag=None):
+        size = len(data)
+        for i, byte in enumerate(data):
+            a = addr + i
+            if not 0 <= a < CODE_SIZE:
+                raise LoaderError(f"{kind} reaches address 0x{a:X}, outside CODE "
+                                  f"(0..{CODE_SIZE - 1})", lineno)
+            if a in self.out:
+                raise LoaderError(self._collision(kind, addr, size, a, tag), lineno)
+            self.out[a] = byte
+            self.at[a] = (tag, kind, addr, size, lineno, text)
+        self.blocks.append((kind, addr, size, lineno, text, tag))
+        self.hi_water = max(self.hi_water, addr + size)
+
+    def origins(self):
+
+        return {a: _origin_text(*info) for a, info in self.at.items()}
+
+    def _collision(self, kind, addr, size, a, tag):
+
+        other = self.at[a]
+        if tag is None and other[0] is None:
+            return (f"{kind} at 0x{a:04X} overlaps a byte already placed there "
+                    f"({_origin_text(*other)})")
+        return (f"{_tagged(tag)}{kind} at 0x{addr:04X}..0x{addr + size - 1:04X} overlaps "
+                f"{_tagged(other[0])}{other[1]} at 0x{other[2]:04X}.."
+                f"0x{other[2] + other[3] - 1:04X}: byte 0x{a:04X} is placed by both")
+
+def _tagged(tag):
+
+    return "" if tag is None else f"{tag} "
+
+def _origin_text(tag, kind, addr, size, lineno, text):
+
+    return f"{_tagged(tag)}{kind} at line {lineno}: {text}"
+
+def _defined_names(items):
+
+    out = set()
+    for it in items:
+        if it.kind == "label":
+            out.add(it.payload)
+        elif it.kind == "equ":
+            out.add(it.payload.partition(",")[0].strip())
+    return out
+
+class _Reader:
+
+    __slots__ = ("symbols", "settled", "later")
+
+    def __init__(self, symbols, settled, later):
+        self.symbols, self.settled, self.later = symbols, tuple(settled), dict(later)
+
+    def available(self):
+        out = {}
+        for table in self.settled:
+            out.update(table.flat())
+        out.update(self.symbols.flat())
+        return out
+
+    def __call__(self, expr, lineno, where):
+        try:
+            return evaluate(expr, self.available(), lineno)
+        except LoaderError as e:
+            for ref in sorted(expression_names(expr) & set(self.later)):
+                if ref not in self.available():
+                    raise LoaderError(f"{where} cannot refer to {ref!r}: it is defined "
+                                      f"{self.later[ref]}", lineno) from None
+            raise
+
+def _declarations(vectors, window):
+
     if vectors is not None and not isinstance(vectors, dict):
         raise LoaderError(f"vectors must be a dict of index -> label_or_int, got "
                           f"a {type(vectors).__name__}")
-    vectors = {} if vectors is None else dict(vectors)
     if window is not None and not (isinstance(window, (tuple, list)) and len(window) == 2):
         raise LoaderError(f"window must be a (lo, hi) pair, got {window!r}")
-    items = _parse(src)
-    symbols = Symbols()
+    return {} if vectors is None else dict(vectors)
 
-    later = set()
-    for it in items:
-        if it.kind == "label":
-            later.add(it.payload)
-        elif it.kind == "equ":
-            later.add(it.payload.partition(",")[0].strip())
-
-    def value_now(expr, lineno, where):
-
-        try:
-            return evaluate(expr, symbols.flat(), lineno)
-        except LoaderError as e:
-            for ref in expression_names(expr) & later:
-                if ref not in symbols:
-                    raise LoaderError(f"{where} cannot refer to {ref!r}: it is defined "
-                                      f"later in the source", lineno) from None
-            raise
+def _place_pass(items, symbols, read):
 
     sizes = []
     pc = 0
@@ -549,11 +617,11 @@ def assemble(src, *, vectors=None, window=None, image=None, entry=None):
             name = name.strip()
             if not expr.strip():
                 raise LoaderError(".equ needs NAME, <expr>", it.lineno)
-            symbols.add(name, value_now(expr, it.lineno, ".equ"), it.lineno, const=True)
+            symbols.add(name, read(expr, it.lineno, ".equ"), it.lineno, const=True)
             sizes.append((it, 0))
             continue
         if it.kind == "org":
-            target = value_now(it.payload, it.lineno, ".org")
+            target = read(it.payload, it.lineno, ".org")
             _checked_int(target, ".org target", 0, CODE_SIZE, it.lineno)
             pc = target
             sizes.append((it, 0))
@@ -580,29 +648,14 @@ def assemble(src, *, vectors=None, window=None, image=None, entry=None):
         size = shape_size((name, shape))[0]
         sizes.append((it, size))
         pc += size
+    return sizes
 
-    out, origins, blocks = {}, {}, []
-    hi_water = 0
-
-    def place(kind, addr, data, lineno, text):
-        nonlocal hi_water
-        for i, byte in enumerate(data):
-            a = addr + i
-            if not 0 <= a < CODE_SIZE:
-                raise LoaderError(f"{kind} reaches address 0x{a:X}, outside CODE "
-                                  f"(0..{CODE_SIZE - 1})", lineno)
-            if a in out:
-                raise LoaderError(f"{kind} at 0x{a:04X} overlaps a byte already placed "
-                                  f"there ({origins[a]})", lineno)
-            out[a] = byte
-            origins[a] = f"{kind} at line {lineno}: {text}"
-        blocks.append((kind, addr, len(data), lineno, text))
-        hi_water = max(hi_water, addr + len(data))
+def _emit_pass(sizes, symbols, read, placer, tag=None):
 
     pc = 0
     for it, _size in sizes:
         if it.kind == "org":
-            pc = value_now(it.payload, it.lineno, ".org")
+            pc = read(it.payload, it.lineno, ".org")
             continue
         if it.kind in ("label", "equ"):
             continue
@@ -610,20 +663,20 @@ def assemble(src, *, vectors=None, window=None, image=None, entry=None):
             for expr in _split_args(it.payload):
                 v = evaluate(expr, symbols.flat(), it.lineno)
                 _checked_int(v, ".byte value", 0, 0xFF, it.lineno)
-                place("byte", pc, bytes([v]), it.lineno, f"{expr} = {v}")
+                placer.place("byte", pc, bytes([v]), it.lineno, f"{expr} = {v}", tag)
                 pc += 1
             continue
         if it.kind == "word":
             for expr in _split_args(it.payload):
                 v = evaluate(expr, symbols.flat(), it.lineno)
                 _checked_int(v, ".word value", 0, 0xFFFF, it.lineno)
-                place("word", pc, (v & 0xFFFF).to_bytes(2, "little"), it.lineno,
-                      f"{expr} = {v}")
+                placer.place("word", pc, (v & 0xFFFF).to_bytes(2, "little"), it.lineno,
+                             f"{expr} = {v}", tag)
                 pc += 2
             continue
         if it.kind == "ascii":
             data = _ascii_bytes(it.payload, it.lineno)
-            place("ascii", pc, data, it.lineno, it.payload)
+            placer.place("ascii", pc, data, it.lineno, it.payload, tag)
             pc += len(data)
             continue
         name, args = it.payload
@@ -645,10 +698,14 @@ def assemble(src, *, vectors=None, window=None, image=None, entry=None):
             raise LoaderError(f"internal: {text!r} encoded to {data.hex()} but the decoder "
                               f"reads {disasm.decode(data, 0).size} bytes at 0x{cps[0]:04X}",
                               it.lineno)
-        place("code", pc, data, it.lineno, text)
+        placer.place("code", pc, data, it.lineno, text, tag)
         pc += size
 
-    content_extent = hi_water
+def _finish(symbols, placer, vectors, window, image, entry):
+
+    content_extent = placer.hi_water
+    out, blocks = placer.out, placer.blocks
+    origins = placer.origins()
     for k in sorted(vectors):
         _checked_int(k, "vector index", 0, VEC_COUNT - 1)
     needed = image_needed(content_extent)
@@ -723,9 +780,9 @@ def assemble(src, *, vectors=None, window=None, image=None, entry=None):
                + ("no window declared, so no STC writes" if placed_window is None
                   else f"window [0x{placed_window[0]:04X}, 0x{placed_window[1]:04X})")
                + "; none of it is a byte of the image")
-    for kind, addr, size, lineno, text in blocks:
-        where = f"line {lineno}" if lineno is not None else "declared by argument"
-        rep.append(f"{kind:5s} 0x{addr:04X} {size:3d}B  {text}   [{where}]")
+    for kind, addr, size, lineno, text, tag in blocks:
+        base = f"line {lineno}" if lineno is not None else "declared by argument"
+        rep.append(f"{kind:5s} 0x{addr:04X} {size:3d}B  {text}   [{_tagged(tag)}{base}]")
     for text in declarations:
         rep.append(f"decl  ---- ----  {text}   [declared by argument]")
     rep.append(f"entry: 0x{entry:04X} "
@@ -740,6 +797,72 @@ def assemble(src, *, vectors=None, window=None, image=None, entry=None):
         rep.append(f"        {name:16s} 0x{symbols.value(name):04X} ({symbols.kind_of(name)})")
     return LoadResult(image_bytes, symbols.as_dict(), entry, rep, placed_vectors,
                       placed_window, origins, entry_explicit, content_extent, needed)
+
+def assemble(src, *, vectors=None, window=None, image=None, entry=None):
+
+    if not isinstance(src, str):
+        raise LoaderError(f"src must be a string, got a {type(src).__name__}")
+    vectors = _declarations(vectors, window)
+    items = _parse(src)
+    symbols = Symbols()
+    read = _Reader(symbols, (), {name: "later in the source"
+                                 for name in _defined_names(items)})
+    sizes = _place_pass(items, symbols, read)
+    placer = _Placer()
+    _emit_pass(sizes, symbols, read, placer)
+    return _finish(symbols, placer, vectors, window, image, entry)
+
+def link(units, *, vectors=None, window=None, image=None, entry=None):
+
+    if isinstance(units, str) or not isinstance(units, (list, tuple)):
+        raise LoaderError(f"units must be a list of source strings, got a "
+                          f"{type(units).__name__}")
+    if not units:
+        raise LoaderError("units must hold at least one source: an empty unit list places "
+                          "no content, so there is nothing to link")
+    for i, src in enumerate(units):
+        if not isinstance(src, str):
+            raise LoaderError(f"unit {i} must be a source string, got a "
+                              f"{type(src).__name__}")
+    vectors = _declarations(vectors, window)
+    items = [_parse(src) for src in units]
+    defined = [_defined_names(its) for its in items]
+    one_unit = len(units) == 1
+
+    merged = Symbols()
+    first = {}
+    to_emit = []
+    settled = []
+    for i, its in enumerate(items):
+        symbols = Symbols()
+        later = {}
+        for j in range(len(units) - 1, i, -1):
+            for name in sorted(defined[j]):
+                later[name] = f"in unit {j}, which is not placed yet"
+        for name in sorted(defined[i]):
+            later[name] = "later in the source"
+        read = _Reader(symbols, settled, later)
+        sizes = _place_pass(its, symbols, read)
+        for name in sorted(symbols.flat()):
+            value, kind = symbols.value(name), symbols.kind_of(name)
+            if name in first:
+                old_value, old_kind, old_unit = first[name]
+                if old_kind != kind or old_value != value:
+                    raise LoaderError(
+                        f"symbol {name!r} defined twice: unit {old_unit} has it as {old_kind} "
+                        f"at {old_value} and unit {i} has it as {kind} at {value}; one name is "
+                        f"one definition, so linking refuses it",
+                        symbols.line_of(name))
+                continue
+            first[name] = (value, kind, i)
+            merged.add(name, value, symbols.line_of(name), kind == "constant")
+        to_emit.append((sizes, read, None if one_unit else f"unit {i}"))
+        settled.append(symbols)
+
+    placer = _Placer()
+    for sizes, read, tag in to_emit:
+        _emit_pass(sizes, merged, read, placer, tag)
+    return _finish(merged, placer, vectors, window, image, entry)
 
 def _short_image_message(length, needed, content_extent):
 

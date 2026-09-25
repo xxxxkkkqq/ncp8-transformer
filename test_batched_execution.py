@@ -38,6 +38,9 @@ from test_state_contract import (FAULT_WRITES, VIEW_FIELDS, assert_widths,
                                  circuit_view, ref_view)
 
 STATE_LEN = circuit_triton.STATE_ROWS
+S_MB = int(circuit_triton.S_MB)
+assert circuit_triton.STATE_ROW_OF["MB"] == S_MB, (
+    "the batch row and the state layout disagree about where the selector lives")
 VEC = 0x0F00
 WLO, WHI = 0x0F20, 0x0F21
 
@@ -62,6 +65,7 @@ def golden_machine(code, data=b"", inputs=b"", row=None, budget=200_000):
         g.load_state(row[0:4], row[4], row[5], row[7], row[8], row[9], row[12], PC=row[6],
                      fault_reason=row[14], fault_addr=row[15])
         g.ipos = row[10]
+        g.MB = row[S_MB]
         assert row[11] == 0 and row[13] == 0, "a fresh machine starts with no output"
         assert row[14] == 0 and row[15] == 0, "a fresh machine starts with no fault"
         assert_widths(golden_view(g), ("golden machine", row))
@@ -115,16 +119,17 @@ def padded(code):
     return bytes(code).ljust(CODE_SIZE, b"\x00")
 
 def row_of(r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos=0, oplen=0, tick=0, status=0,
-           fault_reason=0, fault_addr=0):
+           fault_reason=0, fault_addr=0, mb=0):
     return [r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos, oplen, tick, status,
-            fault_reason, fault_addr]
+            fault_reason, fault_addr, mb]
 
 def push_row(batch, i, row):
 
     assert len(row) == STATE_LEN, ("state row width", len(row), STATE_LEN)
     batch.set_state(i, r=row[0:4], HL=row[4], DE=row[5], PC=row[6], SP=row[7],
                     C=row[8], Z=row[9], ipos=row[10], oplen=row[11], tick=row[12],
-                    status=row[13], fault_reason=row[14], fault_addr=row[15])
+                    status=row[13], fault_reason=row[14], fault_addr=row[15],
+                    MB=row[S_MB])
 
 def op_case(op, seed):
 

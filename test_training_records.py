@@ -131,8 +131,15 @@ def main():
         hit = [x for x in R.schema_problems(bad) if "compiler_identity" in x]
         check(f"refusal {name}", bool(hit), str(R.schema_problems(bad))[:120])
 
-    enc = R.encoding_problems(bytes([0x70, 0x70, 0x14]))
-    check("non-canonical EXT 20 refused", bool(enc), str(enc))
+    enc = R.encoding_problems(bytes([0x11, 0xFC]))
+    check("non-canonical ADDI HL refused", bool(enc), str(enc))
+    check("canonical ADDI HL accepted",
+          not R.encoding_problems(bytes([0x11, 0x00])),
+          str(R.encoding_problems(bytes([0x11, 0x00]))))
+
+    check("EXT past the vector table is a program, not a spelling",
+          not R.encoding_problems(bytes([0x70, 0x70, 0x14])),
+          str(R.encoding_problems(bytes([0x70, 0x70, 0x14]))))
     check("canonical HALT accepted", not R.encoding_problems(G.asm("  HALT\n")))
 
     good = R.label({"kind": "rl", "text": "  LDI r0, 66\n  OUT r0\n  HALT\n",

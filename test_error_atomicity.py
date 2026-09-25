@@ -88,7 +88,7 @@ def check_case(name, code, sp, hl, de, expect_err, expect_commit=None, pc=0,
     runs = [("reference", run_reference(code, sp, hl, de, pc, vec0)),
             ("torch", run_circuit(TorchCircuit, code, sp, hl, de, pc, vec0)),
             ("triton", run_circuit(TritonCircuit, code, sp, hl, de, pc, vec0))]
-    ref_pre = dict(r=list(INIT_R), HL=hl, DE=de, SP=sp, PC=pc, C=INIT_C, Z=INIT_Z,
+    ref_pre = dict(r=list(INIT_R), HL=hl, DE=de, MB=0, SP=sp, PC=pc, C=INIT_C, Z=INIT_Z,
                    ipos=0, oplen=0, tick=TICK0, status=0, fault_reason=0, fault_addr=0)
     assert set(ref_pre) == set(VIEW_FIELDS), (
         "this suite's field list and the comparison set have drifted apart")
@@ -130,7 +130,7 @@ def legal_expect(kind, sp, hl, de, imm=None, pc=0):
     r = list(INIT_R)
     d = bytearray(DATA_IMAGE)
     out = b""
-    st = dict(r=r, HL=hl, DE=de, SP=sp, PC=pc + 1, C=INIT_C, Z=INIT_Z, ipos=0,
+    st = dict(r=r, HL=hl, DE=de, MB=0, SP=sp, PC=pc + 1, C=INIT_C, Z=INIT_Z, ipos=0,
               oplen=0, tick=TICK0 + 1, status=0, fault_reason=0, fault_addr=0)
     ret_lo, ret_hi = (pc + 3) & 0xFF, (pc + 3) >> 8
     if kind in ("PUSHW HL", "PUSHW DE", "POPW HL", "POPW DE", "STW [HL], DE",

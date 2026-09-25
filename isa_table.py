@@ -66,6 +66,8 @@ ALU_NAMES = (
     "PUSHW_HL", "PUSHW_DE", "POPW_HL", "POPW_DE",
     "STW_HLDE", "STW_DEHL", "LDW_DEHL", "LDW_HLDE",
     "LDX", "STX", "ADD_SP", "MULH",
+    "LDM", "STM", "LDMW_DE_HL", "LDMW_HL_DE", "STMW_HL_DE", "STMW_DE_HL",
+    "MOV_MB_HL", "MOV_HL_MB",
 )
 ALU_ID = {name: i for i, name in enumerate(ALU_NAMES)}
 K = len(ALU_NAMES)
@@ -78,6 +80,8 @@ ESC_EOP_NAMES = (
     "MOVW_HL_DE", "MOVW_DE_HL", "MOVW_HL_SP", "MOVW_DE_SP", "MOVW_SP_HL",
     "MOVW_SP_DE", "PUSHW_HL", "PUSHW_DE", "POPW_HL", "POPW_DE",
     "STW_HLDE", "STW_DEHL", "LDW_DEHL", "LDW_HLDE", "LDX", "STX", "ADD_SP", "MULH",
+    "LDM", "STM", "LDMW_DE_HL", "LDMW_HL_DE", "STMW_HL_DE", "STMW_DE_HL",
+    "MOV_MB_HL", "MOV_HL_MB",
 )
 ESC_EOP_ID = {name: ESC_EOP_BASE + i for i, name in enumerate(ESC_EOP_NAMES)}
 
@@ -170,8 +174,18 @@ for _k in range(4):
 for _f in range(16):
     _escape(0x90 + _f, "MULH", f"MULH r{(_f >> 2) & 3}, r{_f & 3}",
             (_f >> 2) & 3, _f & 3)
+for _k in range(4):
+    _escape(0xB0 | _k, "LDM", f"LDM r{_k}, [HL]", _k, _k)
+    _escape(0xB4 | _k, "STM", f"STM [HL], r{_k}", _k, _k)
+for _sub, (_alu, _mn) in ((0xB8, ("LDMW_DE_HL", "LDMW DE, [HL]")),
+                          (0xB9, ("LDMW_HL_DE", "LDMW HL, [DE]")),
+                          (0xBA, ("STMW_HL_DE", "STMW [HL], DE")),
+                          (0xBB, ("STMW_DE_HL", "STMW [DE], HL")),
+                          (0xBC, ("MOV_MB_HL", "MOV MB, HL")),
+                          (0xBD, ("MOV_HL_MB", "MOV HL, MB"))):
+    _escape(_sub, _alu, _mn)
 
-V4_RESERVED = tuple(range(0xB0, 0xBE))
+V4_RESERVED = tuple(range(0xA0, 0xA8))
 
 FAULT_CAUSES = (
     ("OK", "no fault"),
@@ -205,8 +219,13 @@ CAUSES_AWAITING_FEATURE = {
     "TRAP_FRAME": "subcode 0xA8 is unassigned, so no instruction returns from a trap",
     "TRAP_UNBALANCED": "subcode 0xA8 is unassigned, so no instruction returns from a trap",
     "BAD_OPERAND": "the must-be-zero operand refusal is not implemented on this machine",
-    "BANK_OOB": "there is no bank selector instruction on this machine",
-    "BANK_BUSY": "NBANKS is carried but no instruction reaches a neighbouring bank",
+    "BANK_BUSY": "the ownership rule is answered on all four paths, but the three "
+                 "circuit paths hold one page each -- their own DATA, at index 0 -- so a "
+                 "selector that passes the declared bound names the page it owns and a "
+                 "selector past it names BANK_OOB before ownership is read. Only the "
+                 "reference's group driver hands a machine a foreign page, and no group "
+                 "driver exists on a circuit path, so no bank access there can name this "
+                 "cause",
     "PC_ILLEGAL": "a branch committing an out-of-image target faults on the tick that writes it",
 }
 
@@ -215,6 +234,8 @@ FAULT_SITE_ORDER = (
     ("BAD_OPCODE", "BAD_OPCODE"),
     ("BAD_SUBCODE", "BAD_SUBCODE"),
     ("FETCH_OPERAND", "FETCH_OOB"),
+    ("BANK_OOB", "BANK_OOB"),
+    ("BANK_BUSY", "BANK_BUSY"),
     ("TRAP_UNREG", "TRAP_UNREG"),
     ("DATA_OOB", "DATA_OOB"),
     ("STACK_PUSH", "STACK_OVERFLOW"),
@@ -228,6 +249,13 @@ FAULT_SITE_ORDER = (
 FAULT_SITE_NAMES = tuple(site for site, _cause in FAULT_SITE_ORDER)
 FAULT_SITE_CAUSE = {site: CAUSE[cause] for site, cause in FAULT_SITE_ORDER}
 SITE_RANK = {site: i for i, site in enumerate(FAULT_SITE_NAMES)}
+
+BANK_FAULT_SITES = (("BANK_OOB", "BANK_OOB"), ("BANK_BUSY", "BANK_BUSY"))
+BANK_SITE_ANCHOR = "FETCH_OPERAND"
+
+def full_fault_site_order():
+
+    return FAULT_SITE_ORDER
 
 def fault_name(code):
 
@@ -464,6 +492,7 @@ STATE_FIELDS = (
     StateField("r", 0, 255, 4),
     StateField("HL", 0, 65535, None),
     StateField("DE", 0, 65535, None),
+    StateField("MB", 0, 65535, None),
     StateField("PC", 0, 65535, None),
     StateField("SP", 0, DATA_SIZE, None),
     StateField("C", 0, 1, None),
@@ -839,7 +868,7 @@ def check_structure():
         raise DecodeTableError(f"Triton escape vocabulary names no escape row: {unused}")
     clash = [s for s in V4_RESERVED if s in ESCAPE]
     if clash:
-        raise DecodeTableError("v4 reserved subcodes are already assigned: "
+        raise DecodeTableError("held subcodes are already assigned: "
                                f"{[hex(c) for c in clash]}")
     if len(V4_RESERVED) != len(set(V4_RESERVED)):
         raise DecodeTableError("v4 reserved subcodes are not distinct")
@@ -912,7 +941,38 @@ def check_fault_table():
     for name in CAUSES_AWAITING_FEATURE:
         if name not in CAUSE:
             raise DecodeTableError(f"waiting list names unknown cause {name!r}")
+    if BANK_SITE_ANCHOR not in SITE_RANK:
+        raise DecodeTableError("the bank sites are stated to rank after "
+                               f"{BANK_SITE_ANCHOR!r}, which the precedence list does "
+                               f"not name")
+    for site, cause in BANK_FAULT_SITES:
+        if cause not in CAUSE:
+            raise DecodeTableError(f"bank site {site} names unknown cause {cause!r}")
+        if cause == "OK":
+            raise DecodeTableError(f"bank site {site} names OK, which is not a fault")
+        if site not in SITE_RANK:
+            raise DecodeTableError(f"bank site {site} is not a row of the precedence "
+                                   f"list, which is the list a path stacks into")
+    full = full_fault_site_order()
+    if full != FAULT_SITE_ORDER:
+        raise DecodeTableError("the order that includes the bank sites is not the order "
+                               "a path stacks one signal per site into, so a stacked "
+                               "cause could be named at a rank the rule does not state")
+    keep = SITE_RANK[BANK_SITE_ANCHOR] + 1
+    if FAULT_SITE_ORDER[keep:keep + len(BANK_FAULT_SITES)] != BANK_FAULT_SITES:
+        raise DecodeTableError(f"the bank sites are not stacked directly after "
+                               f"{BANK_SITE_ANCHOR!r}: "
+                               f"{[s for s, _c in FAULT_SITE_ORDER[keep:keep + 2]]}")
+    order = full_fault_cause_order()
+    if order.index(CAUSE["BANK_OOB"]) > order.index(CAUSE["BANK_BUSY"]) \
+            or order.index(CAUSE["BANK_BUSY"]) > order.index(CAUSE["DATA_OOB"]):
+        raise DecodeTableError("the bank causes do not rank ahead of the address cause: "
+                               f"{[CAUSE_NAME[c] for c in order]}")
     return True
+
+def full_fault_cause_order():
+
+    return [CAUSE[cause] for _site, cause in full_fault_site_order()]
 
 check_structure()
 
@@ -948,9 +1008,11 @@ if __name__ == "__main__":
         print("   ", b)
 
     free = len(unassigned_escape())
-    planned = [s for s in V4_RESERVED if s in ESCAPE]
-    print(f"\nv4.0 bank slots 0xB0-0xBD already claimed by the table: "
-          f"{[hex(p) for p in planned] or 'none'}")
+    held = [s for s in V4_RESERVED if s in ESCAPE]
+    print(f"\nbank family subcodes 0xB0-0xBD assigned: "
+          f"{sum(1 for s in range(0xB0, 0xBE) if s in ESCAPE)} of 14")
+    print(f"held subcodes {V4_RESERVED[0]:#04x}-{V4_RESERVED[-1]:#04x} claimed by the "
+          f"table: {[hex(h) for h in held] or 'none'}")
     print("free escape subcodes:", free)
     print("VERDICT:", "table reproduces the live decode" if not bad
           else "TABLE DIVERGES FROM LIVE DECODE")

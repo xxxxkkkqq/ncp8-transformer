@@ -81,6 +81,12 @@ for k in range(4):
     ESC[0x84 | k] = (f"LDC {_r(k)}, [HL]", 2)
 for f in range(16):
     ESC[0x90 + f] = (f"MULH {_r(f >> 2)}, {_r(f & 3)}", 2)
+for k in range(4):
+    ESC[0xB0 | k] = (f"LDM {_r(k)}, [HL]", 2)
+    ESC[0xB4 | k] = (f"STM [HL], {_r(k)}", 2)
+for sub, t in {0xB8: "LDMW DE, [HL]", 0xB9: "LDMW HL, [DE]", 0xBA: "STMW [HL], DE",
+               0xBB: "STMW [DE], HL", 0xBC: "MOV MB, HL", 0xBD: "MOV HL, MB"}.items():
+    ESC[sub] = (t, 2)
 
 def disasm(image, start=0, count=None):
 

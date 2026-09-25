@@ -28,7 +28,7 @@ KIND_EXPECT = {"rl": ("status", "out", "state_delta", "fault_reason"),
                "sft": ("status", "out", "state_delta", "fault_reason"),
                "cpt": ("reassembles_to",)}
 
-COMPARED_FIELDS = tuple(f for f in ("r", "HL", "DE", "SP", "PC", "C", "Z", "ipos",
+COMPARED_FIELDS = tuple(f for f in ("r", "HL", "DE", "MB", "SP", "PC", "C", "Z", "ipos",
                                     "tick", "status", "fault_reason", "fault_addr")
                         if f != "oplen")
 

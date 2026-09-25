@@ -25,7 +25,8 @@ import circuit_triton
 import isa_table as ISA
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonBatch, TritonCircuit
-from golden_sim import DATA_SIZE, MachineError, NCP8, STATUS_CODE, asm
+from golden_sim import (DATA_SIZE, MachineError, NCP8, STATUS_CODE, STATUS_RUNNING,
+                        asm)
 from test_state_contract import FAULT_WRITES, VIEW_FIELDS, assert_widths, ref_view
 
 CODE_SIZE = 4096
@@ -58,7 +59,7 @@ def img(head, pc=0, *, vectors=None, window=None, tail_pad=0, length=None):
 def state(**over):
 
     s = dict(r=[1, 2, 3, 4], HL=8, DE=8, PC=0, SP=2048, C=0, Z=0, ipos=0, oplen=0,
-             tick=TICK0, status=0, fault_reason=0, fault_addr=0)
+             tick=TICK0, status=0, fault_reason=0, fault_addr=0, MB=0)
     s.update(over)
     return s
 
@@ -131,6 +132,19 @@ def _c_stw_second_byte(pc):
 def _c_out_cap(pc):
     return (img(asm("OUT r0"), pc), state(PC=pc, oplen=OUT_CAP), pc, b"", b"")
 
+def _c_bank_oob(pc, mb=9, access="STM [HL], r0"):
+    return (img(asm(access), pc), state(PC=pc, MB=mb), pc, b"", b"")
+
+def _c_bank_oob_ldm(pc):
+    return _c_bank_oob(pc, mb=255, access="LDM r0, [HL]")
+
+def _c_bank_addr_oob(pc):
+
+    return (img(asm("STM [HL], r0"), pc), state(PC=pc, HL=DATA_SIZE), pc, b"", b"")
+
+def _c_bank_pair_addr_oob(pc):
+    return (img(asm("STMW [HL], DE"), pc), state(PC=pc, HL=DATA_SIZE - 1), pc, b"", b"")
+
 def _p_fetch_before_trap(pc):
 
     return (img(bytes([0x70, 0x70]), pc, length=pc + 2), state(PC=pc), pc, b"", b"")
@@ -153,6 +167,54 @@ def _p_data_oob_before_out_cap(pc):
 
     return (img(asm("OUTM"), pc), state(PC=pc, HL=DATA_SIZE, oplen=OUT_CAP), pc,
             b"", b"")
+
+def _bank_selector_case(mb):
+
+    def build(pc):
+        return (img(asm("STM [HL], r0"), pc), state(PC=pc, MB=mb), pc, b"", b"")
+    return build
+
+def _p_bank_oob_before_data_oob(pc):
+
+    return (img(asm("STM [HL], r0"), pc), state(PC=pc, MB=9, HL=DATA_SIZE), pc,
+            b"", b"")
+
+BANK_SELECTORS = (0, 1, 2, 63, 255, 4096, 65535)
+
+FOREIGN_ADDR = 8
+
+def _foreign_owner_running_names_busy():
+
+    code = asm("  LDI HL, 1\n  MOV MB, HL\n  LDI HL, 8\n  STM [HL], r0\n  HALT")
+    g = NCP8(code, data=bytes(DATA_SIZE), tick_budget=8,
+             config=ISA.MachineConfig(nbanks=2))
+    pages = (g.data, bytearray(DATA_SIZE))
+    running = STATUS_CODE[STATUS_RUNNING]
+    g.banks, g.bank_own, g.bank_owner_status = pages, 0, (running, running)
+    for _ in range(6):
+        try:
+            g.step()
+        except MachineError:
+            break
+    return (g.fault_reason == CAUSE["BANK_BUSY"] and g.status == "ERROR"
+            and pages[1][FOREIGN_ADDR] == 0)
+
+def _bank_busy_absent():
+
+    for runner in (run_torch, run_triton, run_batch):
+        for mb in BANK_SELECTORS:
+            _raised, view, _out = runner(_bank_selector_case(mb), 0)
+            if view["fault_reason"] == CAUSE["BANK_BUSY"]:
+                return False
+            want = CAUSE["OK"] if mb == 0 else CAUSE["BANK_OOB"]
+            if view["fault_reason"] != want:
+                return False
+    if not hasattr(NCP8, "install_banks"):
+        return False
+    if any(hasattr(cls, "install_banks")
+           for cls in (TorchCircuit, TritonCircuit, TritonBatch)):
+        return False
+    return _foreign_owner_running_names_busy()
 
 def _p_trap_k_before_stack(pc):
 
@@ -180,6 +242,14 @@ CASES = (
     ("TRAP_UNREG", "EXT 0 with a zero vector entry", _c_trap_unreg),
     ("TRAP_UNREG", "EXT 16, past the 16 handler slots", _c_trap_k_oob),
     ("OUT_CAP", "OUT as byte number OUT_CAP+1", _c_out_cap),
+    ("BANK_OOB", "STM [HL], r0 with the selector past this machine's page count",
+     _c_bank_oob),
+    ("BANK_OOB", "LDM r0, [HL] with the selector at the end of the register's span",
+     _c_bank_oob_ldm),
+    ("DATA_OOB", "STM [HL], r0 through the page this machine holds, past its last byte",
+     _c_bank_addr_oob),
+    ("DATA_OOB", "STMW [HL], DE whose second byte leaves the page it holds",
+     _c_bank_pair_addr_oob),
 )
 
 PAIRS = (
@@ -196,6 +266,8 @@ PAIRS = (
      "CODE_OOB", "WINDOW"),
     ("DATA address out of range + output stream at capacity", _p_data_oob_before_out_cap,
      "DATA_OOB", "OUT_CAP"),
+    ("selector past the page count + address outside the page", _p_bank_oob_before_data_oob,
+     "BANK_OOB", "DATA_OOB"),
 )
 
 UNPROVOKABLE_PAIRS = (
@@ -212,10 +284,10 @@ ABSENT_PROOFS = {
                         lambda: 0xA8 not in ISA.ESCAPE),
     "BAD_OPERAND": ("a non-canonical operand byte still executes",
                     lambda: _executes(bytes([0x11, 0x06, 0x00]))),
-    "BANK_OOB": ("the bank subcodes 0xB0-0xBD are still unassigned",
-                 lambda: all(s not in ISA.ESCAPE for s in ISA.V4_RESERVED)),
-    "BANK_BUSY": ("there is no bank selector in the state to compare with NBANKS",
-                  lambda: not hasattr(NCP8(bytes(2)), "MB")),
+    "BANK_BUSY": ("a circuit path holds one page, its own, so its bank access has no "
+                  "foreign owner to wait for; the reference names the cause as soon as a "
+                  "group driver hands it a second page",
+                  lambda: _bank_busy_absent()),
     "PC_ILLEGAL": ("a jump past the image faults on the *next* fetch, not the write",
                    lambda: _bad_target_faults_late()),
 }
@@ -240,7 +312,19 @@ def _install(machine, st, code, data, inputs, budget):
     m.load_state(st["r"], st["HL"], st["DE"], st["SP"], st["C"], st["Z"], st["tick"],
                  PC=st["PC"])
     _set_ipos(m, st["ipos"])
+    _set_mb(m, st["MB"])
     return m
+
+def _set_mb(m, n):
+
+    if not n:
+        return
+    if isinstance(m, NCP8):
+        m.MB = n
+    elif isinstance(m, TorchCircuit):
+        m.MB = torch.tensor([n], dtype=torch.int32, device=m.dev)
+    else:
+        m.S[int(circuit_triton.S_MB)] = n
 
 def _set_ipos(m, n):
 
@@ -292,7 +376,7 @@ def run_batch(case, pc):
     b.set_program(0, code, data or b"", inputs or b"")
     b.set_state(0, r=st["r"], HL=st["HL"], DE=st["DE"], PC=st["PC"], SP=st["SP"],
                 C=st["C"], Z=st["Z"], ipos=st["ipos"], oplen=st["oplen"],
-                tick=st["tick"])
+                tick=st["tick"], MB=st["MB"])
     b.step(1)
     snap = b.snapshot(0)
     return snap["status"] == 3, snap, b.out(0)

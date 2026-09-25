@@ -186,11 +186,13 @@ def test_escape_subcode_space_is_accounted_for_exactly():
     assigned = set(ISA.ESCAPE)
     planned = set(ISA.V4_RESERVED)
     free = set(ISA.unassigned_escape())
-    assert len(assigned) == 115, len(assigned)
-    assert len(planned) == 14, sorted(hex(p) for p in planned)
+    bank = {s for s in assigned if 0xB0 <= s <= 0xBD}
+    assert len(bank) == 14, [hex(b) for b in sorted(bank)]
+    assert len(assigned) == 129, len(assigned)
+    assert len(planned) == 8, sorted(hex(p) for p in planned)
     assert planned <= free, [hex(p) for p in planned - free]
-    assert len(free) == 141, len(free)
-    assert len(free - planned) == 127, len(free - planned)
+    assert len(free) == 127, len(free)
+    assert len(free - planned) == 119, len(free - planned)
     assert len(assigned) + len(planned) + len(free - planned) == 256
     assert not assigned & planned
     ISA.check_structure()
