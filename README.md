@@ -60,14 +60,15 @@ The reference-only suites run on CPU. The circuit suites need CUDA.
 ## Toolchain
 
 The machine is specified in integers, so reading it needs no emulation of anything
-except itself. Four modules, each usable on its own:
+except itself. Five modules, four of which stand on their own:
 
 | module | what it does |
 |---|---|
 | `disasm.py` | decodes one instruction from an image, and reports an encoding that is legal but not canonical rather than folding it |
 | `loader.py` | source text to a placed image: directives, expressions, symbols, and the load-time declarations the machine reads but cannot write |
-| `profile.py` | committed ticks attributed by code point and by PC, with faults and budget overruns accounted separately |
+| `profiler.py` | committed ticks attributed by code point and by PC, with faults and budget overruns accounted separately |
 | `debug.py` | breakpoints, watchpoints, per-tick frames, and `replay()`, which re-runs a recording and demands an exact match |
+| `recordlib.py` | the record schema, and the two conditions a label has to meet before it may be written: every datapath agrees field by field on every tick, and a second execution in a fresh process reproduces the same outcome |
 
 Every one of these refuses to invent behaviour: an unassigned encoding, an ambiguous
 operand form, or a collision between two load-time declarations is an error naming what
@@ -105,16 +106,18 @@ not assigned are reserved and raise an atomic error. Three levels of extension
 are available:
 
 1. **New opcodes** occupy subcode slots in the escape space.
-2. **User-defined instructions** dispatch through `EXT k`: the machine pushes a
-   return address and jumps to the entry point stored in the vector table, which is
-   populated at load time and lives in a region of `CODE` that `STC` cannot address
-   (item 3). A handler is an ordinary program, so it can be verified by running it.
+2. **User-defined instructions** dispatch through `EXT k`: the entry point for `k`
+   is declared at load time in the configuration block, and the machine sets `PC`
+   to it. The table is not part of `CODE`, so `STC` cannot reach it. A handler is
+   an ordinary program, so it can be verified by running it. Nothing is saved and
+   no trap depth is counted, so a handler goes on only where its own code sends
+   it; `k` outside the declared table, or a vector holding zero, stops the tick
+   with `TRAP_UNREG`.
 3. **Controlled self-modification** through `STC [HL], r`, restricted to a window
    declared at load time. An undeclared window is zero-width, which disables
-   self-modification entirely. Writes outside the window raise an atomic error.
-   The window bounds are two 8-bit bytes, so the highest address `STC` can reach
-   at all is `0xFE`, which is what keeps it out of the trap vector table at
-   `0x0F00`. See `ISA.md` section 5.1 before widening those bounds.
+   self-modification entirely, and a write outside the window stops the tick with
+   an atomic error. `ISA.md` section 5 states what the bounds are, what a window
+   may name, and what a run cannot change.
 
 ## Status
 

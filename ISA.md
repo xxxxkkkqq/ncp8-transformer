@@ -214,7 +214,7 @@ instruction length is counted from the prefix byte.
 | 0x60 | ADD HL, DE | 16-bit pointer addition | C |
 | 0x61 | SUB HL, DE | 16-bit pointer subtraction | C |
 | 0x62 | XCHG HL, DE | swap the pointer pair | untouched |
-| 0x70 k | EXT k | push return address, then jump to `vector[k]` | - |
+| 0x70 k | EXT k | `PC = vector[k]`, the entry point declared at load; nothing is saved, so a handler does not come back to the trap site | - |
 | 0x80+r | STC [HL], r | `CODE[HL] = r`, allowed only inside the declared window | - |
 | 0x84+r | LDC r, [HL] | `r = CODE[HL]` | untouched |
 | 0x90+f | MULH r, s | `r = (r * s) >> 8`, the high byte of the widening product | Z |
@@ -223,11 +223,13 @@ Three subcode groups take a trailing immediate byte and are therefore 3 bytes
 long: `LDX`, `STX`, `ADD SP` (and, as before, `EXT k`). Every other escape
 instruction is 2 bytes: prefix plus subcode.
 
-`PUSHW`/`POPW` store the pair low byte first, at the lower address. `CALL`,
-`EXT` and `RET` push a return address low byte first as well, which places the
+`PUSHW`/`POPW` store the pair low byte first, at the lower address. `CALL` and
+`RET` push a return address low byte first as well, which places the
 low byte at the *higher* address because the stack grows down; the two pair
 conventions are therefore not interchangeable, and `PUSHW` pairs only with
-`POPW`.
+`POPW`. `EXT` is not part of either convention: it commits `PC` and the three fault
+fields and touches no other state, which is why the vector table names an entry
+point rather than a handler to return to.
 
 Every subcode not listed above is reserved and raises an atomic error, as does
 any single-byte opcode not listed in 4.1-4.5.
