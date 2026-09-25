@@ -33,7 +33,7 @@ KINDS = {
     "rcanon": (1, "{rcanon}", "r", "r0-r3 in the operand byte; bits 2..7 must be 0",
                False),
     "soff": (1, "{soff}", "i8", "-128..127 signed byte literal", False),
-    "k": (1, "{k}", "k", f"0..{isa_table.VEC_COUNT - 1} trap number", False),
+    "k": (1, "{k}", "k", "0..255 trap number, the whole operand byte", False),
     "[HL+-i8]": (1, "{off}", "[HL+i8]", "[HL] or [HL+d]/[HL-d], d in -128..127", False),
 }
 
@@ -172,7 +172,7 @@ def check(kind, text):
         return v is not None and -128 <= v <= 127
     if kind == "k":
         v = _int(t)
-        return v is not None and 0 <= v < isa_table.VEC_COUNT
+        return v is not None and 0 <= v <= 0xFF
     raise KeyError(f"isa_forms: undeclared operand kind {kind!r}")
 
 def fits(kind, text, value_loose=False):

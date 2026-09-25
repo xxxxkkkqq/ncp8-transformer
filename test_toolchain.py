@@ -186,10 +186,15 @@ def test_round_trip_all_encodings():
                     flagged_seen.add((key, imm))
                 if (key, imm) in want_undispatched:
                     again = refuses(lambda: asm(text))
-                    require(again is not None and "trap vector table" in again
-                            and f"0..{loader.VEC_COUNT - 1}" in again,
-                            f"{img.hex()} -> {text!r} was not refused as undispatchable: "
-                            f"{again}")
+                    require(again is None and asm(text) == img,
+                            f"{img.hex()} -> {text!r} is a program the machine runs, so "
+                            f"the assembler has to spell it: {again}")
+                    stopped = golden_sim.NCP8(img)
+                    refuses(stopped.run)
+                    require(stopped.status == "ERROR"
+                            and stopped.fault_reason == golden_sim.CAUSE["TRAP_UNREG"],
+                            f"{img.hex()} -> {text!r} did not stop on the missing vector: "
+                            f"{stopped.status} cause {stopped.fault_reason}")
                     undispatched[(key, imm)] = (img, text)
                     continue
                 again = refuses(lambda: asm(text))
@@ -225,17 +230,18 @@ def test_round_trip_all_encodings():
             f"{pair_labels(set(folded) - want_folded)}], missing ["
             f"{pair_labels(want_folded - set(folded))}]")
     require(set(undispatched) == want_undispatched,
-            f"the renderings the assembler refused are not the set past the vector "
+            f"the renderings the machine cannot dispatch are not the set past the vector "
             f"table: unexpected [{pair_labels(set(undispatched) - want_undispatched)}], "
             f"missing [{pair_labels(want_undispatched - set(undispatched))}]")
     print(f"  asm->disasm->asm byte-exact on "
-          f"{combos - len(folded) - len(undispatched)}/{combos} combinations "
+          f"{combos - len(folded)}/{combos} combinations "
           f"over {ASSIGNED} assigned encodings ({ASSIGNED_SINGLE} single-byte, "
           f"{ASSIGNED_ESC} escape), operand set {tuple(hex(v) for v in IMMS)}; the "
           f"{len(folded)} others, each one flagged and folded to a form that round trips: "
           + ", ".join(f"{img.hex()} -> {back.hex()}" for img, _t, back
                       in (folded[k] for k in sorted(folded)))
-          + f"; the {len(undispatched)} others refused because no trap vector slot holds"
+          + f"; the {len(undispatched)} others assemble and round trip, and the machine "
+            "stops on them with no trap vector slot to hold"
           ": " + ", ".join(f"{img.hex()} -> {text!r}" for img, text
                            in (undispatched[k] for k in sorted(undispatched))))
 

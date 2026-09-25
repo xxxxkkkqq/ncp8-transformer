@@ -311,11 +311,9 @@ def _render_operand(kind, text, symbols, lineno, name):
                               lineno)
         return f"0x{v:02X}"
     if kind == "k":
-        if not 0 <= v < VEC_COUNT:
-            raise LoaderError(f"{name} {v}: the trap vector table holds indices "
-                              f"0..{VEC_COUNT - 1}, so this code point can never be "
-                              f"dispatched (write the bytes with .byte if that is "
-                              "intended)", lineno)
+        if not 0 <= v <= 0xFF:
+            raise LoaderError(f"{name} trap number {v} is outside 0..255 in {text!r}",
+                              lineno)
         return f"0x{v:02X}"
     if kind == "soff":
         if not -128 <= v <= 127:

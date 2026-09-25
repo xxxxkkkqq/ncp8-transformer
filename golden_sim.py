@@ -614,8 +614,7 @@ def _operand_value(kind, x, name, labels, strict):
             raise _Operand(f"{name} address {v} is out of range 0..65535")
         return v
     if kind in ("i8", "k"):
-        word, hi = (("8-bit immediate", 0xFF) if kind == "i8"
-                    else ("trap number", ISA.VEC_COUNT - 1))
+        word, hi = ("8-bit immediate", 0xFF) if kind == "i8" else ("trap number", 0xFF)
         if s in labels:
             raise _Operand(f"{name} needs a numeric {word}, {s!r} is a label")
         v = _literal(s)
@@ -627,9 +626,7 @@ def _operand_value(kind, x, name, labels, strict):
             raise _Operand(f"unsupported operand expression {s!r}")
         if not 0 <= v <= hi:
             if kind == "k":
-                raise _Operand(f"{name} trap number {v} is outside the trap vector "
-                               f"table's indices 0..{hi}, so this code point can never "
-                               "be dispatched")
+                raise _Operand(f"{name} trap number {v} is out of range 0..{hi}")
             raise _Operand(f"{name} immediate {v} is out of range 0..{hi}")
         return v & 0xFF
     if kind == "soff":
