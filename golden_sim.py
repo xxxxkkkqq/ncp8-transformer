@@ -118,6 +118,12 @@ class NCP8:
             if len(data) > DATA_SIZE:
                 raise ValueError(f"data image is {len(data)} bytes, above DATA_SIZE {DATA_SIZE}")
             self.data[: len(data)] = data
+
+        self.vtab = cfg.vtab
+        if self.vtab is not None:
+
+            seed = ISA.vtab_seed_bytes(cfg.vectors())
+            self.data[self.vtab: self.vtab + ISA.VTAB_CELLS] = seed
         self.r = [0, 0, 0, 0]
         self.HL = 0
         self.DE = 0
@@ -193,7 +199,8 @@ class NCP8:
         lo, hi = self.config.window()
         return ISA.MachineConfig(codelen=self.codelen, entry=self.entry,
                                  winlo=lo, winhi=hi,
-                                 vec=self.config.vectors(), nbanks=self.nbanks,
+                                 vec=self.config.vectors(), vtab=self.config.vtab,
+                                 nbanks=self.nbanks,
                                  tdlim=self.tdlim, splim=self.splim,
                                  tickbudget=self.tb, outcap=self.out_cap)
 
@@ -345,7 +352,10 @@ class NCP8:
 
     def _vector(self, k):
 
-        return self.config.vector(k)
+        if self.vtab is None:
+            return self.config.vector(k)
+        base = self.vtab + 2 * k
+        return self.data[base] | (self.data[base + 1] << 8)
 
     def _stack_room(self, n):
 
@@ -686,10 +696,13 @@ class NCP8:
             tgt = self._vector(k)
             if tgt == 0:
                 self._fault(CAUSE["TRAP_UNREG"],
-                            f"EXT handler {k} is not registered: this machine keeps "
-                            f"its trap entry points in load-time configuration and "
-                            f"CODE holds none, so declaring one at load is the only "
-                            f"way to install a handler @ {pc0:#04x}")
+                            f"EXT handler {k} is not registered: the entry this machine "
+                            f"dispatches from reads 0. There are two ways a handler is "
+                            f"installed, and this machine has one of them -- a load-time "
+                            f"block that declares VEC[k], or a declared VTAB page whose "
+                            f"cells the program stores into with ST/STMW; an entry that "
+                            f"is zero under whichever way this load chose is no handler "
+                            f"@ {pc0:#04x}")
             if self.TDEPTH == self.tdlim:
 
                 self._fault(CAUSE["TRAP_DEPTH"],

@@ -87,14 +87,19 @@ F_PACK_V = tl.constexpr(ISA.FLAG_BITS_PACKED["V"])
 TRAP_TAG = tl.constexpr(ISA.TRAP_TAG)
 
 CFG_VEC_COUNT = tl.constexpr(ISA.VEC_COUNT)
-CFG_LEN = ISA.VEC_COUNT + 2
+
+CFG_VTAB = tl.constexpr(ISA.VEC_COUNT + 2)
+CFG_HASVTAB = tl.constexpr(ISA.VEC_COUNT + 3)
+CFG_LEN = ISA.VEC_COUNT + 4
 CFG_WINLO = tl.constexpr(ISA.VEC_COUNT)
 CFG_WINHI = tl.constexpr(ISA.VEC_COUNT + 1)
 CFG_LEN_C = tl.constexpr(CFG_LEN)
 
 def _cfg_row(cfg):
 
-    row = list(cfg.vectors()) + [cfg.window()[0], cfg.window()[1]]
+    row = list(cfg.vectors()) + [cfg.window()[0], cfg.window()[1],
+                                 0 if cfg.vtab is None else cfg.vtab,
+                                 0 if cfg.vtab is None else 1]
     return row
 
 class DecodeTableMismatch(Exception):
@@ -289,6 +294,7 @@ class _Row:
         return ISA.MachineConfig(codelen=int(self.b.CODELENS[self.i].item()),
                                  entry=self.b.entry,
                                  winlo=lo, winhi=hi, vec=cfg.vectors(),
+                                 vtab=cfg.vtab,
                                  nbanks=self.b.nbanks, tdlim=self.b.tdlim,
                                  splim=self.b.splim,
                                  tickbudget=int(self.b.BUDGETS[self.i].item()),
@@ -865,7 +871,13 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                         errc = _name_cause(errc, F_TRAP_UNREG)
                     else:
 
-                        tgt = tl.load(CFG + k)
+                        hasv = tl.load(CFG + CFG_HASVTAB)
+                        if hasv == 1:
+                            vbase = tl.load(CFG + CFG_VTAB)
+                            tgt = tl.load(DATA + vbase + 2 * k) \
+                                | (tl.load(DATA + vbase + 2 * k + 1) << 8)
+                        else:
+                            tgt = tl.load(CFG + k)
 
                         if tgt == 0:
                             err = 1
@@ -1290,6 +1302,13 @@ class TritonBatch:
         self.DATA[i] = 0
         if db:
             self.DATA[i, :len(db)] = torch.tensor(list(db), dtype=torch.int32, device=self.dev)
+
+        if self.config.vtab is not None:
+
+            vtab = self.config.vtab
+            seed = ISA.vtab_seed_bytes(self.config.vectors())
+            self.DATA[i, vtab: vtab + ISA.VTAB_CELLS] = torch.tensor(
+                list(seed), dtype=torch.int32, device=self.dev)
         ib = bytes(inputs) if inputs else b""
         if len(ib) > self.max_in:
             raise ValueError(f"machine {i}: input stream of {len(ib)} bytes exceeds the "
@@ -1497,6 +1516,12 @@ class TritonCircuit:
         self.DATA = torch.zeros(DATA_SIZE, dtype=i32, device=dev)
         if data:
             self.DATA[: len(data)] = torch.tensor(list(data), dtype=i32, device=dev)
+
+        self.vtab = cfg.vtab
+        if self.vtab is not None:
+            seed = ISA.vtab_seed_bytes(cfg.vectors())
+            self.DATA[self.vtab: self.vtab + ISA.VTAB_CELLS] = torch.tensor(
+                list(seed), dtype=i32, device=dev)
         self.INP = torch.tensor(list(inputs) if inputs else [0], dtype=i32, device=dev)
         self.inlen = len(inputs)
         self.OUTBUF = torch.zeros(self.out_cap, dtype=i32, device=dev)
@@ -1559,7 +1584,8 @@ class TritonCircuit:
         lo, hi = self.config.window()
         return ISA.MachineConfig(codelen=self.codelen, entry=self.entry,
                                  winlo=lo, winhi=hi,
-                                 vec=self.config.vectors(), nbanks=self.nbanks,
+                                 vec=self.config.vectors(), vtab=self.config.vtab,
+                                 nbanks=self.nbanks,
                                  tdlim=self.tdlim, splim=self.splim,
                                  tickbudget=self.tb, outcap=self.out_cap)
 

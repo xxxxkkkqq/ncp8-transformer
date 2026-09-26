@@ -227,7 +227,7 @@ instruction length is counted from the prefix byte.
 | 0x65 | JNS soff | jump if not `S` | untouched |
 | 0x66 | VS soff | jump if `V` | untouched |
 | 0x67 | VC soff | jump if not `V` | untouched |
-| 0x70 k | EXT k | `PC = vector[k]`, the entry point declared at load; nothing is saved, so a handler does not come back to the trap site | - |
+| 0x70 k | EXT k | `PC = vector[k]`, the entry point the load declared; on a machine whose block declares `vtab`, the entry is the little-endian word at that base in DATA, so the program can register or unregister a handler with an ordinary store; nothing is saved, so a handler does not come back to the trap site | - |
 | 0x80+r | STC [HL], r | `CODE[HL] = r`, allowed only inside the declared window | - |
 | 0x84+r | LDC r, [HL] | `r = CODE[HL]` | untouched |
 | 0x90+f | MULH r, s | `r = (r * s) >> 8`, the high byte of the widening product | Z |
@@ -320,6 +320,7 @@ constraint.
 | `codelen` | 0..65535 | how many `CODE` bytes are the program |
 | `winlo`, `winhi` | 0..65535, supplied together or not at all, and `winhi <= codelen` | the self-modification window `[winlo, winhi)`: a span inside the program it may rewrite. A bound past the last program byte is refused at load, naming the span and the program length |
 | `vec` | at most 16 entries, each 0..65535 | trap entry points; `0` means unregistered |
+| `vtab` | 0..4064, even addresses only | the DATA base of a writable 16-entry x 2-byte copy of the vector table: the load seeds it once from `vec` (an absent `vec` seeds sixteen zeros, all unregistered), `DATA[vtab+2k]` low byte and `+1` high, and from the first tick the cells are ordinary DATA an `ST`/`STMW` may rewrite; an odd base and a base whose 32-byte table leaves DATA are refused at construction |
 | `tickbudget` | 0..2^62 | ticks before `OVERRUN` |
 | `outcap` | a power of two, from 1 up to 32768 | output bytes before the capacity fault; a non-power-of-two is refused because the store masks the write index |
 | `nbanks` | 1..65535 | how many `DATA` pages a machine may reach through `MB`; a group must match the count (4.8) |
@@ -329,8 +330,9 @@ constraint.
 
 A field left as `None` is *absent*, and absence has one meaning per field: `codelen`
 is the length of the loaded image, `tickbudget` and `outcap` are the constructor
-arguments, the window is the empty span (no `STC` writes anything) and the vector table
-is all-zero (no `EXT` dispatches anywhere). A reversed window (`winhi < winlo`) is
+arguments, the window is the empty span (no `STC` writes anything), the vector table
+is all-zero (no `EXT` dispatches anywhere) and no writable page exists - the block's
+`vec` is the only table there is. A reversed window (`winhi < winlo`) is
 refused at construction and is never read as the empty window, because that would make
 a typo in one bound indistinguishable from switching self-modification off. Declaring a
 bound in the block and also moving the matching constructor argument off its default to
@@ -361,6 +363,18 @@ sweep states, and it is the reason the earlier protection - a window bound too n
 reach the tables - was not a design: the reachability of the machine's own limits was a
 consequence of an 8-bit field's width, and widening that width would have moved the
 limits inside the memory the machine writes.
+
+One declaration is a signed exception, and it is the only one: a block that declares
+`vtab` gives up "the machine cannot rewrite its own handler table". The block itself
+stays as unreachable as ever - no instruction reads a field of it, so a tick still
+cannot move a bound or a declared vector - but the 32 DATA bytes the field names are
+machine memory, seeded once at load from `vec` and ordinary cells ever after, and an
+`EXT` on such a machine dispatches from what the program last stored there. A load
+that does not declare the field keeps the older guarantee whole, and the machine has
+no path to a handler table of its own; declaring it is the loader's choice, the same
+shape of choice as declaring a self-modification window gives up "`CODE` is
+immutable", visible in the block and refused at construction when the base is odd or
+the table would leave DATA.
 
 Coverage of the census, since 16-bit bounds make the admissible pair set too large to
 state as a total: the pair space splits at the program end. Every pair whose span fits

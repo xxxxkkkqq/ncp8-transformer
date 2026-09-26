@@ -45,6 +45,7 @@ python3 test_spec_conformance.py      # the ISA is stated once: table vs all thr
 python3 test_recursion.py             # multiply, nested CALL/RET, stack overflow
 python3 test_batched_execution.py     # batched/resident executor vs reference
 python3 test_config_block.py        # load-time bounds, same machine on all four paths
+python3 test_vtab_runtime_vectors.py  # a declared vector page in DATA: register, dispatch, unregister
 python3 test_training_records.py      # a label needs four-path agreement and a re-run
 python3 mini_interpreter.py           # a 16-opcode interpreter implemented in NCP-8
 python3 selfread.py                   # programs that read their own PC/SP/flags

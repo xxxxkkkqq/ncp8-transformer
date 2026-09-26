@@ -122,6 +122,16 @@ class TorchCircuit:
         self.DATA = torch.zeros(DATA_SIZE, dtype=i32, device=dev)
         if data:
             self.DATA[: len(data)] = torch.tensor(list(data), dtype=i32, device=dev)
+
+        self.vtab = cfg.vtab
+        self.has_vtab = torch.tensor(1 if self.vtab is not None else 0, dtype=i32,
+                                     device=dev)
+        self.VTAB_BASE = torch.tensor(0 if self.vtab is None else self.vtab, dtype=i32,
+                                      device=dev)
+        if self.vtab is not None:
+            seed = ISA.vtab_seed_bytes(cfg.vectors())
+            self.DATA[self.vtab: self.vtab + ISA.VTAB_CELLS] = torch.tensor(
+                list(seed), dtype=i32, device=dev)
         self.INPUTS = torch.zeros(1, dtype=i32, device=dev)
         self.inlen = torch.zeros(1, dtype=i32, device=dev)
         self.set_inputs(inputs)
@@ -281,7 +291,9 @@ class TorchCircuit:
         t_hladd = self.HL + self.DE; v_hladd = t_hladd & 0xFFFF; c_hladd = t_hladd >> 16
         v_hlsub = (self.HL - self.DE) & 0xFFFF; c_hlsub = (self.HL < self.DE).to(i32)
 
-        vec = self._g(self.cfg_vec, imm0)
+        vec_data = self._g(self.DATA, self.VTAB_BASE + 2 * imm0) \
+            | (self._g(self.DATA, self.VTAB_BASE + 2 * imm0 + 1) << 8)
+        vec = vec_data * self.has_vtab + self._g(self.cfg_vec, imm0) * (1 - self.has_vtab)
         ext_ok = (imm0 < ISA.VEC_COUNT).to(i32) * (vec != 0).to(i32)
 
         fpack = (self.Z * ISA.FLAG_BITS_PACKED["Z"] + self.C * ISA.FLAG_BITS_PACKED["C"]
@@ -694,7 +706,8 @@ class TorchCircuit:
         lo, hi = self.config.window()
         return ISA.MachineConfig(codelen=self.codelen, entry=self.entry,
                                  winlo=lo, winhi=hi,
-                                 vec=self.config.vectors(), nbanks=self.nbanks,
+                                 vec=self.config.vectors(), vtab=self.config.vtab,
+                                 nbanks=self.nbanks,
                                  tdlim=self.tdlim, splim=self.splim,
                                  tickbudget=self.tb, outcap=self.out_cap)
 

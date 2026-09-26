@@ -7,10 +7,12 @@ on:
 
 jobs:
   reference-suites:
-    # A runner here has no GPU, so the six suites below are the ones that touch
-    # the reference machine, the decode tables and the toolchain only: they
-    # import the circuit modules without launching kernels. The circuit suites
-    # themselves stay gated by the local battery, which owns a device.
+    # A runner here has no GPU, so the seven suites below are the ones that
+    # touch the reference machine, the decode tables and the toolchain only:
+    # they import the circuit modules without launching CUDA kernels (the VTAB
+    # suite drives the tensor circuit on CPU and counts the paths it compared).
+    # The circuit suites themselves stay gated by the local battery, which owns
+    # a device.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -27,4 +29,5 @@ jobs:
       - name: run the GPU-free suites
         run: |
           python3 -m pytest -q test_arithmetic_bounds.py test_asm_strictness.py \
-            test_debug_resume.py test_form_domain.py test_isa_v2.py test_linking.py
+            test_debug_resume.py test_form_domain.py test_isa_v2.py test_linking.py \
+            test_vtab_runtime_vectors.py

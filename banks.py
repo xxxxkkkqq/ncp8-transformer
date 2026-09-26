@@ -214,6 +214,18 @@ CIRCUIT_ROWS = (
      "answers the one-bank case as it answers today's machine",
      "a run of each pinned program on a one-machine group and on a lone machine of the "
      "same path, compared tick by tick"),
+    ("a declared VTAB dispatches from machine memory",
+     "a machine whose block declares VTAB reads its trap entries out of its own DATA "
+     "at the declared base -- seeded once at load from the block's vec, ordinary cells "
+     "ever after -- so an STMW the program runs registers a handler the next EXT "
+     "fires, an entry stored back as 0 unregisters it into TRAP_UNREG, and a machine "
+     "that declares no VTAB keeps the block's table as the only one, byte for byte as "
+     "before; the resident batch seeds each row the same way and answers the same "
+     "ticks as the reference",
+     "the runtime-registration program on every path, stepped one tick at a time and "
+     "compared per tick on every compared component against the reference; plus the "
+     "seed bytes read back from DATA, the unregister fault's cause, and the "
+     "absent-VTAB machine's dispatch on the same paths"),
 )
 
 def _ascii(text):
@@ -391,9 +403,9 @@ def default_paths():
 
 class _BatchRow:
 
-    def __init__(self, code, data=None, tick_budget=8):
+    def __init__(self, code, data=None, tick_budget=8, config=None):
         from circuit_triton import TritonBatch
-        self.batch = TritonBatch(1, tick_budget=tick_budget)
+        self.batch = TritonBatch(1, tick_budget=tick_budget, config=config)
         self.batch.set_program(0, code, data)
 
     def step(self):
@@ -456,6 +468,117 @@ def batch_group_rows():
         bad += [f"{label}: {x}" for x in case_bad]
         causes.append(f"{label} -> {sorted(set(named))}")
     return bad, causes
+
+VTAB_BASE = 0x0800
+
+_VTAB_REGISTER = ("  LDI HL, 0x0800\n  LDI DE, handler\n  STMW [HL], DE\n"
+                  "  LDI r0, 3\n  EXT 0\n  OUT r0\n  HALT\n"
+                  "handler:\n  LDI r0, 0x5E\n  TRAPRET\n")
+
+_VTAB_UNREGISTER = ("  LDI HL, 0x0800\n  LDI DE, handler\n  STMW [HL], DE\n"
+                    "  LDI DE, 0\n  STMW [HL], DE\n  EXT 0\n  OUT r0\n  HALT\n"
+                    "handler:\n  LDI r0, 0x5E\n  TRAPRET\n")
+
+_VTAB_SEEDED = "  EXT 0\n  OUT r0\n  HALT\nhandler:\n  LDI r0, 0x71\n  TRAPRET\n"
+
+_VTAB_CONFIG_ONLY = _VTAB_SEEDED
+
+def _vtab_paths():
+
+    paths, notes = {}, []
+    try:
+        from circuit_torch import TorchCircuit
+        paths["TorchCircuit"] = lambda code, data, cfg: TorchCircuit(
+            code, data=data, device="cpu", config=cfg)
+    except Exception as e:
+        notes.append(f"TorchCircuit: {_ascii(e)}")
+    try:
+        from circuit_triton import TritonCircuit
+        TritonCircuit(b"\x00", device="cuda")
+        paths["TritonCircuit"] = lambda code, data, cfg: TritonCircuit(
+            code, data=data, device="cuda", config=cfg)
+    except Exception as e:
+        notes.append(f"TritonCircuit: {_ascii(e)}")
+    try:
+        from circuit_triton import TritonBatch
+        TritonBatch(1, device="cuda")
+
+        paths["TritonBatch"] = lambda code, data, cfg: _BatchRow(
+            code, data=data, tick_budget=ISA.TICK_BUDGET_DEFAULT, config=cfg)
+    except Exception as e:
+        notes.append(f"TritonBatch: {_ascii(e)}")
+    return paths, notes
+
+def _vtab_lockstep(code, build, name, cfg, ticks=24):
+
+    ref = NCP8(code, data=_BANK_DATA, config=cfg)
+    got = build(code, _BANK_DATA, cfg)
+    bad = []
+    for t in range(ticks):
+        try:
+            ref.step()
+        except MachineError:
+            pass
+        try:
+            got.step()
+        except MachineError:
+            pass
+        want, have = ref.record_state(), got.record_state()
+        for f in TICK_FIELDS:
+            if have[f] != want[f]:
+                bad.append(f"tick {t + 1} {f}: {name} {have[f]!r}, reference "
+                           f"{want[f]!r}")
+        if want["status"] != 0:
+            break
+    return bad
+
+def vtab_rows():
+
+    bad, claims = [], []
+
+    import loader as _loader
+    seeded_load = _loader.assemble(_VTAB_SEEDED, vtab=VTAB_BASE, vectors={0: "handler"})
+
+    seeded_cfg = ISA.MachineConfig(vtab=VTAB_BASE, vec=dict(seeded_load.vectors))
+    seeded = NCP8(seeded_load.image[: seeded_load.content_extent], data=_BANK_DATA,
+                  config=seeded_cfg)
+    claims.append(("the load seeds the declared page with the block's vec, "
+                   "little-endian",
+                   seeded.data[VTAB_BASE: VTAB_BASE + ISA.VTAB_CELLS]
+                   == ISA.vtab_seed_bytes(seeded_cfg.vectors())))
+    claims.append(("seeding is a loader step: the self-modification log stays at reset",
+                   seeded.stc_count == 0 and seeded.stc_first == 0))
+    seeded_code = seeded_load.image[: seeded_load.content_extent]
+    paths, notes = _vtab_paths()
+    for path_name, build in sorted(paths.items()):
+        for label, code, cfg in (
+                ("runtime registration", asm(_VTAB_REGISTER),
+                 ISA.MachineConfig(vtab=VTAB_BASE)),
+                ("unregister to 0", asm(_VTAB_UNREGISTER),
+                 ISA.MachineConfig(vtab=VTAB_BASE)),
+                ("seeded dispatch", seeded_code, seeded_cfg),
+                ("absent VTAB, config-only dispatch", seeded_code,
+                 ISA.MachineConfig(vec=seeded_cfg.vec)),
+        ):
+            case_bad = _vtab_lockstep(code, build, path_name, cfg)
+            bad += [f"{label}/{path_name}: {x}" for x in case_bad]
+    ref = NCP8(asm(_VTAB_REGISTER), data=_BANK_DATA,
+               config=ISA.MachineConfig(vtab=VTAB_BASE))
+    ref.run()
+    claims.append(("a handler registered at runtime fires and returns through "
+                   "TRAPRET", bytes(ref.out) == b"\x5e" and ref.status == STATUS_HALT
+                   and ref.TDEPTH == 0))
+    unreg = NCP8(asm(_VTAB_UNREGISTER), data=_BANK_DATA,
+                 config=ISA.MachineConfig(vtab=VTAB_BASE))
+    try:
+        unreg.run()
+    except MachineError:
+        pass
+    claims.append(("an entry stored back as 0 unregisters the handler",
+                   unreg.status == STATUS_ERROR
+                   and unreg.fault_reason == ISA.CAUSE["TRAP_UNREG"]
+                   and bytes(unreg.out) == b""))
+    return bad, claims, notes
 
 def probe_rows(paths=None, notes=(), codes=None):
 
@@ -568,6 +691,33 @@ def probe_rows(paths=None, notes=(), codes=None):
             evidence = (f"4 group cases x 2 rows, tick by tick against "
                         f"BankGroup.from_programs: {'; '.join(causes)}; {detail}")
             out.append((name, DIFFERS if bad else PASS, _ascii(evidence), what, how))
+        elif name == "a declared VTAB dispatches from machine memory":
+            if not paths:
+                out.append((name, NOT_RUN,
+                            "no path compared: " + ("; ".join(notes) if notes
+                                                    else "pass --with-paths"),
+                            what, how))
+                continue
+            try:
+                bad, claims, probe_notes = vtab_rows()
+            except Exception as e:
+                out.append((name, SKIPPED,
+                            f"the VTAB probe could not be driven: {_ascii(e)}",
+                            what, how))
+                continue
+            detail = ("; ".join(bad[:3]) if bad
+                      else "every compared component of every tick agrees on all "
+                           f"{len(paths)} path(s), faults included")
+            failed = [label for label, ok in claims if not ok]
+            verdict = DIFFERS if (bad or failed) else (
+                NOT_RUN if probe_notes else PASS)
+            evidence = (f"{len(claims)} claim(s) about the declared page, "
+                        f"{len(paths)} path(s) tick-for-tick"
+                        + (f" (uncompared: {'; '.join(probe_notes)})" if probe_notes
+                           else "")
+                        + f"; {detail}"
+                        + ("; failed: " + "; ".join(failed) if failed else ""))
+            out.append((name, verdict, _ascii(evidence), what, how))
         else:
             lone = NCP8(asm("LDI HL, 8\nLDI r0, 0x5A\nSTM [HL], r0\nHALT"),
                         data=bytes(DATA_SIZE))

@@ -726,6 +726,9 @@ def moved_block(block, field):
         moved["winlo"], moved["winhi"] = 2, 6
     elif field == "WINHI":
         moved["winhi"] = block["winhi"] + 4
+    elif field == "VTAB":
+
+        moved["vtab"] = (block["vtab"] + 2) if "vtab" in block else 0x0100
     elif field == "NBANKS":
         moved["nbanks"] = block["nbanks"] + 1
     elif field == "TDLIM":

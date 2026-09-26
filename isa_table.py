@@ -22,10 +22,11 @@ shown by that sweep.
 cause-in-table, and the pairing `fault_reason != 0` if and only if `status == 3`.
 
 `MachineConfig` is the load-time configuration block the same three implementations
-read: CODELEN, the two window bounds, the trap vector table, the bank count, the trap
-depth limit, the tick budget and the output capacity. Constructing it is the gate -
-each field has one stated range, a half-supplied window and a reversed one are refused,
-and `resolve_constraint` refuses a bound that the block and a moved constructor
+read: CODELEN, the two window bounds, the trap vector table, the base of the optional
+writable copy of that table in DATA, the bank count, the stack floor, the boot address,
+the trap depth limit, the tick budget and the output capacity. Constructing it is the
+gate - each field has one stated range, a half-supplied window and a reversed one are
+refused, and `resolve_constraint` refuses a bound that the block and a moved constructor
 argument state differently. `as_dict()`/`from_dict()` are how a block is carried as
 data, so a record or a recording can hold the machine it describes.
 """
@@ -282,6 +283,10 @@ FAULT_ADDR_BITS = 16
 
 VEC_COUNT = 16
 
+VTAB_CELLS = 2 * VEC_COUNT
+
+DEFAULT_VTAB_SENTINEL = 0
+
 DEFAULT_WINDOW = (0, 0)
 DEFAULT_VECTORS = (0,) * VEC_COUNT
 DEFAULT_ENTRY = 0
@@ -289,11 +294,11 @@ DEFAULT_TDLIM = 64
 
 TRAP_TAG = 0xA5
 
-CONFIG_NAMES = ("CODELEN", "ENTRY", "WINLO", "WINHI", "VEC", "NBANKS", "TDLIM",
+CONFIG_NAMES = ("CODELEN", "ENTRY", "WINLO", "WINHI", "VEC", "VTAB", "NBANKS", "TDLIM",
                 "SPLIM", "TICKBUDGET", "OUTCAP")
 
 CONFIG_WIDTHS = {"CODELEN": 16, "ENTRY": 16, "WINLO": 16, "WINHI": 16, "VEC": 16,
-                 "NBANKS": 16, "TDLIM": 8, "SPLIM": 16, "TICKBUDGET": None,
+                 "VTAB": 16, "NBANKS": 16, "TDLIM": 8, "SPLIM": 16, "TICKBUDGET": None,
                  "OUTCAP": 16}
 
 OUT_CAP_LIMIT = 1 << 16
@@ -362,13 +367,37 @@ def entry_error(entry, codelen, where=""):
                 f"fetch would fault")
     return None
 
+def vtab_error(vtab, where=""):
+
+    if vtab % 2:
+        return (f"{where}VTAB={vtab} (0x{vtab:04X}) is an odd address: the vector "
+                f"table is {VEC_COUNT} little-endian words -- DATA[VTAB+2k] low, "
+                f"DATA[VTAB+2k+1] high, the byte order STMW writes -- so a base that "
+                f"misaligns every entry is refused at construction rather than "
+                f"dispatched from")
+    if vtab + VTAB_CELLS > DATA_SIZE:
+        return (f"{where}VTAB={vtab} (0x{vtab:04X}) does not fit inside DATA: the "
+                f"table is {VTAB_CELLS} bytes ({VEC_COUNT} x 2) and would reach "
+                f"0x{vtab + VTAB_CELLS:04X}, past the {DATA_SIZE}-byte span, so an "
+                f"EXT k near the end of the table would read past machine memory")
+    return None
+
+def vtab_seed_bytes(vec):
+
+    out = bytearray(VTAB_CELLS)
+    for k, v in enumerate(vec):
+        out[2 * k] = v & 0xFF
+        out[2 * k + 1] = (v >> 8) & 0xFF
+    return bytes(out)
+
 class MachineConfig:
 
-    __slots__ = ("codelen", "entry", "winlo", "winhi", "vec", "nbanks", "tdlim",
-                 "splim", "tickbudget", "outcap")
+    __slots__ = ("codelen", "entry", "winlo", "winhi", "vec", "vtab", "nbanks",
+                 "tdlim", "splim", "tickbudget", "outcap")
 
     def __init__(self, *, codelen=None, entry=None, winlo=None, winhi=None, vec=None,
-                 nbanks=None, tdlim=None, splim=None, tickbudget=None, outcap=None):
+                 vtab=None, nbanks=None, tdlim=None, splim=None, tickbudget=None,
+                 outcap=None):
         self.codelen = (None if codelen is None
                         else _cfg_int("CODELEN", codelen, 0, (1 << 16) - 1))
         self.entry = (None if entry is None
@@ -399,6 +428,12 @@ class MachineConfig:
         else:
             self.winlo = self.winhi = None
         self.vec = None if vec is None else self._checked_vec(vec)
+        self.vtab = (None if vtab is None
+                     else _cfg_int("VTAB", vtab, 0, (1 << 16) - 1))
+        if self.vtab is not None:
+            bad = vtab_error(self.vtab)
+            if bad is not None:
+                raise ConfigError(bad)
         self.nbanks = (None if nbanks is None
                        else _cfg_int("NBANKS", nbanks, 1, (1 << 16) - 1))
         self.tdlim = (None if tdlim is None
@@ -1116,6 +1151,34 @@ def check_config_table():
             continue
         raise DecodeTableError(f"a trap-depth limit of {bad} is accepted, though it is "
                                f"outside the 8 bits the field declares")
+    if MachineConfig().vtab is not None:
+        raise DecodeTableError("an absent vector-table base reads as a declared one, so "
+                               "a machine without the field would count as one that "
+                               "gave up the immutable-handler-table rule")
+
+    if MachineConfig(vtab=0x0800).vtab != 0x0800:
+        raise DecodeTableError("the declared vector-table base does not survive "
+                               "validation")
+    for bad_vtab in (0x0FE1, 0x0FFF, DATA_SIZE, 1 << 16):
+        try:
+            MachineConfig(vtab=bad_vtab)
+        except ConfigError:
+            continue
+        raise DecodeTableError(f"a vector-table base of {bad_vtab} is accepted, though "
+                               f"its {VTAB_CELLS} bytes would leave the "
+                               f"{DATA_SIZE}-byte DATA span")
+    try:
+        MachineConfig(vtab=DATA_SIZE - VTAB_CELLS + 1)
+    except ConfigError as e:
+        if "odd" not in str(e) or f"VTAB={DATA_SIZE - VTAB_CELLS + 1}" not in str(e):
+            raise DecodeTableError("an odd vector-table base is refused without naming "
+                                   f"the base and the alignment rule: {e}")
+    else:
+        raise DecodeTableError("an odd vector-table base is accepted, though the "
+                               "entries are the little-endian words STMW writes")
+    if MachineConfig(vtab=DATA_SIZE - VTAB_CELLS).vtab != DATA_SIZE - VTAB_CELLS:
+        raise DecodeTableError("a table ending exactly at the last DATA byte is "
+                               "refused, though its footprint fits the span")
     try:
         MachineConfig(codelen=4, entry=4)
     except ConfigError as e:
