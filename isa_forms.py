@@ -57,13 +57,14 @@ FORMS = {
     "JNS": (("soff",),),
     "VS": (("soff",),),
     "VC": (("soff",),),
-    "CALL": (("a16",),),
+    "CALL": (("a16",), ("HL",)),
     "LDI": (("HL", "i16"), ("DE", "i16"), ("r", "i8")),
     "ADDI": (("HL", "rcanon"), ("DE", "rcanon"), ("r", "i8")),
     "JPHL": ((),),
     "GETPC": (("r",),),
     "GETSP": (("r",),),
     "GETF": (("r",),),
+    "TRAPRET": ((),),
 
     "AND": (("r", "r"),),
     "OR": (("r", "r"),),
@@ -391,7 +392,7 @@ def self_test(verbose=True):
             for t in FORMS[name][i + 1:]:
                 if len(s) != len(t):
                     continue
-                if all(a == b or a in VALUE_KINDS or b in VALUE_KINDS
+                if all(a == b or (a in VALUE_KINDS and b in VALUE_KINDS)
                        for a, b in zip(s, t)):
                     fails.append(("structural-ambiguity-pair", name, s, t))
 

@@ -11,6 +11,7 @@
 | `PC` | 16 bit | program counter |
 | `C`, `Z` | 1 bit each | carry and zero flags |
 | `S`, `V` | 1 bit each | signed result and signed overflow flags |
+| `TDEPTH` | 8 bit | trap nesting depth: `EXT k` increments it after the frame push, `TRAPRET` decrements it; reset 0, bounded by `tdlim` |
 | `CODE` | 4096 bytes | program memory. The first `CODELEN` bytes are the program: instruction fetch, `LDC` and `STC` are all bounded by that length, not by the 4096, and `STC` is bounded further by the declared window (see 5) |
 | `DATA` | 4096 bytes | data memory and stack |
 | input | byte stream | `IN`, cursor `ipos` |
@@ -54,7 +55,12 @@ Two properties hold, in both directions, and both are checked on every path:
 The list of causes lives in one place, `isa_table.FAULT_CAUSES`, numbered densely from
 `0` = no fault; this document does not restate it, because a second copy of a table is how
 two sources of truth start disagreeing. `test_spec_conformance.py` checks the table against
-the machine.
+the machine. Four of them name rules this document states in prose: `PC_ILLEGAL` - a
+control transfer whose committed `PC` lands at or past the program extent stops on the
+tick that writes `PC`, before any byte at the target is fetched; `TRAP_DEPTH` - `EXT k`
+when `TDEPTH` already equals the declared `tdlim`, refused before the frame is pushed;
+`TRAP_FRAME` - a `TRAPRET` whose frame tag is not the one the dispatch left; and
+`TRAP_UNBALANCED` - a `TRAPRET` with no trap to return from.
 
 ### 2.1 Terminal status is sticky
 
@@ -315,7 +321,9 @@ constraint.
 | `tickbudget` | 0..2^62 | ticks before `OVERRUN` |
 | `outcap` | a power of two, from 1 up to 32768 | output bytes before the capacity fault; a non-power-of-two is refused because the store masks the write index |
 | `nbanks` | 1..65535 | how many `DATA` pages a machine may reach through `MB`; a group must match the count (4.8) |
-| `tdlim` | 0..255 | carried, not yet consulted by any instruction (trap depth) |
+| `tdlim` | 0..255 | trap depth: `EXT k` stops with `TRAP_DEPTH` when `TDEPTH` reaches it; an absent block resolves to 64 |
+| `splim` | 0..4096 | the declared stack floor: a push that stays inside the span but would cross it names `STACK_OVERFLOW`; an absent block resolves to 0, which refuses no push the span already allows |
+| `entry` | 0..65535 | the address every path boots the PC from; an absent block boots at 0, and a value at or past the program extent is refused at load, naming the entry and the extent |
 
 A field left as `None` is *absent*, and absence has one meaning per field: `codelen`
 is the length of the loaded image, `tickbudget` and `outcap` are the constructor

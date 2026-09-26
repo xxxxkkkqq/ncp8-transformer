@@ -642,26 +642,190 @@ def c14_page_accesses():
     return {"runs": runs, "ticks": ticks_compared, "selectors": PAGE_SELECTORS,
             "accesses": len(PAGE_ACCESSES), "paths": len(CIRCUIT_PATHS)}
 
+GROUP_WRITER = ("  LDI HL, {bank}\n  MOV MB, HL\n  LDI HL, 64\n  LDI r0, {val:#x}\n"
+                "  STM [HL], r0\n  HALT")
+
+GROUP_SLEEP = "  HALT"
+GROUP_LOOP = "loop:\n  ADDI r0, 1\n  JMP loop"
+
+GROUP_LATE_HALT = "  ADDI r0, 1\n  ADDI r0, 1\n  ADDI r0, 1\n  HALT"
+GROUP_BUDGET = 32
+
+def grouped_pair(codes, *, data=DATA, budget=GROUP_BUDGET):
+
+    built = [asm(c) if isinstance(c, str) else c for c in codes]
+    grp = BankGroup.from_programs(built, data=data, tick_budget=budget)
+    bat = TritonBatch.from_programs(built, data=data, tick_budget=budget)
+    return grp, bat
+
+def lockstep_records(grp, bat, n, limit=48):
+
+    ref_t, bat_t = [], []
+    for _ in range(limit):
+        if (grp.all_quiescent()
+                and all(bat.record_state(i)["status"] != STATUS_CODE[STATUS_RUNNING]
+                        for i in range(n))):
+            break
+        grp.step(strict=False)
+        bat.step(1)
+        ref_t.append([{k: grp.machine(i).record_state()[k] for k in TICK_FIELDS}
+                      for i in range(n)])
+        bat_t.append([{k: bat.record_state(i)[k] for k in TICK_FIELDS}
+                      for i in range(n)])
+    return ref_t, bat_t
+
+def pair_diffs(ref_t, bat_t, n):
+
+    bad = []
+    if len(ref_t) != len(bat_t):
+        bad.append(("tick count", None, None, len(bat_t), len(ref_t)))
+    for t, (rs, bs) in enumerate(zip(ref_t, bat_t)):
+        for i in range(n):
+            bad += [(t, i, f, bs[i][f], rs[i][f])
+                    for f in TICK_FIELDS if bs[i][f] != rs[i][f]]
+    return bad
+
+def page_diffs(grp, bat, n):
+
+    bad = []
+    for i in range(n):
+        a, b = bytes(grp.data(i)), bytes(bat.data(i))
+        bad += [(i, k, b[k], a[k]) for k in range(len(a)) if a[k] != b[k]]
+    return bad
+
+def refused_at(ticks, cause, row=0):
+
+    return next((t for t, rows in enumerate(ticks)
+                 if rows[row]["fault_reason"] == cause), None)
+
+def c15_grouped_batch():
+    print("C15 a grouped batch is the reference's bank group")
+    n = 2
+
+    refused = refuse(TritonBatch.from_programs, [asm("  HALT")] * 2,
+                     config=ISA.MachineConfig(nbanks=3))
+    check("C15 a construction of 2 programs with a block declaring NBANKS=3 is refused",
+          refused is not None and "NBANKS=3" in refused, repr(refused))
+    refused = refuse(TritonBatch.from_programs, [asm("  HALT")] * 2,
+                     config=ISA.MachineConfig(nbanks=2))
+    check("C15 a construction of 2 programs with a block declaring NBANKS=2 is built",
+          refused is None, repr(refused))
+
+    grp, bat = grouped_pair([GROUP_WRITER.format(bank=1, val=0x77), GROUP_SLEEP])
+    ref_t, bat_t = lockstep_records(grp, bat, n)
+    bad = pair_diffs(ref_t, bat_t, n)
+    check("C15 the batch agrees with the bank group tick for tick: the write lands",
+          not bad, str(bad[:3]))
+    check("C15 the page the write landed in is the reference's page",
+          not page_diffs(grp, bat, n) and bat.data(1)[64] == 0x77
+          and bat.data(0)[64] == DATA[64],
+          f"page 1 byte 64 is {bat.data(1)[64]:#x}, page 0 byte 64 is "
+          f"{bat.data(0)[64]:#x}")
+
+    grp, bat = grouped_pair([GROUP_WRITER.format(bank=1, val=0x77), GROUP_LOOP])
+    ref_t, bat_t = lockstep_records(grp, bat, n)
+    bad = pair_diffs(ref_t, bat_t, n)
+    check("C15 the batch agrees with the bank group tick for tick: the owner runs",
+          not bad, str(bad[:3]))
+    at = refused_at(bat_t, CAUSE["BANK_BUSY"])
+    check("C15 the batch named BANK_BUSY where the reference named it",
+          at is not None and at == refused_at(ref_t, CAUSE["BANK_BUSY"]),
+          f"batch at {at}, reference at {refused_at(ref_t, CAUSE['BANK_BUSY'])}")
+    moved = sorted(k for k in TICK_FIELDS
+                   if bat_t[at][0][k] != bat_t[at - 1][0][k]) if at else []
+    check("C15 the refusing tick committed only the three fault fields",
+          moved == FAULT_ONLY, f"committed {moved}")
+    check("C15 the refused tick named the STM's address and moved no page",
+          bat_t[at][0]["fault_addr"] == bat_t[at - 1][0]["PC"]
+          and bat.data(1)[64] == DATA[64] and bat.data(0)[64] == DATA[64],
+          f"addr {bat_t[at][0]['fault_addr']:#x}, page bytes "
+          f"{bat.data(0)[64]:#x} {bat.data(1)[64]:#x}")
+
+    grp, bat = grouped_pair([GROUP_WRITER.format(bank=5, val=0x77), GROUP_SLEEP])
+    ref_t, bat_t = lockstep_records(grp, bat, n)
+    bad = pair_diffs(ref_t, bat_t, n)
+    check("C15 the batch agrees with the bank group tick for tick: the selector is "
+          "past the group", not bad, str(bad[:3]))
+    check("C15 the selector past the declared count is BANK_OOB on the batch",
+          refused_at(bat_t, CAUSE["BANK_OOB"]) is not None
+          and bat.record_state(0)["status"] == STATUS_CODE[STATUS_ERROR],
+          f"cause {bat.record_state(0)['fault_reason']}")
+
+    late_writer = ("  LDI HL, 0\n  MOV MB, HL\n  LDI r0, 0x33\n"
+                   "  STM [HL], r0\n  HALT")
+    grp, bat = grouped_pair([GROUP_LATE_HALT, late_writer])
+    ref_t, bat_t = lockstep_records(grp, bat, n)
+    bad = pair_diffs(ref_t, bat_t, n)
+    check("C15 the batch agrees with the bank group tick for tick: the owner halts "
+          "beside the store", not bad, str(bad[:3]))
+    check("C15 a write beside a RUNNING owner is refused at the boundary",
+          refused_at(bat_t, CAUSE["BANK_BUSY"], row=1) is not None
+          and bat.data(0)[0] == DATA[0],
+          f"cause {bat.record_state(1)['fault_reason']}, owner page byte 0 is "
+          f"{bat.data(0)[0]:#x}")
+    later_writer = ("  LDI HL, 0\n  MOV MB, HL\n  LDI r0, 1\n  ADDI r0, 1\n"
+                    "  LDI r0, 0x33\n  STM [HL], r0\n  HALT")
+    grp, bat = grouped_pair([GROUP_LATE_HALT, later_writer])
+    ref_t, bat_t = lockstep_records(grp, bat, n)
+    bad = pair_diffs(ref_t, bat_t, n)
+    check("C15 the batch agrees with the bank group tick for tick: the store comes "
+          "after the owner's halt", not bad, str(bad[:3]))
+    check("C15 the same write one tick after the owner's halt lands",
+          refused_at(bat_t, CAUSE["BANK_BUSY"], row=1) is None
+          and bat.data(0)[0] == 0x33,
+          f"cause {bat.record_state(1)['fault_reason']}, owner page byte 0 is "
+          f"{bat.data(0)[0]:#x}")
+
+    grp, bat = grouped_pair([GROUP_WRITER.format(bank=0, val=0x11),
+                             GROUP_WRITER.format(bank=1, val=0x22)])
+    ref_t, bat_t = lockstep_records(grp, bat, n)
+    bad = pair_diffs(ref_t, bat_t, n) + page_diffs(grp, bat, n)
+    check("C15 the batch agrees with the bank group tick for tick: both rows write "
+          "their own pages", not bad, str(bad[:3]))
+    check("C15 each page holds its own row's byte and not the other's",
+          bat.data(0)[64] == 0x11 and bat.data(1)[64] == 0x22,
+          f"{bat.data(0)[64]:#x} {bat.data(1)[64]:#x}")
+
+    codes = [asm(GROUP_WRITER.format(bank=0, val=0x44)),
+             asm(GROUP_WRITER.format(bank=1, val=0x44))]
+    plain = TritonBatch(2, tick_budget=GROUP_BUDGET)
+    declared = TritonBatch(2, tick_budget=GROUP_BUDGET,
+                           config=ISA.MachineConfig(nbanks=1))
+    for i, c in enumerate(codes):
+        plain.set_program(i, c, DATA)
+        declared.set_program(i, c, DATA)
+    plain.run()
+    declared.run()
+    drift = [(i, f) for i in range(2) for f in TICK_FIELDS
+             if plain.record_state(i)[f] != declared.record_state(i)[f]]
+    drift += [(i, k, declared.data(i)[k], plain.data(i)[k]) for i in range(2)
+              for k in range(DATA_SIZE)
+              if plain.data(i)[k] != declared.data(i)[k]]
+    check("C15 a batch declaring NBANKS=1 is byte-identical to the batch that "
+          "declares nothing", not drift, str(drift[:3]))
+    check("C15 the one-bank batch refuses the selector past its page with BANK_OOB",
+          declared.record_state(1)["fault_reason"] == CAUSE["BANK_OOB"]
+          and declared.record_state(1)["status"] == STATUS_CODE[STATUS_ERROR],
+          f"row 1 cause {declared.record_state(1)['fault_reason']}")
+
 def main():
     print("bank acceptance: the ownership rules of the reference path, measured")
     for fn in (c1_encodings, c2_one_bank, c3_own_page, c4_isolation, c5_running_neighbour,
                c6_quiescent_neighbour, c7_boundary, c8_reachability, c9_declaration,
-               c10_causes, c11_sticky, c13_selector_row, c14_page_accesses):
+               c10_causes, c11_sticky, c13_selector_row, c14_page_accesses,
+               c15_grouped_batch):
         fn()
     print("\nC12 what is NOT RUN here, and the condition that closes each row")
     for row, why in (
-            ("a batch is not a group",
-             "TritonBatch holds one DATA page per row, so a row's selector can name only "
-             "the page it owns: it carries a per-row MB and no foreign page. Measured by "
-             "C14, which runs two bank programs in one batch and finds each row's page "
-             "identical to the reference running that row's program alone"),
-            ("BANK_BUSY on a circuit path",
-             "the ownership rule is answered on all four paths, but the three circuit "
-             "paths hold one page each, so no bank access there can name this cause. "
-             "Measured by C14, which names it zero times in "
+            ("BANK_BUSY on TorchCircuit and TritonCircuit",
+             "the two single-machine circuit paths hold one page each, and no group "
+             "driver can hand them a second, so no bank access there can name this "
+             "cause. Measured by C14, which names it zero times in "
              f"{len(PAGE_SELECTORS) * len(PAGE_ACCESSES) * len(CIRCUIT_PATHS)} runs over "
              "every selector a lone machine can name, and by C5, which produces it on "
-             "the reference; test_fault_registers.py C4 re-derives the absence")):
+             "the reference; C15 produces it on the grouped batch against the "
+             "reference's driver, and test_fault_registers.py C4 re-derives the "
+             "absence on the one-page paths"),):
         print(f"  NOT RUN {row}   ({why})")
     print("\nC12 measured by C14, not listed as NOT RUN: the six page accesses answer "
           "on TorchCircuit, TritonCircuit and TritonBatch at every selector a machine "

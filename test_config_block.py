@@ -246,14 +246,17 @@ def s1_defaults():
     for ctor, name in ((NCP8, "NCP8"), (TorchCircuit, "TorchCircuit"),
                        (TritonCircuit, "TritonCircuit")):
         c = ctor(b"\x00\x00\x00\x00")
+
         check(f"S1 {name} defaults are today's machine",
-              (c.codelen, c.out_cap, c.tb, c.nbanks, c.tdlim) == (4, OUT_CAP,
-                                                                  TICKBUDGET, 1, 0),
-              f"got {(c.codelen, c.out_cap, c.tb, c.nbanks, c.tdlim)}")
+              (c.codelen, c.out_cap, c.tb, c.nbanks, c.tdlim, c.splim)
+              == (4, OUT_CAP, TICKBUDGET, 1, 64, 0)
+              and c.tdlim == ISA.DEFAULT_TDLIM,
+              f"got {(c.codelen, c.out_cap, c.tb, c.nbanks, c.tdlim, c.splim)}")
     b = TritonBatch(2)
     check("S1 batch defaults are today's machine",
-          (b.out_cap, b.config.equivalent_to_default()) == (OUT_CAP, True),
-          f"got {(b.out_cap, b.config)}")
+          (b.out_cap, b.splim, b.tdlim, b.config.equivalent_to_default())
+          == (OUT_CAP, 0, 64, True) and b.tdlim == ISA.DEFAULT_TDLIM,
+          f"got {(b.out_cap, b.splim, b.tdlim, b.config)}")
 
     for p in CAPACITY_PATHS:
         c = p.build(b"\x00\x00\x00\x00")
@@ -270,7 +273,7 @@ def s1_defaults():
         sig = inspect.signature(c.load_state) if hasattr(c, "load_state") else None
         if sig is not None:
             bad = [n for n in sig.parameters
-                   if n in ("codelen", "out_cap", "config", "nbanks", "tdlim")]
+                   if n in ("codelen", "entry", "out_cap", "config", "nbanks", "tdlim")]
             check(f"S1 {p.name}.load_state installs no constraint", not bad,
                   f"it takes {bad}")
 
@@ -309,6 +312,8 @@ def s2_validation():
                      (dict(vec={0: 0x10000}), "a vector past the code space"),
                      (dict(nbanks=0), "NBANKS 0"),
                      (dict(tdlim=256), "TDLIM past its 8 bits"),
+                     (dict(splim=-1), "SPLIM below 0"),
+                     (dict(splim=DATA_SIZE + 1), "SPLIM past the DATA span"),
                      (dict(tickbudget=-1), "a negative TICKBUDGET"),
                      (dict(outcap=0), "OUTCAP 0"),
                      (dict(outcap=3), "a non-power-of-two OUTCAP"),
@@ -789,6 +794,278 @@ def s9_pair_census():
           f"{unfittable} pairs past it refused at load, plus {len(edge) ** 2} "
           f"region-straddling pairs per circuit")
 
+FLOOR_PROG = asm("LDI r0, 0x5A\nLDI HL, 0x0009\nMOVW SP, HL\n"
+                 "PUSH r0\nPUSH r0\nPUSH r0\nOUT r0\nHALT")
+
+FLOOR_PUSH3 = 0x09
+
+def _floor_view(p, code, config=None):
+
+    m = p.build(code, config=config)
+    v, _ = p.run(m, limit=40)
+    if p.name == "reference":
+        sp = m.snapshot()["SP"]
+        data = bytes(m.data)
+    elif p.name == "batch":
+        sp = m.snapshot(0)["SP"]
+        data = bytes(int(x) & 0xFF for x in m.DATA[0].cpu().tolist())
+    else:
+        sp = m.snapshot()["SP"]
+        data = bytes(int(x) & 0xFF for x in m.DATA.cpu().tolist())
+    return dict(v, sp=sp, data=data)
+
+def _floor_case(name, code, config, pins, data_span=(5, 10)):
+
+    views = [(p.name, _floor_view(p, code, config)) for p in CAPACITY_PATHS]
+    for pname, v in views:
+        got = {k: v[k] for k in pins}
+        if "data" in got:
+            got["data"] = v["data"][data_span[0]:data_span[0] + len(pins["data"])]
+        want = dict(pins)
+        if "data" in want:
+            want["data"] = bytes(want["data"])
+        check(f"S10 {name} on {pname}", got == want,
+              f"got {got}, want {want}")
+    fields = ("status", "cause", "addr", "out", "ticks", "pc", "sp", "r")
+    head = views[0][1]
+    for pname, v in views[1:]:
+        same = all(v[k] == head[k] for k in fields) \
+            and v["data"][data_span[0]:data_span[1]] == head["data"][data_span[0]:data_span[1]]
+        check(f"S10 {name}: {pname} agrees with {views[0][0]}", same,
+              f"{ {k: v[k] for k in fields} } against { {k: head[k] for k in fields} }")
+    return head
+
+def s10_stack_floor():
+    print("S10 the declared stack floor: the block's SPLIM is what the push side "
+          "measures SP against")
+
+    for p in CAPACITY_PATHS:
+        m = p.build(FLOOR_PROG)
+        check(f"S10 {p.name}: an absent block resolves the floor to 0", m.splim == 0,
+              f"{m.splim!r}")
+        m = p.build(FLOOR_PROG, config=CFG(splim=7))
+        check(f"S10 {p.name}: a declared block carries its floor", m.splim == 7,
+              f"{m.splim!r}")
+
+    _floor_case("absent block, three pushes land", FLOOR_PROG, None,
+                dict(status=1, cause=0, addr=0, sp=6, ticks=8, out=b"\x5a",
+                     data=[0, 0x5A, 0x5A, 0x5A, 0]))
+    _floor_case("absent block, push then pop undoes it",
+                asm("LDI r0, 0x5A\nLDI HL, 0x0009\nMOVW SP, HL\n"
+                    "PUSH r0\nPOP r1\nHALT"), None,
+                dict(status=1, cause=0, addr=0, sp=9, ticks=6, out=b"",
+                     r=[0x5A, 0x5A, 0, 0]))
+
+    _floor_case("floor 7 refuses the push that would land at 6", FLOOR_PROG,
+                CFG(splim=7),
+                dict(status=3, cause=CAUSE["STACK_OVERFLOW"], addr=FLOOR_PUSH3,
+                     sp=7, ticks=5, out=b"", data=[0, 0, 0x5A, 0x5A, 0]))
+
+    _floor_case("floor 6 lets the same program finish", FLOOR_PROG, CFG(splim=6),
+                dict(status=1, cause=0, addr=0, sp=6, ticks=8, out=b"\x5a",
+                     data=[0, 0x5A, 0x5A, 0x5A, 0]))
+    _floor_case("floor 8 refuses a push that would land at 7",
+                asm("LDI r0, 0x5A\nLDI HL, 8\nMOVW SP, HL\nPUSH r0\nHALT"),
+                CFG(splim=8),
+                dict(status=3, cause=CAUSE["STACK_OVERFLOW"], addr=0x07,
+                     sp=8, ticks=3, out=b""))
+    _floor_case("floor 7 takes the same push, landing at 7",
+                asm("LDI r0, 0x5A\nLDI HL, 8\nMOVW SP, HL\nPUSH r0\nHALT"),
+                CFG(splim=7),
+                dict(status=1, cause=0, addr=0, sp=7, ticks=5, out=b"",
+                     data=[0, 0, 0x5A, 0, 0]))
+
+    _floor_case("MOVW SP past the span names DATA_OOB, floor or not",
+                asm("LDI HL, 0x1001\nMOVW SP, HL\nHALT"), CFG(splim=7),
+                dict(status=3, cause=CAUSE["DATA_OOB"], addr=0x03, sp=DATA_SIZE,
+                     ticks=1, out=b""))
+    _floor_case("MOVW SP past the span names DATA_OOB with no floor either",
+                asm("LDI HL, 0x1001\nMOVW SP, HL\nHALT"), None,
+                dict(status=3, cause=CAUSE["DATA_OOB"], addr=0x03, sp=DATA_SIZE,
+                     ticks=1, out=b""))
+    _floor_case("ADD SP past the span names DATA_OOB",
+                asm("LDI HL, 0x1000\nMOVW SP, HL\nADD SP, 1\nHALT"), None,
+                dict(status=3, cause=CAUSE["DATA_OOB"], addr=0x05, sp=DATA_SIZE,
+                     ticks=2, out=b""))
+
+    _floor_case("PUSHW refused one slot short of the floor",
+                asm("LDI DE, 8\nMOVW SP, DE\nLDI HL, 0x0204\nPUSHW HL\nHALT"),
+                CFG(splim=7),
+                dict(status=3, cause=CAUSE["STACK_OVERFLOW"], addr=0x08, sp=8,
+                     ticks=3, out=b""))
+    _floor_case("PUSHW at floor + 2 lands its last slot at the floor",
+                asm("LDI DE, 8\nMOVW SP, DE\nLDI HL, 0x0204\nPUSHW HL\nHALT"),
+                CFG(splim=6),
+                dict(status=1, cause=0, addr=0, sp=6, ticks=5, out=b"",
+                     data=[0, 0x04, 0x02, 0, 0]))
+    _floor_case("CALL refused one slot short of the floor",
+                asm("LDI HL, 9\nMOVW SP, HL\nCALL 0x0008\nHALT"), CFG(splim=8),
+                dict(status=3, cause=CAUSE["STACK_OVERFLOW"], addr=0x05, sp=9,
+                     ticks=2, out=b""))
+    _floor_case("CALL at floor + 2 pushes the return address",
+                asm("LDI HL, 9\nMOVW SP, HL\nCALL 0x0008\nHALT"), CFG(splim=7),
+                dict(status=1, cause=0, addr=0, sp=7, ticks=4, out=b"",
+                     data=[0, 0, 0, 8, 0]))
+
+    ext_src = image(asm("LDI HL, 13\nMOVW SP, HL\nEXT 0\nHALT"),
+                    vectors={0: 0x0F0C})
+    _floor_case("EXT refused with the frame's last slot below the floor", ext_src,
+                CFG(vec={0: 0x0F0C}, splim=10),
+                dict(status=3, cause=CAUSE["STACK_OVERFLOW"], addr=0x05, sp=13,
+                     ticks=2, out=b""))
+    _floor_case("EXT with the frame's last slot at the floor dispatches", ext_src,
+                CFG(vec={0: 0x0F0C}, splim=9),
+                dict(status=1, cause=0, addr=0, sp=9, ticks=4, out=b""))
+    print("    absent, refusing, boundary and division cases all pinned on the four "
+          "paths")
+
+ENTRY_E = 0x20
+ENTRY_PROG = asm("start:\n  LDI r0, 5\n  OUT r0\n  HALT\n")
+ENTRY_PADDED = bytes(ENTRY_E) + ENTRY_PROG
+
+def _force_pc(m, name, addr):
+
+    if name == "reference":
+        m.PC = addr
+    elif name == "batch":
+        m.set_state(0, PC=addr)
+    elif name == "torch":
+        m.PC = torch.tensor([addr], dtype=torch.int32, device=m.dev)
+    else:
+        m.S[6] = addr
+
+def s11_entry():
+    print("S11 the block's ENTRY is where every path boots")
+
+    pins = (
+        ("ldi_out_halt", asm("LDI r0, 1\nOUT r0\nHALT"),
+         dict(status=1, ticks=3, pc=4, out=b"\x01", r=[1, 0, 0, 0], hl=0, cause=0,
+              addr=0)),
+        ("floor", FLOOR_PROG,
+         dict(status=1, ticks=8, pc=12, out=b"Z", r=[0x5A, 0, 0, 0], hl=9, cause=0,
+              addr=0)),
+        ("bad_opcode", bytes([0x71, 0x00]),
+         dict(status=3, ticks=0, pc=0, out=b"", r=[0, 0, 0, 0], hl=0,
+              cause=CAUSE["BAD_OPCODE"], addr=0)),
+        ("trap_unreg", asm("EXT 0\nHALT"),
+         dict(status=3, ticks=0, pc=0, out=b"", r=[0, 0, 0, 0], hl=0,
+              cause=CAUSE["TRAP_UNREG"], addr=0)),
+    )
+    for name, code, want in pins:
+        for p in CAPACITY_PATHS:
+            m = p.build(code)
+            check(f"S11 {p.name}: an absent ENTRY resolves to 0", m.entry == 0,
+                  repr(m.entry))
+            v, _ = p.run(m, limit=32)
+            got = {k: v[k] for k in ("status", "ticks", "pc", "out", "r", "hl",
+                                     "cause", "addr")}
+            check(f"S11 {name} with no ENTRY is the pre-wave machine on {p.name}",
+                  got == want, f"got {got}, want {want}")
+
+    for p in PATHS:
+        for entry, codelen in ((len(ENTRY_PROG), None),
+                               (len(ENTRY_PROG) + 1, len(ENTRY_PROG))):
+            try:
+                cfg = (CFG(entry=entry) if codelen is None
+                       else CFG(codelen=codelen, entry=entry))
+                p.build(ENTRY_PROG, config=cfg)
+                check(f"S11 {p.name} refuses ENTRY {entry} past its program", False,
+                      "a machine was built whose first fetch would fault")
+            except ISA.ConfigError as e:
+                msg = str(e)
+                check(f"S11 {p.name} refuses ENTRY {entry} past its program and names "
+                      f"both numbers",
+                      "ENTRY" in msg and str(entry) in msg
+                      and f"{len(ENTRY_PROG)} bytes" in msg, msg)
+    try:
+        CFG(codelen=4, entry=4)
+        check("S11 the block refuses ENTRY == CODELEN", False, "built")
+    except ISA.ConfigError as e:
+        check("S11 the block refuses ENTRY == CODELEN",
+              "ENTRY=4" in str(e) and "4 bytes" in str(e), str(e))
+    b = TritonBatch(2, config=CFG(entry=len(ENTRY_PROG)))
+    try:
+        b.set_program(0, ENTRY_PROG)
+        check("S11 batch refuses ENTRY past a row's own program", False, "loaded")
+    except ISA.ConfigError as e:
+        check("S11 batch refuses ENTRY past a row's own program and names both numbers",
+              "ENTRY" in str(e) and f"{len(ENTRY_PROG)} bytes" in str(e), str(e))
+
+    b.set_program(0, image(ENTRY_PROG, length=0x40))
+    b.set_program(1, image(asm("HALT"), length=0x40))
+    check("S11 batch writes the resolved entry into every row's PC",
+          all(int(b.snapshot(i)["PC"]) == len(ENTRY_PROG) for i in (0, 1)),
+          [int(b.snapshot(i)["PC"]) for i in (0, 1)])
+
+    fields = ("status", "cause", "addr", "out", "ticks", "pc", "hl", "r")
+    for p in CAPACITY_PATHS:
+        v1, _ = p.run(p.build(ENTRY_PADDED, config=CFG(entry=ENTRY_E)), limit=16)
+        m2 = p.build(ENTRY_PADDED)
+        _force_pc(m2, p.name, ENTRY_E)
+        v2, _ = p.run(m2, limit=16)
+        check(f"S11 {p.name}: booting at ENTRY {ENTRY_E:#04X} is the hand-padded boot",
+              all(v1[k] == v2[k] for k in fields),
+              f"entry { {k: v1[k] for k in fields} } against forced "
+              f"{ {k: v2[k] for k in fields} }")
+        check(f"S11 {p.name}: the padded boot computes from the entry",
+              v1["out"] == b"\x05" and v1["status"] == 1,
+              f"out {v1['out']!r} status {v1['status']}")
+        v0, _ = p.run(p.build(ENTRY_PADDED), limit=16)
+        check(f"S11 {p.name}: the same image without ENTRY boots at 0",
+              v0["pc"] == 1 and v0["ticks"] == 1 and v0["status"] == 1
+              and v0["out"] == b"",
+              f"pc {v0['pc']} ticks {v0['ticks']} out {v0['out']!r}")
+
+    mid = asm("LDI r0, 3\nloop:\n  SUBI r0, 1\n  JNZ loop\n  OUT r0\n  HALT\n")
+    for p in CAPACITY_PATHS:
+        v1, _ = p.run(p.build(mid, config=CFG(entry=2)), limit=64)
+        m2 = p.build(mid)
+        _force_pc(m2, p.name, 2)
+        v2, _ = p.run(m2, limit=64)
+        check(f"S11 {p.name}: an entry inside the program skips the prefix exactly as "
+              f"the forced boot does",
+              all(v1[k] == v2[k] for k in fields),
+              f"entry { {k: v1[k] for k in fields} } against forced "
+              f"{ {k: v2[k] for k in fields} }")
+
+    import debug as dbg
+    import loader
+    r = loader.assemble(".org 0x20\nstart:\n  LDI r0, 5\n  OUT r0\n  HALT\n",
+                        entry="start")
+    traj = dbg.record(r.image, config=r.config())
+    check("S11 the recording boots at the declared entry",
+          bool(traj.frames) and traj.frames[0]["pc"] == 0x20 and traj.out == b"\x05",
+          f"first PCs {traj.pcs()[:2]} out {traj.out!r}")
+    check("S11 the recording carries the block it ran under",
+          traj.config is not None and traj.config.as_dict().get("entry") == 0x20,
+          repr(None if traj.config is None else traj.config.as_dict()))
+    try:
+        traj.replay()
+        check("S11 a nonzero-entry recording replays to the same frames", True)
+    except dbg.DebugError as e:
+        check("S11 a nonzero-entry recording replays to the same frames", False, str(e))
+    print("    absent, refused, padded-equivalence and replay rows all walked on the "
+          "four paths")
+
+def s12_carried_block():
+
+    print("S12 a block carried as data arrives with the meaning it was written with")
+    from isa_table import MachineConfig, ConfigError
+    plain = MachineConfig(vec={0: 4})
+    carried = MachineConfig.from_dict({"vec": {"0": 4}})
+    check("a vector index stringified by the carrier rebuilds to the same block",
+          carried == plain, f"{carried!r}")
+    for bad in ({"vec": {"0x10": 4}}, {"vec": {"-1": 4}}, {"vec": {"1x": 4}},
+                {"vec": {"16": 4}}):
+        try:
+            MachineConfig.from_dict(bad)
+            check(f"carried vector index {list(bad['vec'])[0]!r} refused", False,
+                  "accepted")
+        except ConfigError:
+            check(f"carried vector index {list(bad['vec'])[0]!r} refused", True)
+    check("a carried block without a vector is untouched",
+          MachineConfig.from_dict({"tdlim": 8}) == MachineConfig(tdlim=8), "")
+
 def main():
     s1_defaults()
     s2_validation()
@@ -799,6 +1076,9 @@ def main():
     s7_capacity()
     s8_defaults_identical()
     s9_pair_census()
+    s10_stack_floor()
+    s11_entry()
+    s12_carried_block()
     print()
     if FAILS:
         print(f"CONFIG BLOCK ACCEPTANCE: {len(FAILS)} FAILURES")

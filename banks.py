@@ -159,8 +159,9 @@ def _per_machine(value, n, default):
         return [default if v is None else v for v in got]
     return [value] * n
 
-TICK_FIELDS = ("r", "HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "ipos", "tick",
-               "status", "fault_reason", "fault_addr", "DATA", "CODE", "out")
+TICK_FIELDS = ("r", "HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "TDEPTH",
+               "ipos", "tick", "status", "fault_reason", "fault_addr",
+               "DATA", "CODE", "out")
 
 _UNCOMPARED_STATE = tuple(n for n in ISA.STATE_FIELD_NAMES if n not in TICK_FIELDS)
 if _UNCOMPARED_STATE:
@@ -198,11 +199,15 @@ CIRCUIT_ROWS = (
      "cause of a tick that breaks the selector bound and the page address bound at once "
      "on the stacking path and on the reference"),
     ("a batch is not a group",
-     "the resident batched path keeps NBANKS at the value it was loaded with whatever its "
-     "row count is, so a bank access names the same cause in a batch of unrelated "
-     "programs as it does alone, and a row reaches only its own page",
-     "one bank program on a batch of each of several row counts, compared with the "
-     "reference's tick of the same program"),
+     "a batch whose rows its declared NBANKS partitions into groups is the reference's "
+     "bank group: row i's bank j and row k's bank j are one page, a write through a "
+     "selector lands in the page the reference names, an owner still RUNNING at the "
+     "tick boundary refuses the write with BANK_BUSY and commits nothing, a selector "
+     "past the declared count refuses with BANK_OOB, and the one-bank batch stays "
+     "today's batch byte for byte",
+     "the group cases on a grouped batch and on BankGroup.from_programs, stepped in "
+     "lockstep one tick at a time and compared per row per tick on every compared "
+     "field, pages byte for byte at the stop"),
     ("a one-bank group is a lone machine",
      "no change: the page a lone machine reaches is its own, so every path already "
      "answers the one-bank case as it answers today's machine",
@@ -396,6 +401,61 @@ class _BatchRow:
     def record_state(self):
         return self.batch.record_state(0)
 
+def _batch_group_case(codes, budget):
+
+    from circuit_triton import TritonBatch
+    grp = BankGroup.from_programs([asm(c) for c in codes], data=_BANK_DATA,
+                                  tick_budget=budget)
+    bat = TritonBatch.from_programs([asm(c) for c in codes], data=_BANK_DATA,
+                                    tick_budget=budget)
+    n = len(codes)
+    bad, named = [], []
+    for t in range(budget + 8):
+        if grp.all_quiescent() and all(bat.record_state(i)["status"] != 0
+                                       for i in range(n)):
+            break
+        grp.step(strict=False)
+        bat.step(1)
+        row_bad = []
+        for i in range(n):
+            want = grp.machine(i).record_state()
+            got = bat.record_state(i)
+            named.append(int(got["fault_reason"]))
+            for f in TICK_FIELDS:
+                if got[f] != want[f]:
+                    row_bad.append(f"row {i} {f}: batch {got[f]!r}, reference "
+                                   f"{want[f]!r}")
+        if row_bad:
+            bad.append(f"tick {t + 1}: " + "; ".join(row_bad))
+    for i in range(n):
+        a, b = bytes(grp.data(i)), bytes(bat.data(i))
+        at = next((k for k in range(len(a)) if a[k] != b[k]), None)
+        if at is not None:
+            bad.append(f"row {i} page byte {at}: batch {b[at]:#x}, reference {a[at]:#x}")
+    return bad, named
+
+_GROUP_WRITER = ("  LDI HL, {bank}\n  MOV MB, HL\n  LDI HL, 64\n  LDI r0, {val:#x}\n"
+                 "  STM [HL], r0\n  HALT")
+
+def batch_group_rows():
+
+    cases = (
+        ("the write lands", (_GROUP_WRITER.format(bank=1, val=0x77), "  HALT")),
+        ("the write is refused busy",
+         (_GROUP_WRITER.format(bank=1, val=0x77), "loop:\n  ADDI r0, 1\n  JMP loop")),
+        ("the selector is out of bounds",
+         (_GROUP_WRITER.format(bank=5, val=0x77), "  HALT")),
+        ("each row writes the page it owns",
+         (_GROUP_WRITER.format(bank=0, val=0x11), _GROUP_WRITER.format(bank=1,
+                                                                       val=0x22))),
+    )
+    bad, causes = [], []
+    for label, codes in cases:
+        case_bad, named = _batch_group_case(codes, budget=32)
+        bad += [f"{label}: {x}" for x in case_bad]
+        causes.append(f"{label} -> {sorted(set(named))}")
+    return bad, causes
+
 def probe_rows(paths=None, notes=(), codes=None):
 
     paths = paths or {}
@@ -488,17 +548,25 @@ def probe_rows(paths=None, notes=(), codes=None):
                         + ("; failed: " + "; ".join(bad) if bad else "; all claims hold"))
             out.append((name, PASS if not bad else DIFFERS, _ascii(evidence), what, how))
         elif name == "a batch is not a group":
-            try:
-                from circuit_triton import TritonBatch
-            except Exception as e:
-                out.append((name, SKIPPED, f"the batched path could not be imported: "
-                                           f"{_ascii(e)}", what, how))
+            if not paths:
+                out.append((name, NOT_RUN,
+                            "no path compared: " + ("; ".join(notes) if notes
+                                                    else "pass --with-paths"),
+                            what, how))
                 continue
-            can = hasattr(TritonBatch, "install_banks")
-            out.append((name, PASS if can else NOT_RUN,
-                        f"TritonBatch {'can' if can else 'cannot'} be given foreign "
-                        f"DATA pages, so its row count is all it knows about banks",
-                        what, how))
+            try:
+                bad, causes = batch_group_rows()
+            except Exception as e:
+                out.append((name, SKIPPED,
+                            f"the grouped batch could not be driven: {_ascii(e)}",
+                            what, how))
+                continue
+            detail = ("; ".join(bad[:3]) if bad
+                      else "every compared component of every tick and both pages "
+                           "of every row agree")
+            evidence = (f"4 group cases x 2 rows, tick by tick against "
+                        f"BankGroup.from_programs: {'; '.join(causes)}; {detail}")
+            out.append((name, DIFFERS if bad else PASS, _ascii(evidence), what, how))
         else:
             lone = NCP8(asm("LDI HL, 8\nLDI r0, 0x5A\nSTM [HL], r0\nHALT"),
                         data=bytes(DATA_SIZE))

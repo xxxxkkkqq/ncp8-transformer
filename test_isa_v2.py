@@ -345,26 +345,27 @@ def test_esc_and_trap():
 
     main = bytes([0x70, 0x70, 0x00, 0x00])
     handler_addr = 0x10
-    handler = bytes([0xD4 | 0, 1, 0x08])
+    handler = bytes([0xD4 | 0, 1, 0x70, 0xA8])
     code = bytearray(main.ljust(handler_addr, b"\x00")) + handler
     g = NCP8(bytes(code), config=vectors((0, handler_addr))); g.r[0] = 41
     drive(g)
     assert g.r[0] == 42 and g.status == "HALT", ("EXT call failed", g.snapshot(), g.trace)
     assert g.SP == 4096, "stack not restored after EXT (return address bookkeeping)"
+    assert g.TDEPTH == 0, ("EXT/TRAPRET ", g.TDEPTH)
 
-    h0 = bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x08])
-    h1 = bytes([0xD4 | 0, 1, 0x08])
+    h0 = bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x70, 0xA8])
+    h1 = bytes([0xD4 | 0, 1, 0x70, 0xA8])
     code2 = bytearray(bytearray(main).ljust(handler_addr, b"\x00")) + h0 + h1
     g = NCP8(bytes(code2), config=vectors((0, handler_addr),
                                           (1, handler_addr + len(h0)))); g.r[0] = 0
     drive(g)
-    assert g.r[0] == 2 and g.SP == 4096, ("EXT nested call", g.r[0], g.SP)
+    assert g.r[0] == 2 and g.SP == 4096 and g.TDEPTH == 0, ("EXT nested call", g.r[0], g.SP)
     print("  escape prefix + user-instruction trap (reserved subcode atomic ERR / unregistered ERR / call-return-nested bookkeeping)")
 
 def test_pc_bookkeeping():
 
     code = bytearray(bytes([0x70, 0x70, 0x00]) + bytes([0xD0 | 3, 0xAB, 0x00]))
-    h = bytes([0xD4 | 0, 1, 0x08])
+    h = bytes([0xD4 | 0, 1, 0x70, 0xA8])
     code = bytearray(bytes(code).ljust(0x10, b"\x00")) + h
     g = NCP8(bytes(code), config=vectors((0, 0x10)))
     drive(g)

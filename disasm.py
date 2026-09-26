@@ -78,6 +78,8 @@ for sub, name in ((0x64, "JS"), (0x65, "JNS"), (0x66, "VS"), (0x67, "VC")):
     ESC[sub] = (f"{name} {{soff}}", 3)
 ESC[0x58] = ("ADD SP, {soff}", 3)
 ESC[0x70] = ("EXT {k}", 3)
+ESC[0xA8] = ("TRAPRET", 2)
+ESC[0xA9] = ("CALL HL", 2)
 for k in range(4):
     ESC[0x80 | k] = (f"STC [HL], {_r(k)}", 2)
     ESC[0x84 | k] = (f"LDC {_r(k)}, [HL]", 2)

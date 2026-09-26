@@ -51,12 +51,14 @@ WIDTHS = {
     "V": (0, 2),
     "fault_reason": (0, 256),
     "fault_addr": (0, 1 << 16),
+
+    "TDEPTH": (0, 256),
 }
 
 FAULT_WRITES = ("status", "fault_reason", "fault_addr")
 
-VIEW_FIELDS = ("r", "HL", "DE", "MB", "SP", "PC", "C", "Z", "S", "V", "ipos", "oplen",
-               "tick", "status", "fault_reason", "fault_addr")
+VIEW_FIELDS = ("r", "HL", "DE", "MB", "SP", "PC", "C", "Z", "S", "V", "TDEPTH",
+               "ipos", "oplen", "tick", "status", "fault_reason", "fault_addr")
 
 _left_out = [n for n in ISA.STATE_FIELD_NAMES if n not in VIEW_FIELDS]
 assert not _left_out, ("the compared view leaves out state rows", _left_out)
@@ -64,7 +66,7 @@ assert not _left_out, ("the compared view leaves out state rows", _left_out)
 def ref_view(g):
 
     view = dict(r=list(g.r), HL=g.HL, DE=g.DE, MB=g.MB, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
-                S=g.S, V=g.V, ipos=g.ipos, oplen=len(g.out), tick=g.tick,
+                S=g.S, V=g.V, TDEPTH=g.TDEPTH, ipos=g.ipos, oplen=len(g.out), tick=g.tick,
                 status=golden_sim.STATUS_CODE[g.status],
                 fault_reason=g.fault_reason, fault_addr=g.fault_addr)
     _check_view_fields(view, "reference")
@@ -320,27 +322,56 @@ def test_d4_state_constructors_reject_illegal_states():
 def test_d4_store_address_stays_inside_its_own_machine():
 
     code = asm("PUSH r0\nHALT")
+    col = 4111 % DATA_SIZE
     b = TritonBatch(2)
     b.set_program(0, code, bytes(8))
     b.set_program(1, code, bytes(8))
     b.STATE[0, 0] = 0x33
     b.STATE[0, 7] = 4112
 
-    col = 4111 % DATA_SIZE
     b.DATA[1, col] = 0xEE
     b.step(1)
+    s0 = b.snapshot(0)
+    assert s0["status"] == 3 and s0["fault_reason"] == ISA.CAUSE["STACK_OVERFLOW"], (
+        "the out-of-span push must be refused before it stores", s0)
     assert b.DATA[1, col].item() == 0xEE, (
         "machine 0 wrote outside its own DATA row", b.DATA[1, col].item())
-    assert b.DATA[0, col].item() == 0x33, (
-        "the masked store did not land inside machine 0", b.DATA[0, col].item())
+    assert b.DATA[0, col].item() == 0, (
+        "the refused push stored anyway", b.DATA[0, col].item())
+    assert b.STATE[0, 7].item() == 4112, (
+        "the error tick moved SP", b.STATE[0, 7].item())
     c = TritonCircuit(code, data=bytes(8))
     c.S[0] = 0x33
     c.S[7] = 4112
     c.step()
-    assert int(c.DATA[col].item()) == 0x33, (
-        "the single-machine store left this machine's DATA")
-    print("  D4 store masking: an out-of-range SP cannot write outside its own row in the"
-          " batch, and cannot leave DATA in the single-machine kernel")
+    assert int(c.S[13].item()) == 3 \
+        and int(c.S[14].item()) == ISA.CAUSE["STACK_OVERFLOW"], (
+        "the single kernel accepted an out-of-span push", int(c.S[13].item()),
+        int(c.S[14].item()))
+    assert int(c.DATA[col].item()) == 0, (
+        "the refused store landed in the single machine's DATA",
+        int(c.DATA[col].item()))
+    t = TorchCircuit(code, data=bytes(8))
+    t.R.fill_(0x33)
+    t.SP.fill_(4112)
+    t.step()
+    assert int(t.status.item()) == 3 \
+        and int(t.fault_reason.item()) == ISA.CAUSE["STACK_OVERFLOW"], (
+        "the tensor circuit accepted an out-of-span push", int(t.status.item()),
+        int(t.fault_reason.item()))
+    assert int(t.DATA[col].item()) == 0, (
+        "the refused store landed in the tensor circuit's DATA",
+        int(t.DATA[col].item()))
+    g = NCP8(code, data=bytes(8))
+    g.r[0] = 0x33
+    g.SP = 4112
+    msg = refuse(g.step)
+    assert msg is not None, "the reference accepted an out-of-span push"
+    assert int(g.data[col]) == 0, (
+        "the refused store landed in the reference's DATA", int(g.data[col]))
+    print("  D4 store containment: an out-of-range SP is refused by the push pre-check"
+          " before any store, so it cannot write its own row, another machine's row,"
+          " or DATA, on all four paths")
 
 def test_d4_store_masks_require_power_of_two_sizes():
 

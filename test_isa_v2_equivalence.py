@@ -230,16 +230,18 @@ main:
 def test_programs(Machine, name):
 
     main = bytes([0x70, 0x70, 0x00, 0xD0 | 3, 0x7E, 0x00])
-    h0 = bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x08])
-    h1 = bytes([0xD4 | 0, 5, 0x08])
+    h0 = bytes([0x70, 0x70, 0x01, 0xD4 | 0, 1, 0x70, 0xA8])
+    h1 = bytes([0xD4 | 0, 5, 0x70, 0xA8])
     code = bytes(bytearray(bytes(main).ljust(0x20, b"\x00")) + h0 + h1)
     table = {0: 0x20, 1: 0x20 + len(h0)}
     n = _lockstep(Machine, "EXT nested", code, config=CFG(vec=table))
     g = NCP8(code, config=CFG(vec=table))
     while g.status == "RUNNING":
         g.step()
-    assert g.r[0] == 6 and g.r[3] == 0x7E and g.SP == 4096 and g.status == "HALT", g.snapshot()
-    print(f"[{name}] EXT trap lockstep {n} ticks (nested call r0=6 / stack restored / HALT)")
+    assert (g.r[0] == 6 and g.r[3] == 0x7E and g.SP == 4096 and g.TDEPTH == 0
+            and g.status == "HALT"), g.snapshot()
+    print(f"[{name}] EXT trap lockstep {n} ticks (nested call r0=6 / stack+depth restored "
+          f"/ HALT)")
 
     prog = """
     LDI r0, 37

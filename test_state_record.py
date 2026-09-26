@@ -720,6 +720,8 @@ def moved_block(block, field):
         moved["vec"][3] = moved["vec"][3] + 1
     elif field == "CODELEN":
         moved["codelen"] = block["codelen"] + 1
+    elif field == "ENTRY":
+        moved["entry"] = block["entry"] + 1
     elif field == "WINLO":
         moved["winlo"], moved["winhi"] = 2, 6
     elif field == "WINHI":
@@ -728,6 +730,9 @@ def moved_block(block, field):
         moved["nbanks"] = block["nbanks"] + 1
     elif field == "TDLIM":
         moved["tdlim"] = block["tdlim"] + 1
+    elif field == "SPLIM":
+        moved["splim"] = (DATA_SIZE - 1 if block["splim"] == DATA_SIZE
+                          else block["splim"] + 1)
     elif field == "TICKBUDGET":
         moved["tickbudget"] = block["tickbudget"] + 1
     elif field == "OUTCAP":

@@ -29,7 +29,8 @@ KIND_EXPECT = {"rl": ("status", "out", "state_delta", "fault_reason"),
                "cpt": ("reassembles_to",)}
 
 COMPARED_FIELDS = tuple(f for f in ("r", "HL", "DE", "MB", "SP", "PC", "C", "Z", "S", "V",
-                                    "ipos", "tick", "status", "fault_reason", "fault_addr")
+                                    "TDEPTH", "ipos", "tick", "status", "fault_reason",
+                                    "fault_addr")
                         if f != "oplen")
 
 CONFIG_KEYS = tuple(ISA.MachineConfig.__slots__)
@@ -170,11 +171,11 @@ def agreement(code, data=None, inputs=b"", budget=64, config=None,
               tensor_device="cpu"):
 
     batch = None
-    kwargs = {}
+
+    cfg = None
     if config:
-        kwargs = {k: v for k, v in config.items() if k in ("codelen", "outcap",
-                                                           "tickbudget")}
-    ref = G.NCP8(code, data=data, inputs=inputs, tick_budget=budget)
+        cfg = ISA.MachineConfig.from_dict(config)
+    ref = G.NCP8(code, data=data, inputs=inputs, tick_budget=budget, config=cfg)
     paths = [("reference", ref, None)]
     try:
         from circuit_torch import TorchCircuit
@@ -183,12 +184,13 @@ def agreement(code, data=None, inputs=b"", budget=64, config=None,
         return None, [f"the circuit paths could not be imported, so four-way agreement "
                       f"did not run: {exc}"]
     paths.append(("torch", TorchCircuit(code, data=data, inputs=inputs, tick_budget=budget,
-                                         device=tensor_device), None))
+                                        device=tensor_device, config=cfg), None))
     paths.append(("triton", TritonCircuit(code, data=data, inputs=inputs,
-                                          tick_budget=budget), None))
+                                          tick_budget=budget, config=cfg), None))
 
     try:
-        batch = TritonBatch(1, tick_budget=budget, max_in=max(1, len(inputs)))
+        batch = TritonBatch(1, tick_budget=budget, max_in=max(1, len(inputs)),
+                            config=cfg)
         batch.set_program(0, code, data, inputs)
     except ValueError as exc:
         return None, [f"the batched path could not be loaded with this record: {exc}"]
@@ -426,7 +428,8 @@ out = {}
 for sp in specs:
     code = bytes.fromhex(sp["code"])
     m = G.NCP8(code, data=bytes.fromhex(sp["initial_data"]) or None,
-               inputs=bytes.fromhex(sp["input"]), tick_budget=sp["budget"])
+               inputs=bytes.fromhex(sp["input"]), tick_budget=sp["budget"],
+               config=G.ISA.MachineConfig.from_dict(sp.get("config")))
     for _ in range(sp["budget"] + %(slack)d):
         if m.status == G.STATUS_RUNNING:
             try:
@@ -441,15 +444,25 @@ for sp in specs:
 open(%(dst)r, "w", encoding="utf-8").write(json.dumps(out))
 """
 
-def reexecute(records, name_of=lambda r: r["text"]):
+def _sample_name(record, index):
+
+    import hashlib
+    material = ":".join((record.get("code", ""), record.get("input", ""),
+                         record.get("initial_data", ""), str(record.get("budget", ""))))
+    return f"{index}:{hashlib.sha256(material.encode()).hexdigest()[:12]}"
+
+def reexecute(records, name_of=None):
 
     import os
     import tempfile
     src = Path(tempfile.gettempdir()) / f"records_src_{os.getpid()}.json"
     dst = Path(tempfile.gettempdir()) / f"records_out_{os.getpid()}.json"
-    payload = [{"name": name_of(r), "code": r["code"],
+    names = [name_of(r) if name_of is not None else _sample_name(r, i)
+             for i, r in enumerate(records)]
+    payload = [{"name": nm, "code": r["code"],
                 "initial_data": r.get("initial_data", ""),
-                "input": r.get("input", ""), "budget": r["budget"]} for r in records]
+                "input": r.get("input", ""), "budget": r["budget"],
+                "config": r.get("config")} for nm, r in zip(names, records)]
     src.write_text(json.dumps(payload), encoding="utf-8")
     script = REEXECUTE % {"tree": str(Path(__file__).resolve().parent),
                           "src": str(src), "dst": str(dst), "slack": DRIVER_SLACK}
@@ -463,7 +476,7 @@ def reexecute(records, name_of=lambda r: r["text"]):
         return {name_of(r): [f"re-execution did not run: {reason}"] for r in records}
     got = json.loads(dst.read_text(encoding="utf-8"))
     problems = {}
-    for r, key in zip(records, [name_of(r) for r in records]):
+    for r, key in zip(records, names):
         if key not in got:
             problems[key] = ["the fresh process reported no result for this record"]
             continue
@@ -485,22 +498,25 @@ def reexecute(records, name_of=lambda r: r["text"]):
                          "tick count cannot be re-checked")
         elif recorded_tick is not None and act["tick"] != recorded_tick:
             diffs.append(f"tick: recorded {recorded_tick}, fresh process {act['tick']}")
-        problems[key] = diffs
+        if diffs:
+            problems[key] = diffs
     for path in (src, dst):
         path.unlink(missing_ok=True)
     return problems
 
-def write_records(path, records, name_of=lambda r: r["text"]):
+def write_records(path, records, name_of=None):
 
     records = list(records)
     problems = []
-    names = [name_of(r) for r in records]
+    names = [name_of(r) if name_of is not None else _sample_name(r, i)
+             for i, r in enumerate(records)]
     for i, (r, key) in enumerate(zip(records, names)):
         for p in schema_problems(r):
             problems.append(f"record {i}: {p}")
         for p in emitter_problems(r, name=key):
             problems.append(f"record {i}: {p}")
-    fresh = reexecute(records, name_of)
+    fresh = reexecute(records, name_of) if name_of is not None \
+        else reexecute(records)
     for key, diffs in fresh.items():
         if diffs:
             problems.append(f"record {key!r} did not reproduce in a fresh process: "

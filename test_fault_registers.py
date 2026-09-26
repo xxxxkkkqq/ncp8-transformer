@@ -59,7 +59,7 @@ def img(head, pc=0, *, vectors=None, window=None, tail_pad=0, length=None):
 def state(**over):
 
     s = dict(r=[1, 2, 3, 4], HL=8, DE=8, PC=0, SP=2048, C=0, Z=0, ipos=0, oplen=0,
-             tick=TICK0, status=0, fault_reason=0, fault_addr=0, MB=0)
+             tick=TICK0, status=0, fault_reason=0, fault_addr=0, MB=0, TDEPTH=0)
     s.update(over)
     return s
 
@@ -145,6 +145,62 @@ def _c_bank_addr_oob(pc):
 def _c_bank_pair_addr_oob(pc):
     return (img(asm("STMW [HL], DE"), pc), state(PC=pc, HL=DATA_SIZE - 1), pc, b"", b"")
 
+def _c_pc_illegal_jmp(pc):
+    return img(asm("JMP 0x0F00"), pc), state(PC=pc), pc, b"", b""
+
+def _c_pc_illegal_call(pc):
+    return img(asm("CALL 0x0F00"), pc), state(PC=pc), pc, b"", b""
+
+def _c_pc_illegal_ret(pc):
+
+    return (img(asm("RET"), pc), state(PC=pc), pc,
+            b"\x00" * 2048 + b"\x0f\x00", b"")
+
+def _c_pc_illegal_jphl(pc):
+    return img(asm("JPHL"), pc), state(PC=pc, HL=0x0F00), pc, b"", b""
+
+def _c_pc_illegal_jz(pc):
+    return img(asm("JZ 0x0F00"), pc), state(PC=pc, Z=1), pc, b"", b""
+
+def _c_pc_illegal_djnz(pc):
+
+    return (img(asm("DJNZ r0, 0x0F00"), pc), state(PC=pc, r=[2, 2, 3, 4]), pc,
+            b"", b"")
+
+def _c_pc_illegal_js(pc):
+
+    return img(asm("JS 4"), pc), state(PC=pc, S=1), pc, b"", b""
+
+def _c_pc_illegal_ext(pc):
+
+    return (img(asm("EXT 0"), pc), state(PC=pc), pc, b"", b"",
+            ISA.MachineConfig(vec={0: 0x0F00}))
+
+def _c_pc_illegal_call_hl(pc):
+
+    return img(asm("CALL HL"), pc), state(PC=pc, HL=0x0F00), pc, b"", b""
+
+def _c_pc_illegal_trapret(pc):
+
+    data = bytearray(DATA_SIZE)
+    data[2048:2052] = b"\x0f\x00\x24\xa5"
+    return img(asm("TRAPRET"), pc), state(PC=pc, TDEPTH=1), pc, bytes(data), b""
+
+def _c_trap_depth(pc):
+
+    return (img(asm("EXT 0"), pc), state(PC=pc, TDEPTH=1), pc, b"", b"",
+            ISA.MachineConfig(vec={0: 0x0F10}, tdlim=1))
+
+def _c_trap_unbalanced(pc):
+
+    return img(asm("TRAPRET"), pc), state(PC=pc), pc, b"", b""
+
+def _c_trap_frame(pc):
+
+    data = bytearray(DATA_SIZE)
+    data[2048:2052] = b"\x0f\x10\x00\x00"
+    return img(asm("TRAPRET"), pc), state(PC=pc, TDEPTH=1), pc, bytes(data), b""
+
 def _p_fetch_before_trap(pc):
 
     return (img(bytes([0x70, 0x70]), pc, length=pc + 2), state(PC=pc), pc, b"", b"")
@@ -220,6 +276,56 @@ def _p_trap_k_before_stack(pc):
 
     return img(bytes([0x70, 0x70, 16]), pc), state(PC=pc, SP=0), pc, b"", b""
 
+def _p_stack_before_pc_target(pc):
+
+    return img(asm("CALL 0x0F00"), pc), state(PC=pc, SP=1), pc, b"", b""
+
+def _p_pop_before_pc_target(pc):
+
+    return (img(asm("RET"), pc), state(PC=pc, SP=DATA_SIZE - 1), pc,
+            b"\x00" * (DATA_SIZE - 1) + b"\x0f", b"")
+
+def _p_trap_k_before_pc_target(pc):
+
+    return (img(bytes([0x70, 0x70, 16]), pc), state(PC=pc), pc, b"", b"",
+            ISA.MachineConfig(vec={15: 0x0F00}))
+
+def _p_fetch_before_pc_target(pc):
+
+    return (img(bytes([0x09, 0x40]), pc, length=pc + 2), state(PC=pc), pc, b"", b"")
+
+def _p_trap_unreg_before_depth(pc):
+
+    return (img(asm("EXT 0"), pc), state(PC=pc), pc, b"", b"",
+            ISA.MachineConfig(tdlim=0))
+
+def _p_depth_before_stack(pc):
+
+    return (img(asm("EXT 0"), pc), state(PC=pc, SP=1), pc, b"", b"",
+            ISA.MachineConfig(vec={0: 0x0F10}, tdlim=0))
+
+def _p_depth_before_pc_target(pc):
+
+    return (img(asm("EXT 0"), pc), state(PC=pc), pc, b"", b"",
+            ISA.MachineConfig(vec={0: 0x0F00}, tdlim=0))
+
+def _p_unbalanced_before_underflow(pc):
+
+    return (img(asm("TRAPRET"), pc), state(PC=pc, SP=DATA_SIZE - 3), pc, b"", b"")
+
+def _p_underflow_before_frame(pc):
+
+    data = bytearray(DATA_SIZE)
+    data[DATA_SIZE - 1] = 0xA5
+    return (img(asm("TRAPRET"), pc), state(PC=pc, TDEPTH=1, SP=DATA_SIZE - 3), pc,
+            bytes(data), b"")
+
+def _p_frame_before_pc_target(pc):
+
+    data = bytearray(DATA_SIZE)
+    data[2048:2052] = b"\x0f\x00\x00\x00"
+    return img(asm("TRAPRET"), pc), state(PC=pc, TDEPTH=1), pc, bytes(data), b""
+
 CASES = (
     ("OK", "NOP commits a tick and names no cause", _c_ok),
     ("BAD_OPCODE", "unassigned single-byte opcode 0x71", _c_bad_opcode),
@@ -250,6 +356,24 @@ CASES = (
      _c_bank_addr_oob),
     ("DATA_OOB", "STMW [HL], DE whose second byte leaves the page it holds",
      _c_bank_pair_addr_oob),
+    ("PC_ILLEGAL", "JMP to the first address past the image", _c_pc_illegal_jmp),
+    ("PC_ILLEGAL", "CALL whose target is past the image", _c_pc_illegal_call),
+    ("PC_ILLEGAL", "RET to a return address past the image", _c_pc_illegal_ret),
+    ("PC_ILLEGAL", "JPHL with HL past the image", _c_pc_illegal_jphl),
+    ("PC_ILLEGAL", "JZ taken past the image", _c_pc_illegal_jz),
+    ("PC_ILLEGAL", "DJNZ taken past the image", _c_pc_illegal_djnz),
+    ("PC_ILLEGAL", "JS taken past the image's end", _c_pc_illegal_js),
+    ("PC_ILLEGAL", "EXT dispatching to a registered handler past the image",
+     _c_pc_illegal_ext),
+    ("PC_ILLEGAL", "CALL HL whose target register is past the image",
+     _c_pc_illegal_call_hl),
+    ("PC_ILLEGAL", "TRAPRET restoring a return address past the image",
+     _c_pc_illegal_trapret),
+    ("TRAP_DEPTH", "EXT 0 with the depth counter at TDLIM (one trap in flight)",
+     _c_trap_depth),
+    ("TRAP_UNBALANCED", "TRAPRET with no trap in flight", _c_trap_unbalanced),
+    ("TRAP_FRAME", "TRAPRET over the stale bytes a CALL-style RET left",
+     _c_trap_frame),
 )
 
 PAIRS = (
@@ -268,6 +392,26 @@ PAIRS = (
      "DATA_OOB", "OUT_CAP"),
     ("selector past the page count + address outside the page", _p_bank_oob_before_data_oob,
      "BANK_OOB", "DATA_OOB"),
+    ("no room to push + target past the image", _p_stack_before_pc_target,
+     "STACK_OVERFLOW", "PC_ILLEGAL"),
+    ("nothing stored to pop + target past the image", _p_pop_before_pc_target,
+     "STACK_UNDERFLOW", "PC_ILLEGAL"),
+    ("handler past the vector table + target past the image",
+     _p_trap_k_before_pc_target, "TRAP_UNREG", "PC_ILLEGAL"),
+    ("unfetchable operand + target past the image", _p_fetch_before_pc_target,
+     "FETCH_OOB", "PC_ILLEGAL"),
+    ("no vector registered + depth counter full", _p_trap_unreg_before_depth,
+     "TRAP_UNREG", "TRAP_DEPTH"),
+    ("depth counter full + no room to push the frame", _p_depth_before_stack,
+     "TRAP_DEPTH", "STACK_OVERFLOW"),
+    ("depth counter full + handler past the image", _p_depth_before_pc_target,
+     "TRAP_DEPTH", "PC_ILLEGAL"),
+    ("no trap in flight + nothing stored to pop", _p_unbalanced_before_underflow,
+     "TRAP_UNBALANCED", "STACK_UNDERFLOW"),
+    ("nothing stored to pop + a plausible stale tag", _p_underflow_before_frame,
+     "STACK_UNDERFLOW", "TRAP_FRAME"),
+    ("stale tag + target past the image", _p_frame_before_pc_target,
+     "TRAP_FRAME", "PC_ILLEGAL"),
 )
 
 UNPROVOKABLE_PAIRS = (
@@ -276,33 +420,20 @@ UNPROVOKABLE_PAIRS = (
 )
 
 ABSENT_PROOFS = {
-    "TRAP_DEPTH": ("no TDEPTH state exists to compare against TDLIM",
-                   lambda: not hasattr(NCP8(bytes(2)), "TDEPTH")),
-    "TRAP_FRAME": ("TRAPRET is not an assigned code point",
-                   lambda: 0xA8 not in ISA.ESCAPE),
-    "TRAP_UNBALANCED": ("TRAPRET is not an assigned code point",
-                        lambda: 0xA8 not in ISA.ESCAPE),
     "BANK_BUSY": ("a circuit path holds one page, its own, so its bank access has no "
                   "foreign owner to wait for; the reference names the cause as soon as a "
                   "group driver hands it a second page",
                   lambda: _bank_busy_absent()),
-    "PC_ILLEGAL": ("a jump past the image faults on the *next* fetch, not the write",
-                   lambda: _bad_target_faults_late()),
 }
 
-def _bad_target_faults_late():
+def _install(machine, st, code, data, inputs, budget, cfg=None):
 
-    g = NCP8(asm("JMP 0x0F00\nHALT"))
-    g.step()
-    return g.PC == 0x0F00 and g.status == "RUNNING"
-
-def _install(machine, st, code, data, inputs, budget):
-
-    m = machine(code, data=data, inputs=inputs, tick_budget=budget)
+    m = machine(code, data=data, inputs=inputs, tick_budget=budget, config=cfg)
     m.load_state(st["r"], st["HL"], st["DE"], st["SP"], st["C"], st["Z"], st["tick"],
-                 PC=st["PC"])
+                 PC=st["PC"], S=st.get("S"), V=st.get("V"))
     _set_ipos(m, st["ipos"])
     _set_mb(m, st["MB"])
+    _set_tdepth(m, st.get("TDEPTH", 0))
     return m
 
 def _set_mb(m, n):
@@ -327,9 +458,21 @@ def _set_ipos(m, n):
     else:
         m.S[10] = n
 
+def _set_tdepth(m, n):
+
+    if not n:
+        return
+    if isinstance(m, NCP8):
+        m.TDEPTH = n
+    elif isinstance(m, TorchCircuit):
+        m.TDEPTH = torch.tensor([n], dtype=torch.int32, device=m.dev)
+    else:
+        m.S[int(circuit_triton.S_TDEPTH)] = n
+
 def run_reference(case, pc):
-    code, st, addr, data, inputs = case(pc)
-    g = _install(NCP8, st, code, data, inputs, 200_000)
+    code, st, addr, data, inputs, *rest = case(pc)
+    cfg = rest[0] if rest else None
+    g = _install(NCP8, st, code, data, inputs, 200_000, cfg)
     if st["oplen"]:
         g.out = bytearray(st["oplen"])
     raised = False
@@ -346,8 +489,9 @@ def run_triton(case, pc):
     return _run_circuit(TritonCircuit, case, pc)
 
 def _run_circuit(Machine, case, pc):
-    code, st, addr, data, inputs = case(pc)
-    c = _install(Machine, st, code, data, inputs, 200_000)
+    code, st, addr, data, inputs, *rest = case(pc)
+    cfg = rest[0] if rest else None
+    c = _install(Machine, st, code, data, inputs, 200_000, cfg)
     if st["oplen"]:
         _set_oplen(c, st["oplen"])
     c.step()
@@ -361,12 +505,14 @@ def _set_oplen(c, n):
 
 def run_batch(case, pc):
 
-    code, st, addr, data, inputs = case(pc)
-    b = TritonBatch(1, max_in=max(1, len(inputs)))
+    code, st, addr, data, inputs, *rest = case(pc)
+    cfg = rest[0] if rest else None
+    b = TritonBatch(1, max_in=max(1, len(inputs)), config=cfg)
     b.set_program(0, code, data or b"", inputs or b"")
     b.set_state(0, r=st["r"], HL=st["HL"], DE=st["DE"], PC=st["PC"], SP=st["SP"],
-                C=st["C"], Z=st["Z"], ipos=st["ipos"], oplen=st["oplen"],
-                tick=st["tick"], MB=st["MB"])
+                C=st["C"], Z=st["Z"], S=st.get("S", 0), V=st.get("V", 0),
+                ipos=st["ipos"], oplen=st["oplen"],
+                tick=st["tick"], MB=st["MB"], TDEPTH=st.get("TDEPTH", 0))
     b.step(1)
     snap = b.snapshot(0)
     return snap["status"] == 3, snap, b.out(0)
@@ -522,6 +668,17 @@ def test_c3_at_most_one_cause_per_tick():
         "the trap-vector cause must outrank the stack bound, as golden_sim checks them")
     assert ISA.SITE_RANK["BAD_SUBCODE"] < ISA.SITE_RANK["FETCH_OPERAND"], (
         "decode refusal must outrank the operand bound that follows it")
+    assert ISA.SITE_RANK["PC_ILLEGAL"] < ISA.SITE_RANK["FETCH_CODE"], (
+        "the branch-target write is judged on its own tick, before the fetch that "
+        "would follow the committed PC")
+    assert (ISA.SITE_RANK["TRAP_UNREG"] < ISA.SITE_RANK["TRAP_DEPTH"]
+            < ISA.SITE_RANK["STACK_PUSH"]), (
+        "the EXT chain tests the vector, then the depth counter, then the four-slot "
+        "frame push room, in that order")
+    assert (ISA.SITE_RANK["TRAP_UNBALANCED"] < ISA.SITE_RANK["STACK_POP"]
+            < ISA.SITE_RANK["TRAP_FRAME"]), (
+        "the TRAPRET chain tests the depth counter, then the four-slot pop room, "
+        "then the frame tag, in that order")
     for what, why in UNPROVOKABLE_PAIRS:
         print(f"    not provokable on this machine: {what} -- {why}")
     print(f"  C3 precedence: {len(builders)} ordering pairs provoked at "
@@ -602,6 +759,219 @@ def test_c6_reference_records_the_error_status_it_raises_for():
     print("  C6 the faulting tick raises *and* records status 3 with its cause; later "
           "steps are the sticky no-op")
 
+def test_c7_pc_illegal_commits_nothing():
+
+    cases = [(how, build) for cause, how, build in CASES if cause == "PC_ILLEGAL"]
+    ticks = 0
+    for how, build in cases:
+        for pc in PC_SITES:
+            code, st, addr, data, inputs, *rest = build(pc)
+            cfg = rest[0] if rest else None
+            want_data = bytes(data).ljust(DATA_SIZE, b"\x00")
+            for who, runner in (("reference", _c7_reference), ("torch", _c7_torch),
+                                ("triton", _c7_triton), ("batch", _c7_batch)):
+                raised, view, out, data_got = runner(build, pc)
+                assert raised, (how, pc, who, "the jump tick did not fault")
+                assert view["fault_reason"] == CAUSE["PC_ILLEGAL"], (
+                    how, pc, who, "named", _cause_text(view["fault_reason"]))
+                assert view["fault_addr"] == pc, (how, pc, who, view)
+                assert view["tick"] == st["tick"], (
+                    how, pc, who, "the faulting tick did not keep its number", view)
+                assert view["PC"] == st["PC"], (
+                    how, pc, who, "PC did not keep its pre-tick value", view)
+                for k in ("r", "HL", "DE", "SP", "MB"):
+                    assert view[k] == st[k], (how, pc, who, k, "moved", view[k])
+                assert view["ipos"] == st["ipos"], (how, pc, who, "ipos moved", view)
+                assert out == b"", (how, pc, who, "the error tick emitted", out)
+                assert data_got == want_data, (
+                    how, pc, who, "the error tick wrote DATA (a return address?)")
+                ticks += 1
+    print(f"  C7 branch-target bound: {len(cases)} PC-writing forms x {len(PC_SITES)} "
+          f"addresses on all four paths ({ticks} runs): the jump's own tick stops "
+          f"with PC_ILLEGAL, fault_addr names the jump, and nothing commits")
+    return ticks
+
+def _c7_reference(build, pc):
+    code, st, addr, data, inputs, *rest = build(pc)
+    cfg = rest[0] if rest else None
+    g = _install(NCP8, st, code, data, inputs, 200_000, cfg)
+    raised = False
+    try:
+        g.step()
+    except MachineError:
+        raised = True
+    return raised, ref_view(g), bytes(g.out), bytes(g.data)
+
+def _c7_torch(build, pc):
+    code, st, addr, data, inputs, *rest = build(pc)
+    cfg = rest[0] if rest else None
+    c = _install(TorchCircuit, st, code, data, inputs, 200_000, cfg)
+    c.step()
+    return (c.snapshot()["status"] == 3, c.snapshot(), c.out(),
+            bytes(c.DATA.cpu().tolist()))
+
+def _c7_triton(build, pc):
+    code, st, addr, data, inputs, *rest = build(pc)
+    cfg = rest[0] if rest else None
+    c = _install(TritonCircuit, st, code, data, inputs, 200_000, cfg)
+    c.step()
+    return (c.snapshot()["status"] == 3, c.snapshot(), c.out(),
+            bytes(c.DATA.cpu().tolist()))
+
+def _c7_batch(build, pc):
+    code, st, addr, data, inputs, *rest = build(pc)
+    cfg = rest[0] if rest else None
+    b = TritonBatch(1, max_in=max(1, len(inputs)), config=cfg)
+    b.set_program(0, code, data or b"", inputs or b"")
+    b.set_state(0, r=st["r"], HL=st["HL"], DE=st["DE"], PC=st["PC"], SP=st["SP"],
+                C=st["C"], Z=st["Z"], S=st.get("S", 0), V=st.get("V", 0),
+                ipos=st["ipos"], oplen=st["oplen"], tick=st["tick"], MB=st["MB"],
+                TDEPTH=st.get("TDEPTH", 0))
+    b.step(1)
+    snap = b.snapshot(0)
+    return snap["status"] == 3, snap, b.out(0), bytes(b.DATA[0].cpu().tolist())
+
+SP0 = 2048
+FRAME_FLAGS_SLOT = SP0 - 2
+
+def _drive_all(build, budget=64):
+
+    code, st, addr, data, inputs, *rest = build(0)
+    cfg = rest[0] if rest else None
+    got = {}
+    for who, runner in _DRIVERS.items():
+        got[who] = runner(code, st, bytes(data), inputs, cfg, budget)
+    head = got["reference"]
+    for who, (view, out, datab) in got.items():
+        for k in VIEW_FIELDS:
+            if k == "tick" or k == "tick":
+                continue
+
+        for k in head[0]:
+            assert view[k] == head[0][k], (who, k, view[k], head[0][k])
+        assert out == head[1], (who, "output stream", out, head[1])
+        assert datab == head[2], (who, "DATA image diverged")
+    return head
+
+def _driver_reference(code, st, data, inputs, cfg, budget):
+    m = NCP8(code, data=data or None, inputs=inputs, tick_budget=budget, config=cfg)
+    m.load_state(st["r"], st["HL"], st["DE"], st["SP"], st["C"], st["Z"], st["tick"],
+                 PC=st["PC"], S=st.get("S"), V=st.get("V"))
+    _set_tdepth(m, st.get("TDEPTH", 0))
+    try:
+        while m.status == "RUNNING":
+            m.step()
+    except MachineError:
+        pass
+    return (ref_view(m), bytes(m.out), bytes(m.data))
+
+def _driver_torch(code, st, data, inputs, cfg, budget):
+    c = TorchCircuit(code, data=data or None, inputs=inputs, tick_budget=budget,
+                     config=cfg)
+    c.load_state(st["r"], st["HL"], st["DE"], st["SP"], st["C"], st["Z"], st["tick"],
+                 PC=st["PC"], S=st.get("S"), V=st.get("V"))
+    _set_tdepth(c, st.get("TDEPTH", 0))
+    while int(c.status.item()) == 0:
+        c.step()
+    snap = c.snapshot()
+    return (snap, c.out(), bytes(int(v) for v in c.DATA.cpu().tolist()))
+
+def _driver_triton(code, st, data, inputs, cfg, budget):
+    c = TritonCircuit(code, data=data or None, inputs=inputs, tick_budget=budget,
+                      config=cfg)
+    c.load_state(st["r"], st["HL"], st["DE"], st["SP"], st["C"], st["Z"], st["tick"],
+                 PC=st["PC"], S=st.get("S"), V=st.get("V"))
+    _set_tdepth(c, st.get("TDEPTH", 0))
+    while int(c.status.item()) == 0:
+        c.step()
+    snap = c.snapshot()
+    return (snap, c.out(), bytes(int(v) for v in c.DATA.cpu().tolist()))
+
+def _driver_batch(code, st, data, inputs, cfg, budget):
+    b = TritonBatch(1, max_in=max(1, len(inputs)), config=cfg, tick_budget=budget)
+    b.set_program(0, code, data or b"", inputs or b"")
+    b.set_state(0, r=st["r"], HL=st["HL"], DE=st["DE"], PC=st["PC"], SP=st["SP"],
+                C=st["C"], Z=st["Z"], S=st.get("S", 0), V=st.get("V", 0),
+                ipos=st["ipos"], oplen=st["oplen"], tick=st["tick"], MB=st["MB"],
+                TDEPTH=st.get("TDEPTH", 0))
+    b.run()
+    snap = b.snapshot(0)
+    return (snap, b.out(0), bytes(int(v) for v in b.DATA[0].cpu().tolist()))
+
+_DRIVERS = {"reference": _driver_reference, "torch": _driver_torch,
+            "triton": _driver_triton, "batch": _driver_batch}
+
+def test_c8_trap_protocol_end_to_end():
+
+    prog = asm("LDI r2, 0x80\nADD r2, r2\nEXT 0\nGETF r1\nOUT r1\nHALT")
+    handler = asm(f"LDI HL, {FRAME_FLAGS_SLOT}\nLDI r0, 0\nMOV [HL], r0\nTRAPRET")
+    for fb in range(16):
+        h = handler.replace(asm("LDI r0, 0"), bytes([0xD0 | 0, fb]))
+        code = bytearray(prog.ljust(0x10, b"\x00")) + h
+        cfg = ISA.MachineConfig(vec={0: 0x10})
+
+        def build(_pc, code=code, cfg=cfg):
+            return img(bytes(code), 0), state(), 0, b"", b"", cfg
+
+        view, out, _data = _drive_all(build)
+        assert view["status"] == 1 and out == bytes([fb]), (fb, view, out)
+        assert view["SP"] == SP0 and view["TDEPTH"] == 0, (fb, view)
+        assert (view["Z"], view["C"], view["S"], view["V"]) == (
+            fb & 1, (fb >> 1) & 1, (fb >> 2) & 1, (fb >> 3) & 1), (fb, view)
+    print(f"  C8a frame round trip: 16 flag bytes stored by the handler, restored "
+          f"exactly, on all four paths")
+
+    prog = asm("EXT 0\nLDI r1, 0x77\nOUT r1\nHALT")
+    code = bytearray(prog.ljust(0x10, b"\x00")) + asm("EXT 0")
+    cfg = ISA.MachineConfig(vec={0: 0x10}, tdlim=2)
+
+    def build(_pc, code=code, cfg=cfg):
+        return img(bytes(code), 0), state(), 0, b"", b"", cfg
+
+    view, out, data = _drive_all(build)
+    assert view["status"] == 3 and view["fault_reason"] == CAUSE["TRAP_DEPTH"], view
+    assert view["fault_addr"] == 0x10 and view["tick"] == TICK0 + 2, view
+    assert view["SP"] == SP0 - 8 and view["TDEPTH"] == 2, view
+    assert view["r"] == [1, 2, 3, 4] and out == b"", view
+    assert data[SP0 - 12:SP0 - 8] == bytes(4), "the refused tick pushed"
+    assert data[SP0 - 8:SP0] != bytes(8), "the two frames are gone"
+    print("  C8b depth runaway: the third EXT of a self-re-entering handler names "
+          "TRAP_DEPTH, two frames intact, nothing pushed")
+
+    prog = asm("LDI HL, 0x0010\nCALL HL\nHALT")
+    code = bytearray(prog.ljust(0x10, b"\x00")) + asm("HALT")
+
+    def build(_pc, code=code):
+        return img(bytes(code), 0), state(), 0, b"", b""
+
+    view, out, data = _drive_all(build)
+    assert view["status"] == 1 and view["SP"] == SP0 - 2, view
+    assert data[SP0 - 2:SP0] == bytes([0x00, 0x05]), \
+        "the return address is not high-byte-on-top at SP"
+    code = bytearray(asm("LDI HL, 0x0010\nCALL HL\nLDI r1, 0x11\nOUT r1\nHALT")
+                     .ljust(0x10, b"\x00")) + asm("LDI r0, 0x22\nOUT r0\nRET")
+
+    def build2(_pc, code=code):
+        return img(bytes(code), 0), state(), 0, b"", b""
+
+    view, out, _data = _drive_all(build2)
+    assert view["status"] == 1 and out == bytes([0x22, 0x11]), (view, out)
+    assert view["SP"] == SP0 and view["TDEPTH"] == 0, view
+    print("  C8c CALL HL: pushes high-on-top, jumps through HL, RET round-trips")
+
+    prog = asm("LDI HL, 0x0FE0\nMOVW SP, HL\nEXT 0\nTRAPRET\nHALT")
+    code = bytearray(prog.ljust(0x10, b"\x00")) + asm("LDI r1, 9\nRET")
+    cfg = ISA.MachineConfig(vec={0: 0x10})
+
+    def build(_pc, code=code, cfg=cfg):
+        return img(bytes(code), 0), state(), 0, b"", b"", cfg
+
+    view, out, _data = _drive_all(build)
+    assert view["status"] == 3 and view["fault_reason"] == CAUSE["TRAP_FRAME"], view
+    assert view["fault_addr"] == 8 and view["TDEPTH"] == 1, view
+    print("  C8d the 7.3 leak: a handler left by RET is caught by the enclosing "
+          "TRAPRET as TRAP_FRAME")
+
 CHECKS = (
     test_c1_cause_table_is_covered_exhaustively,
     test_c2_bijection_holds_on_every_tick_of_every_case,
@@ -609,6 +979,8 @@ CHECKS = (
     test_c4_absent_causes_are_absent_for_a_reason,
     test_c5_the_new_fields_join_the_width_sweep,
     test_c6_reference_records_the_error_status_it_raises_for,
+    test_c7_pc_illegal_commits_nothing,
+    test_c8_trap_protocol_end_to_end,
 )
 
 def run_all():

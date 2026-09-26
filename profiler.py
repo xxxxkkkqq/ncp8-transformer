@@ -174,9 +174,6 @@ def run(code, *, data=None, inputs=b"", tick_budget=ISA.TICK_BUDGET_DEFAULT,
 
 def run_result(result, **kw):
 
-    _require(result.entry in (0, None),
-             f"this image declares entry 0x{result.entry:04X} but the reference boots at "
-             f"PC 0; jump to the entry in the program or profile it with run(image)")
     config = kw.pop("config", None)
     return run(bytes(result.image), config=result.config() if config is None else config,
                **kw)

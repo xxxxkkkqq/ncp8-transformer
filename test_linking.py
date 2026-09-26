@@ -243,8 +243,8 @@ def symmetry_row():
 
 def entry_row():
 
-    units = [".org 0x0000\nmain:\n  JMP helper\n  HALT\n",
-             ".org 0x100\nhelper:\n  LDI r0, 9\n  RET\n"]
+    units = [".org 0x0000\nmain:\n  LDI r0, 1\n  OUT r0\n  HALT\n",
+             ".org 0x100\nhelper:\n  LDI r0, 9\n  OUT r0\n  HALT\n"]
     linked = loader.link(units, image=0x200, entry="helper")
     if linked.entry != 0x100:
         return False, f"entry is 0x{linked.entry:04X}, `helper` is placed at 0x0100"
@@ -253,6 +253,14 @@ def entry_row():
     hand = loader.assemble(units[0] + units[1], image=0x200, entry="helper")
     if bytes(linked.image) != bytes(hand.image):
         return False, "the program with a cross-unit entry differs from the hand-placed one"
+    ran = run_once(linked)
+    if ran[2] != b"\x09" or ran[0] != "HALT":
+        return False, (f"the linked image booted at its entry ends {ran[0]} emitting "
+                       f"{ran[2]!r}, not the helper's 9")
+    ran0 = run_once(loader.link(units, image=0x200))
+    if ran0[2] != b"\x01" or ran0[0] != "HALT":
+        return False, (f"the same image without the entry boots at 0 and ends "
+                       f"{ran0[0]} emitting {ran0[2]!r}, not main's 1")
     return True, ""
 
 def symbols_row():

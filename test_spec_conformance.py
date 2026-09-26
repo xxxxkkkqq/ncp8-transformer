@@ -56,9 +56,17 @@ def case(space, code, row, pc):
     data = bytearray(CT.DATA_SIZE)
     if row["alu"] == "JPHL":
         HL = end
+    if row["alu"] == "CALL_HL":
+        HL = end
     if row["alu"] == "RET":
         data[SP] = end >> 8
         data[SP + 1] = end & 0xFF
+    if row["alu"] == "TRAPRET":
+
+        data[SP] = end >> 8
+        data[SP + 1] = end & 0xFF
+        data[SP + 2] = 0x00
+        data[SP + 3] = ISA.TRAP_TAG
     return bytes(img), R, HL, DE, SP, data, cfg
 
 def step(space, code, row, pc):
@@ -66,6 +74,8 @@ def step(space, code, row, pc):
     img, R, HL, DE, SP, data, cfg = case(space, code, row, pc)
     g = NCP8(img, data=data, config=cfg)
     g.load_state(R, HL, DE, SP, 0, 0, 0, PC=pc)
+    if row["alu"] == "TRAPRET":
+        g.TDEPTH = 1
     g.step()
     return g
 
@@ -243,6 +253,8 @@ def test_golden_register_field_matches_table():
             img, R, HL, DE, SP, data, cfg = case(space, code, row, pc)
             g = NCP8(img, data=data, config=cfg)
             g.load_state(R, HL, DE, SP, 0, 0, 0, PC=pc)
+            if row["alu"] == "TRAPRET":
+                g.TDEPTH = 1
             g.step()
             changed = [i for i in range(4) if g.r[i] != R[i]]
             assert set(changed) <= {row["s0"]}, (
@@ -329,6 +341,7 @@ _ENCODE = {
     "XCHG": "XCHG HL, DE",
     "HALT": "HALT", "NOP": "NOP", "INC_HL": "INC HL", "DEC_HL": "DEC HL",
     "INC_DE": "INC DE", "CLC": "CLC", "OUTM": "OUTM", "OUTDE": "OUTDE", "RET": "RET",
+    "TRAPRET": "TRAPRET", "CALL_HL": "CALL HL",
     "JPHL": "JPHL", "GETPC": "GETPC r2", "GETSP": "GETSP r2", "GETF": "GETF r2",
     "AND": "AND r1, r2", "OR": "OR r1, r2", "XOR": "XOR r1, r2", "MUL": "MUL r1, r2",
     "ADD": "ADD r1, r2", "SUB": "SUB r1, r2", "ADC": "ADC r1, r2", "SBB": "SBB r1, r2",

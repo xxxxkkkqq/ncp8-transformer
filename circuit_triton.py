@@ -66,7 +66,10 @@ S_FAULT_ADDR = tl.constexpr(15)
 S_MB = tl.constexpr(16)
 S_SIGN = tl.constexpr(17)
 S_OVFL = tl.constexpr(18)
-STATE_ROWS = 19
+S_SPLIM = tl.constexpr(19)
+
+S_TDEPTH = tl.constexpr(20)
+STATE_ROWS = 21
 STATE_ROWS_C = tl.constexpr(STATE_ROWS)
 
 BANK_PAGES = 1
@@ -77,6 +80,8 @@ F_PACK_Z = tl.constexpr(ISA.FLAG_BITS_PACKED["Z"])
 F_PACK_C = tl.constexpr(ISA.FLAG_BITS_PACKED["C"])
 F_PACK_S = tl.constexpr(ISA.FLAG_BITS_PACKED["S"])
 F_PACK_V = tl.constexpr(ISA.FLAG_BITS_PACKED["V"])
+
+TRAP_TAG = tl.constexpr(ISA.TRAP_TAG)
 
 CFG_VEC_COUNT = tl.constexpr(ISA.VEC_COUNT)
 CFG_LEN = ISA.VEC_COUNT + 2
@@ -172,14 +177,14 @@ for _name, _size in (("CODE_SIZE", CODE_SIZE), ("DATA_SIZE", DATA_SIZE),
 CODE_MASK = tl.constexpr(CODE_SIZE - 1)
 
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
-                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, where=""):
+                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, td=0, where=""):
 
     if not 0 <= oplen <= OUT_CAP:
         raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
     bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "MB": mb, "PC": PC,
                            "SP": SP, "C": C, "Z": Z, "S": s, "V": v, "ipos": ipos, "tick": tick,
                            "status": status, "fault_reason": fault_reason,
-                           "fault_addr": fault_addr},
+                           "fault_addr": fault_addr, "TDEPTH": td},
                           where)
     if bad is not None:
         raise ValueError(bad)
@@ -187,7 +192,7 @@ def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
 STATE_ROW_OF = {"r": (0, 1, 2, 3), "HL": 4, "DE": 5, "PC": 6, "SP": 7, "C": 8, "Z": 9,
                 "S": int(S_SIGN), "V": int(S_OVFL),
                 "ipos": 10, "tick": 12, "status": 13, "fault_reason": 14,
-                "fault_addr": 15, "MB": int(S_MB)}
+                "fault_addr": 15, "MB": int(S_MB), "TDEPTH": int(S_TDEPTH)}
 STATE_ROW_OPLEN = 11
 if set(STATE_ROW_OF) != set(ISA.STATE_FIELD_NAMES):
     raise ISA.DecodeTableError(
@@ -196,7 +201,7 @@ if set(STATE_ROW_OF) != set(ISA.STATE_FIELD_NAMES):
         f"other, so a record taken on this path would be incomplete")
 _ROWS_NAMED = sorted({row for at in STATE_ROW_OF.values()
                       for row in (at if isinstance(at, tuple) else (at,))}
-                     | {STATE_ROW_OPLEN})
+                     | {STATE_ROW_OPLEN, int(S_SPLIM)})
 if _ROWS_NAMED != list(range(STATE_ROWS)):
     raise ISA.DecodeTableError(
         f"the state row layout names rows {_ROWS_NAMED} while a row of this machine is "
@@ -276,8 +281,10 @@ class _Row:
         cfg = self.b.config
         lo, hi = cfg.window()
         return ISA.MachineConfig(codelen=int(self.b.CODELENS[self.i].item()),
+                                 entry=self.b.entry,
                                  winlo=lo, winhi=hi, vec=cfg.vectors(),
                                  nbanks=self.b.nbanks, tdlim=self.b.tdlim,
+                                 splim=self.b.splim,
                                  tickbudget=int(self.b.BUDGETS[self.i].item()),
                                  outcap=self.b.out_cap)
 
@@ -337,6 +344,10 @@ def _dec_esc(sub):
         eop = ESC_MULH; d = (sub >> 2) & 3; s = sub & 3; lx = 0
     elif sub >= 0xB0 and sub <= 0xB7:
         eop = ESC_LDM + ((sub >> 2) & 1); d = sub & 3; s = sub & 3; lx = 0
+    elif sub == 0xA8:
+        eop = ESC_TRAPRET; d = 0; s = 0; lx = 0
+    elif sub == 0xA9:
+        eop = ESC_CALL_HL; d = 0; s = 0; lx = 0
     elif sub >= 0xB8 and sub <= 0xBD:
         eop = ESC_LDMW_DE_HL + (sub - 0xB8); d = 0; s = 0; lx = 0
     else:
@@ -358,16 +369,19 @@ def _name_cause(errc, code):
     return errc
 
 @triton.jit
-def _bank_refusal(MB, NB):
+def _bank_refusal(MB, NB, HELD, OWN, OST):
 
-    if (MB >= NB) or (MB >= BANK_PAGES_C):
+    if MB >= NB:
         return F_BANK_OOB
-    if MB != BANK_OWN_C:
+    if MB >= HELD:
+        return F_BANK_OOB
+    if (MB != OWN) & (OST == 0):
         return F_BANK_BUSY
     return 0
 
 @triton.jit
-def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
+def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
+          TDLIM, BSTAT, PID, HELD):
 
     r0 = tl.load(S + 0); r1 = tl.load(S + 1); r2 = tl.load(S + 2); r3 = tl.load(S + 3)
     HL = tl.load(S + 4); DE = tl.load(S + 5); PC = tl.load(S + 6); SP = tl.load(S + 7)
@@ -375,9 +389,17 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
     MB = tl.load(S + S_MB)
     SGN = tl.load(S + S_SIGN); OVF = tl.load(S + S_OVFL)
 
+    SPLIM = tl.load(S + S_SPLIM)
+
+    TD = tl.load(S + S_TDEPTH)
+
+    OWN = PID % NB
+    BDELTA = 0
+
     nR0, nR1, nR2, nR3 = r0, r1, r2, r3
     nHL, nDE, nSP = HL, DE, SP
     nMB = MB
+    nTD = TD
     nC, nZ, nIPO = C, Z, IPO
     nSGN, nOVF = SGN, OVF
     nOL = OL
@@ -387,7 +409,11 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
     A1 = 0; V1 = 0; E1 = 0
     A2 = 0; V2 = 0; E2 = 0
     A3 = 0; V3 = 0; E3 = 0
+    A4 = 0; V4 = 0; E4 = 0
+    A5 = 0; V5 = 0; E5 = 0
     err = 0
+
+    PCW = 0
 
     errc = 0
 
@@ -446,6 +472,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                 else:
                     nPC = (tl.load(DATA + SP) << 8) | tl.load(DATA + SP + 1)
                     nSP = SP + 2
+                    PCW = 1
             elif eop >= 0x09 and eop <= 0x0D:
                 if PC + elen > CODELEN:
                     err = 1
@@ -454,20 +481,26 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                     t = tl.load(CODE + PC + 1) | (tl.load(CODE + PC + 2) << 8)
                     if eop == 0x09:
                         nPC = t
+                        PCW = 1
                     elif eop == 0x0A:
                         nPC = t if Z == 1 else PC + elen
+                        PCW = 1 if Z == 1 else 0
                     elif eop == 0x0B:
                         nPC = t if Z == 0 else PC + elen
+                        PCW = 1 if Z == 0 else 0
                     elif eop == 0x0C:
                         nPC = t if C == 1 else PC + elen
+                        PCW = 1 if C == 1 else 0
                     else:
                         nPC = t if C == 0 else PC + elen
+                        PCW = 1 if C == 0 else 0
             elif eop == 0x0E:
 
                 if PC + elen > CODELEN:
                     err = 1
                     errc = _name_cause(errc, F_FETCH_OOB)
-                elif SP < 2:
+                elif (SP - SPLIM < 2) or (SP > DS):
+
                     err = 1
                     errc = _name_cause(errc, F_STACK_OVERFLOW)
                 else:
@@ -476,6 +509,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                     A1 = SP - 1; V1 = ret & 0xFF; E1 = 1
                     A2 = SP - 2; V2 = (ret >> 8) & 0xFF; E2 = 1
                     nSP = SP - 2; nPC = t
+                    PCW = 1
             elif eop == 0x0F or eop == 0x10:
                 if PC + elen > CODELEN:
                     err = 1
@@ -500,6 +534,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                         nDE = (DE + rs) & 0xFFFF
             elif eop == 0x13:
                 nPC = HL & 0xFFFF
+                PCW = 1
             elif eop >= 0x14 and eop <= 0x1F:
                 d = eop & 3
                 if eop < 0x18:
@@ -601,6 +636,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                     nPC = PC + elen
                     if v != 0:
                         nPC = t
+                        PCW = 1
             nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
         elif eop >= 0xE0 and eop <= 0xFF:
             d = eop & 3
@@ -631,7 +667,8 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                 else:
                     A1 = DE; V1 = rr; E1 = 1
             elif eop < 0xF4:
-                if SP <= 0:
+                if (SP - SPLIM < 1) or (SP > DS):
+
                     err = 1
                     errc = _name_cause(errc, F_STACK_OVERFLOW)
                 else:
@@ -718,7 +755,9 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
             elif eop == ESC_MOV_HL_MB:
                 nHL = MB & 0xFFFF
             elif eop == ESC_LDM or eop == ESC_STM:
-                why = _bank_refusal(MB, NB)
+                INB = (MB < NB) & (MB < HELD)
+                OST = tl.load(BSTAT + tl.where(INB, PID - OWN + MB, 0))
+                why = _bank_refusal(MB, NB, HELD, OWN, OST)
                 if why != 0:
                     err = 1
                     errc = _name_cause(errc, why)
@@ -726,17 +765,21 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                     err = 1
                     errc = _name_cause(errc, F_DATA_OOB)
                 elif eop == ESC_LDM:
-                    v = tl.load(DATA + HL)
+                    BDELTA = (MB - OWN) * DS
+                    v = tl.load(DATA + BDELTA + HL)
                     nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
                     nC = C & 1
                     nSGN = SGN & 1; nOVF = OVF & 1
                 else:
+                    BDELTA = (MB - OWN) * DS
                     A1 = HL; V1 = _get4(r0, r1, r2, r3, ed); E1 = 1
                     nC = C & 1
                     nSGN = SGN & 1; nOVF = OVF & 1
             elif eop == ESC_LDMW_DE_HL or eop == ESC_LDMW_HL_DE:
 
-                why = _bank_refusal(MB, NB)
+                INB = (MB < NB) & (MB < HELD)
+                OST = tl.load(BSTAT + tl.where(INB, PID - OWN + MB, 0))
+                why = _bank_refusal(MB, NB, HELD, OWN, OST)
                 if why != 0:
                     err = 1
                     errc = _name_cause(errc, why)
@@ -749,7 +792,8 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                         err = 1
                         errc = _name_cause(errc, F_DATA_OOB)
                     else:
-                        v = tl.load(DATA + adr) | (tl.load(DATA + adr + 1) << 8)
+                        BDELTA = (MB - OWN) * DS
+                        v = tl.load(DATA + BDELTA + adr) | (tl.load(DATA + BDELTA + adr + 1) << 8)
                         if eop == ESC_LDMW_DE_HL:
                             nDE = v
                         else:
@@ -758,7 +802,9 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                         nSGN = SGN & 1; nOVF = OVF & 1
             elif eop == ESC_STMW_HL_DE or eop == ESC_STMW_DE_HL:
 
-                why = _bank_refusal(MB, NB)
+                INB = (MB < NB) & (MB < HELD)
+                OST = tl.load(BSTAT + tl.where(INB, PID - OWN + MB, 0))
+                why = _bank_refusal(MB, NB, HELD, OWN, OST)
                 if why != 0:
                     err = 1
                     errc = _name_cause(errc, why)
@@ -773,6 +819,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                         err = 1
                         errc = _name_cause(errc, F_DATA_OOB)
                     else:
+                        BDELTA = (MB - OWN) * DS
                         A1 = adr; V1 = v & 0xFF; E1 = 1
                         A2 = adr + 1; V2 = (v >> 8) & 0xFF; E2 = 1
                         nC = C & 1
@@ -795,6 +842,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                     else:
                         hit = 1 - OVF
                     nPC = tgt if hit == 1 else PC + elen
+                    PCW = 1 if hit == 1 else 0
                     nSGN = SGN & 1
                     nOVF = OVF & 1
             elif eop == ESC_EXT:
@@ -814,14 +862,66 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                         if tgt == 0:
                             err = 1
                             errc = _name_cause(errc, F_TRAP_UNREG)
-                        elif SP < 2:
+                        elif TD == TDLIM:
+
+                            err = 1
+                            errc = _name_cause(errc, F_TRAP_DEPTH)
+                        elif (SP - SPLIM < 4) or (SP > DS):
+
                             err = 1
                             errc = _name_cause(errc, F_STACK_OVERFLOW)
                         else:
                             ret = PC + elen
-                            A1 = SP - 1; V1 = ret & 0xFF; E1 = 1
-                            A2 = SP - 2; V2 = (ret >> 8) & 0xFF; E2 = 1
-                            nSP = SP - 2; nPC = tgt
+
+                            A1 = SP - 1; V1 = TRAP_TAG; E1 = 1
+                            A2 = SP - 2; V2 = Z * F_PACK_Z + C * F_PACK_C \
+                                + SGN * F_PACK_S + OVF * F_PACK_V; E2 = 1
+                            A4 = SP - 3; V4 = ret & 0xFF; E4 = 1
+                            A5 = SP - 4; V5 = (ret >> 8) & 0xFF; E5 = 1
+                            nSP = SP - 4; nPC = tgt
+                            nTD = TD + 1
+                            PCW = 1
+            elif eop == ESC_TRAPRET:
+
+                if TD == 0:
+
+                    err = 1
+                    errc = _name_cause(errc, F_TRAP_UNBALANCED)
+                elif SP + 4 > DS:
+                    err = 1
+                    errc = _name_cause(errc, F_STACK_UNDERFLOW)
+                else:
+                    hi = tl.load(DATA + SP)
+                    lo = tl.load(DATA + SP + 1)
+                    fb = tl.load(DATA + SP + 2)
+                    tag = tl.load(DATA + SP + 3)
+                    if tag != TRAP_TAG:
+
+                        err = 1
+                        errc = _name_cause(errc, F_TRAP_FRAME)
+                    else:
+                        nPC = (hi << 8) | lo
+                        nSP = SP + 4
+                        nZ = fb & 1
+                        nC = (fb >> 1) & 1
+                        nSGN = (fb >> 2) & 1
+                        nOVF = (fb >> 3) & 1
+                        nTD = TD - 1
+                        PCW = 1
+            elif eop == ESC_CALL_HL:
+
+                if PC + elen > CODELEN:
+                    err = 1
+                    errc = _name_cause(errc, F_FETCH_OOB)
+                elif (SP - SPLIM < 2) or (SP > DS):
+                    err = 1
+                    errc = _name_cause(errc, F_STACK_OVERFLOW)
+                else:
+                    ret = PC + elen
+                    A1 = SP - 1; V1 = ret & 0xFF; E1 = 1
+                    A2 = SP - 2; V2 = (ret >> 8) & 0xFF; E2 = 1
+                    nSP = SP - 2; nPC = HL
+                    PCW = 1
             elif eop == ESC_STC:
 
                 if HL >= CODELEN:
@@ -866,7 +966,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
                     nSP = DE
             elif eop == ESC_PUSHW_HL or eop == ESC_PUSHW_DE:
 
-                if SP < 2:
+                if (SP - SPLIM < 2) or (SP > DS):
                     err = 1
                     errc = _name_cause(errc, F_STACK_OVERFLOW)
                 else:
@@ -964,6 +1064,10 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
 
         err = 1
         errc = _name_cause(errc, F_OUT_CAP)
+    if err == 0 and PCW == 1 and nPC >= CODELEN:
+
+        err = 1
+        errc = _name_cause(errc, F_PC_ILLEGAL)
     if ST != 0:
 
         RST = ST
@@ -989,29 +1093,35 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB):
         tl.store(S + 12, NT)
         tl.store(S + 13, NST)
         tl.store(S + S_MB, nMB)
+        tl.store(S + S_TDEPTH, nTD)
 
         if OEN == 1:
             tl.store(OUTBUF + (OL & (OC - 1)), OVAL)
         if E1 == 1:
-            tl.store(DATA + (A1 & (DS - 1)), V1)
+            tl.store(DATA + BDELTA + (A1 & (DS - 1)), V1)
         if E2 == 1:
-            tl.store(DATA + (A2 & (DS - 1)), V2)
+            tl.store(DATA + BDELTA + (A2 & (DS - 1)), V2)
         if E3 == 1:
             tl.store(CODE + (A3 & CODE_MASK), V3)
+        if E4 == 1:
+            tl.store(DATA + (A4 & (DS - 1)), V4)
+        if E5 == 1:
+            tl.store(DATA + (A5 & (DS - 1)), V5)
         RST = NST
         RTK = NT
     return RST, RTK
 
 @triton.jit
 def ncp_step_kernel(CODE, DATA, INPUTS, OUTBUF, S, BUDGET, CODELEN, INLEN, DS, OC,
-                    CFG, NB):
+                    CFG, NB, TDLIM, BSTAT):
 
     BD = tl.load(BUDGET + 0)
-    _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB)
+    _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB, TDLIM,
+          BSTAT, 0, BANK_PAGES_C)
 
 @triton.jit
 def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BUDGETS,
-                        STEP_LIMIT, CFG, NB,
+                        STEP_LIMIT, CFG, NB, TDLIM, BSTAT, NROWS,
                         CS: tl.constexpr, DS: tl.constexpr, INS: tl.constexpr,
                         OCS: tl.constexpr):
 
@@ -1025,12 +1135,25 @@ def ncp_resident_kernel(CODE, DATA, INPUTS, OUTBUF, STATES, CODELENS, INLENS, BU
     CL = tl.load(CODELENS + pid)
     IL = tl.load(INLENS + pid)
     BD = tl.load(BUDGETS + pid)
+    HELD = tl.minimum(NB, NROWS - (pid // NB) * NB)
     st = tl.load(ST + 13)
     tk = tl.load(ST + 12)
     n = 0
     while (st == 0) & ((STEP_LIMIT <= 0) | (n < STEP_LIMIT)):
-        st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, BD, DS, OCS, CF, NB)
+        st, tk = _tick(CP, DP, IP, OP, ST, CL, IL, BD, DS, OCS, CF, NB, TDLIM,
+                       BSTAT, pid, HELD)
         n += 1
+
+def _per_row(value, n, default):
+
+    if value is None:
+        return [default] * n
+    if isinstance(value, (list, tuple)):
+        got = list(value)
+        if len(got) != n:
+            raise ISA.ConfigError(f"{len(got)} values given for {n} rows of the group")
+        return [default if v is None else v for v in got]
+    return [value] * n
 
 class BatchResult(NamedTuple):
 
@@ -1057,6 +1180,8 @@ class TritonBatch:
                 f"instruction bound is the length of the program set_program loaded "
                 f"into it, so one number for all {n} rows would describe {n} machines "
                 f"that are not this batch")
+
+        self.entry = ISA.DEFAULT_ENTRY if cfg.entry is None else cfg.entry
         self.dev = torch.device(device)
         self.n = n
         self.config = cfg
@@ -1064,7 +1189,9 @@ class TritonBatch:
                                               cfg.outcap)
         ISA.check_capacity(self.out_cap, OUT_CAP)
         self.nbanks = 1 if cfg.nbanks is None else cfg.nbanks
-        self.tdlim = 0 if cfg.tdlim is None else cfg.tdlim
+        self.tdlim = ISA.DEFAULT_TDLIM if cfg.tdlim is None else cfg.tdlim
+
+        self.splim = 0 if cfg.splim is None else cfg.splim
         self.max_in = max(1, int(max_in))
         self.num_warps = num_warps
         i32 = torch.int32
@@ -1073,7 +1200,11 @@ class TritonBatch:
         self.INPUTS = torch.zeros((n, self.max_in), dtype=i32, device=self.dev)
         self.OUTBUF = torch.zeros((n, self.out_cap), dtype=i32, device=self.dev)
         self.STATE = torch.zeros((n, STATE_ROWS), dtype=i32, device=self.dev)
+        self.STATE[:, 6] = self.entry
         self.STATE[:, 7] = DATA_SIZE
+        self.STATE[:, int(S_SPLIM)] = self.splim
+
+        self.BSTAT = torch.zeros(n, dtype=i32, device=self.dev)
         self.CODELENS = torch.zeros(n, dtype=i32, device=self.dev)
         self.INLENS = torch.zeros(n, dtype=i32, device=self.dev)
         tb = ISA.resolve_constraint("TICKBUDGET", "tick_budget", int(tick_budget),
@@ -1088,6 +1219,38 @@ class TritonBatch:
         if not isinstance(i, int) or not 0 <= i < self.n:
             raise ValueError(f"machine index {i} is outside a batch of {self.n} machines")
 
+    @classmethod
+    def from_programs(cls, codes, *, data=None, inputs=None,
+                      tick_budget=ISA.TICK_BUDGET_DEFAULT, out_cap=OUT_CAP,
+                      config=None):
+
+        from golden_sim import asm
+        codes = [c if isinstance(c, (bytes, bytearray)) else asm(c) for c in codes]
+        n = len(codes)
+        blocks = _per_row(config, n, None)
+        block = blocks[0]
+        if any(b is not block for b in blocks):
+            raise ISA.ConfigError("a batch carries one configuration block for the "
+                                  "whole group, not one block per row")
+        if block is not None and block.nbanks is not None:
+            if block.nbanks != n:
+                raise ISA.ConfigError(
+                    f"the block declares NBANKS={block.nbanks} and this construction "
+                    f"groups {n} programs; the declared count is the group's size, "
+                    f"and the group will not rewrite the block under it")
+        else:
+            fields = dict(block.as_dict()) if block is not None else {}
+            fields["nbanks"] = n
+            block = ISA.MachineConfig.from_dict(fields)
+        b = cls(n, tick_budget=tick_budget, out_cap=out_cap, config=block,
+                max_in=max(1, max((len(v) for v in _per_row(inputs, n, b"")),
+                                  default=1)))
+        datas = _per_row(data, n, b"")
+        input_streams = _per_row(inputs, n, b"")
+        for i in range(n):
+            b.set_program(i, codes[i], datas[i], input_streams[i])
+        return b
+
     def set_program(self, i, code, data=None, inputs=None):
 
         self._row(i)
@@ -1096,6 +1259,10 @@ class TritonBatch:
             raise ValueError(f"machine {i}: code is {len(cb)} bytes, above CODE_SIZE {CODE_SIZE}")
 
         bad = self.config.check_for_program(len(cb), f"machine {i}: ")
+        if bad is not None:
+            raise ISA.ConfigError(bad)
+
+        bad = ISA.entry_error(self.entry, len(cb), f"machine {i}: ")
         if bad is not None:
             raise ISA.ConfigError(bad)
         self.CODE[i] = 0
@@ -1118,16 +1285,18 @@ class TritonBatch:
             self.INPUTS[i, :len(ib)] = torch.tensor(list(ib), dtype=torch.int32, device=self.dev)
         self.INLENS[i] = len(ib)
         self.STATE[i] = 0
+        self.STATE[i, 6] = self.entry
         self.STATE[i, 7] = DATA_SIZE
+        self.STATE[i, int(S_SPLIM)] = self.splim
 
     def set_state(self, i, r=(0, 0, 0, 0), HL=0, DE=0, PC=0, SP=DATA_SIZE,
                   C=0, Z=0, S=0, V=0, ipos=0, oplen=0, tick=0, status=0, fault_reason=0,
-                  fault_addr=0, MB=0):
+                  fault_addr=0, MB=0, TDEPTH=0):
 
         self._row(i)
         check_state(r, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=ipos, oplen=oplen,
                     status=status, fault_reason=fault_reason, fault_addr=fault_addr,
-                    mb=MB, s=S, v=V, where=f"machine {i}: ")
+                    mb=MB, s=S, v=V, td=TDEPTH, where=f"machine {i}: ")
         self.STATE[i, 0:4] = torch.tensor(list(r), dtype=torch.int32, device=self.dev)
         self.STATE[i, 4] = HL
         self.STATE[i, 5] = DE
@@ -1144,6 +1313,7 @@ class TritonBatch:
         self.STATE[i, 14] = fault_reason
         self.STATE[i, 15] = fault_addr
         self.STATE[i, int(S_MB)] = MB
+        self.STATE[i, int(S_TDEPTH)] = TDEPTH
 
     def set_budget(self, i, budget):
 
@@ -1162,6 +1332,10 @@ class TritonBatch:
 
     def run(self):
 
+        if self.nbanks > 1:
+            while bool((self.STATE[:, 13] == 0).any().item()):
+                self._launch(1)
+            return self.results()
         self._launch(0)
         return self.results()
 
@@ -1171,10 +1345,13 @@ class TritonBatch:
         return self.results()
 
     def _launch(self, step_limit):
+        if self.nbanks > 1:
+
+            self.BSTAT.copy_(self.STATE[:, 13])
         ncp_resident_kernel[(self.n,)](
             self.CODE, self.DATA, self.INPUTS, self.OUTBUF, self.STATE,
             self.CODELENS, self.INLENS, self.BUDGETS, step_limit, self.CFG,
-            self.nbanks,
+            self.nbanks, self.tdlim, self.BSTAT, self.n,
             CS=CODE_SIZE, DS=DATA_SIZE, INS=self.max_in, OCS=self.out_cap,
             num_warps=self.num_warps)
 
@@ -1248,7 +1425,8 @@ def run_batch(codes, datas=None, inputs=None, budgets=None, states=None,
             b.set_state(i, r=row[0:4], HL=row[4], DE=row[5], PC=row[6], SP=row[7],
                         C=row[8], Z=row[9], S=row[int(S_SIGN)], V=row[int(S_OVFL)],
                         ipos=row[10], oplen=row[11], tick=row[12], status=row[13],
-                        fault_reason=row[14], fault_addr=row[15], MB=row[int(S_MB)])
+                        fault_reason=row[14], fault_addr=row[15], MB=row[int(S_MB)],
+                        TDEPTH=row[int(S_TDEPTH)])
     return b.run()
 
 class TritonCircuit:
@@ -1284,11 +1462,18 @@ class TritonCircuit:
         bad = cfg.check_for_program(self.codelen, "TritonCircuit: ")
         if bad is not None:
             raise ISA.ConfigError(bad)
+
+        self.entry = ISA.DEFAULT_ENTRY if cfg.entry is None else cfg.entry
+        bad = ISA.entry_error(self.entry, self.codelen, "TritonCircuit: ")
+        if bad is not None:
+            raise ISA.ConfigError(bad)
         self.out_cap = ISA.resolve_constraint("OUTCAP", "out_cap", out_cap, OUT_CAP,
                                               cfg.outcap)
         ISA.check_capacity(self.out_cap, OUT_CAP)
         self.nbanks = 1 if cfg.nbanks is None else cfg.nbanks
-        self.tdlim = 0 if cfg.tdlim is None else cfg.tdlim
+        self.tdlim = ISA.DEFAULT_TDLIM if cfg.tdlim is None else cfg.tdlim
+
+        self.splim = 0 if cfg.splim is None else cfg.splim
         self.CODE = torch.zeros(max(1, CODE_SIZE), dtype=i32, device=dev)
         self.CODE[: len(code)] = torch.tensor(list(code), dtype=i32, device=dev)
         self.DATA = torch.zeros(DATA_SIZE, dtype=i32, device=dev)
@@ -1299,6 +1484,10 @@ class TritonCircuit:
         self.OUTBUF = torch.zeros(self.out_cap, dtype=i32, device=dev)
         self.S = torch.zeros(STATE_ROWS, dtype=i32, device=dev)
         self.S[7] = DATA_SIZE
+        self.S[6] = self.entry
+        self.S[int(S_SPLIM)] = self.splim
+
+        self.BANKSTAT = torch.zeros(1, dtype=i32, device=dev)
         self.BUDGET = torch.tensor(
             [ISA.resolve_constraint("TICKBUDGET", "tick_budget", int(tick_budget),
                                     ISA.TICK_BUDGET_DEFAULT, cfg.tickbudget)],
@@ -1317,7 +1506,8 @@ class TritonCircuit:
         check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC,
                     ipos=int(self.S[10].item()), oplen=int(self.S[11].item()),
                     status=int(self.S[13].item()), fault_reason=fr, fault_addr=fa,
-                    mb=int(self.S[int(S_MB)].item()), s=s0, v=v0)
+                    mb=int(self.S[int(S_MB)].item()), s=s0, v=v0,
+                    td=int(self.S[int(S_TDEPTH)].item()))
         self.S[0:4] = torch.tensor(list(R), dtype=torch.int32, device=self.dev)
         self.S[4] = HL; self.S[5] = DE; self.S[6] = PC
         self.S[7] = SP; self.S[8] = C; self.S[9] = Z
@@ -1344,10 +1534,11 @@ class TritonCircuit:
     def _record_block(self):
 
         lo, hi = self.config.window()
-        return ISA.MachineConfig(codelen=self.codelen, winlo=lo, winhi=hi,
+        return ISA.MachineConfig(codelen=self.codelen, entry=self.entry,
+                                 winlo=lo, winhi=hi,
                                  vec=self.config.vectors(), nbanks=self.nbanks,
-                                 tdlim=self.tdlim, tickbudget=self.tb,
-                                 outcap=self.out_cap)
+                                 tdlim=self.tdlim, splim=self.splim,
+                                 tickbudget=self.tb, outcap=self.out_cap)
 
     def _record_bounds(self):
 
@@ -1368,7 +1559,7 @@ class TritonCircuit:
                     tick=st["tick"], PC=st["PC"], ipos=st["ipos"], oplen=len(got.out),
                     status=st["status"], fault_reason=st["fault_reason"],
                     fault_addr=st["fault_addr"], mb=st["MB"], s=st["S"], v=st["V"],
-                    where="TritonCircuit: ")
+                    td=st["TDEPTH"], where="TritonCircuit: ")
         _write_row_state(self.S, st)
         self.S[STATE_ROW_OPLEN] = len(got.out)
         self.CODE.copy_(_byte_image(got.code).to(self.dev))
@@ -1380,7 +1571,8 @@ class TritonCircuit:
     def step(self):
         ncp_step_kernel[(1,)](self.CODE, self.DATA, self.INP, self.OUTBUF, self.S,
                               self.BUDGET, self.codelen, self.inlen, DATA_SIZE,
-                              self.out_cap, self.CFG, self.nbanks)
+                              self.out_cap, self.CFG, self.nbanks, self.tdlim,
+                              self.BANKSTAT)
 
     @property
     def status(self):

@@ -70,14 +70,14 @@ class FaultCauseMissing(MachineError):
     pass
 
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
-                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, where=""):
+                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, td=0, where=""):
 
     if not 0 <= oplen <= OUT_CAP:
         raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
     bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "MB": mb, "PC": PC,
                            "SP": SP, "C": C, "Z": Z, "S": s, "V": v, "ipos": ipos, "tick": tick,
                            "status": status, "fault_reason": fault_reason,
-                           "fault_addr": fault_addr},
+                           "fault_addr": fault_addr, "TDEPTH": td},
                           where)
     if bad is not None:
         raise ValueError(bad)
@@ -105,6 +105,11 @@ class NCP8:
         bad = cfg.check_for_program(self.codelen, "NCP8: ")
         if bad is not None:
             raise ISA.ConfigError(bad)
+
+        self.entry = ISA.DEFAULT_ENTRY if cfg.entry is None else cfg.entry
+        bad = ISA.entry_error(self.entry, self.codelen, "NCP8: ")
+        if bad is not None:
+            raise ISA.ConfigError(bad)
         self.code = loaded.ljust(CODE_SIZE, b"\x00")
         self.data = bytearray(DATA_SIZE)
         if data:
@@ -115,12 +120,14 @@ class NCP8:
         self.HL = 0
         self.DE = 0
         self.SP = DATA_SIZE
-        self.PC = 0
+        self.PC = self.entry
         self.C = 0
         self.Z = 0
 
         self.S = 0
         self.V = 0
+
+        self.TDEPTH = 0
         self.inputs = bytes(inputs)
         self.ipos = 0
         self.out = bytearray()
@@ -134,7 +141,9 @@ class NCP8:
                                          cfg.tickbudget)
 
         self.nbanks = 1 if cfg.nbanks is None else cfg.nbanks
-        self.tdlim = 0 if cfg.tdlim is None else cfg.tdlim
+        self.tdlim = ISA.DEFAULT_TDLIM if cfg.tdlim is None else cfg.tdlim
+
+        self.splim = 0 if cfg.splim is None else cfg.splim
 
         self.MB = 0
         self.bank_own = 0
@@ -155,7 +164,7 @@ class NCP8:
         vv = self.V if V is None else V
         check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=self.ipos,
                     status=STATUS_CODE[self.status], fault_reason=fr, fault_addr=fa,
-                    mb=self.MB, s=sv, v=vv)
+                    mb=self.MB, s=sv, v=vv, td=self.TDEPTH)
         self.r = list(R)
         self.HL, self.DE, self.SP, self.C, self.Z = HL, DE, SP, C, Z
         self.S, self.V = sv, vv
@@ -173,10 +182,11 @@ class NCP8:
     def _record_block(self):
 
         lo, hi = self.config.window()
-        return ISA.MachineConfig(codelen=self.codelen, winlo=lo, winhi=hi,
+        return ISA.MachineConfig(codelen=self.codelen, entry=self.entry,
+                                 winlo=lo, winhi=hi,
                                  vec=self.config.vectors(), nbanks=self.nbanks,
-                                 tdlim=self.tdlim, tickbudget=self.tb,
-                                 outcap=self.out_cap)
+                                 tdlim=self.tdlim, splim=self.splim,
+                                 tickbudget=self.tb, outcap=self.out_cap)
 
     _RECORD_READERS = {
         "r": lambda m: list(m.r),
@@ -189,6 +199,7 @@ class NCP8:
         "Z": lambda m: m.Z,
         "S": lambda m: m.S,
         "V": lambda m: m.V,
+        "TDEPTH": lambda m: m.TDEPTH,
         "ipos": lambda m: m.ipos,
         "tick": lambda m: m.tick,
         "status": lambda m: m.status_code(),
@@ -220,12 +231,13 @@ class NCP8:
                     tick=st["tick"], PC=st["PC"], ipos=st["ipos"],
                     status=st["status"], fault_reason=st["fault_reason"],
                     fault_addr=st["fault_addr"], mb=st["MB"], s=st["S"], v=st["V"],
-                    where="NCP8: ")
+                    td=st["TDEPTH"], where="NCP8: ")
         self.r = list(st["r"])
         self.HL, self.DE, self.PC, self.SP = st["HL"], st["DE"], st["PC"], st["SP"]
         self.MB = st["MB"]
         self.C, self.Z = st["C"], st["Z"]
         self.S, self.V = st["S"], st["V"]
+        self.TDEPTH = st["TDEPTH"]
         self.ipos, self.tick = st["ipos"], st["tick"]
         self.status = STATUS_NAME[st["status"]]
         self.fault_reason, self.fault_addr = st["fault_reason"], st["fault_addr"]
@@ -305,6 +317,15 @@ class NCP8:
         self.PC += n
         return b
 
+    def _pc_target(self, t, pc0):
+
+        if t >= self.codelen:
+            self._fault(CAUSE["PC_ILLEGAL"],
+                        f"PC_ILLEGAL: branch target {t:#06x} is not inside the image "
+                        f"(CODELEN {self.codelen}); the jump faults on the tick that "
+                        f"writes PC, before any byte at the target is fetched "
+                        f"@ {pc0:#04x}")
+
     def _window(self):
 
         return self.config.window()
@@ -315,7 +336,7 @@ class NCP8:
 
     def _stack_room(self, n):
 
-        if not (0 <= self.SP - n and self.SP <= DATA_SIZE):
+        if not (self.splim <= self.SP - n and self.SP <= DATA_SIZE):
             self._fault(CAUSE["STACK_OVERFLOW"], "stack overflow")
 
     def _stack_have(self, n):
@@ -401,9 +422,15 @@ class NCP8:
             self.DE = (self.DE + 1) & 0xFFFF; m = "OUTDE"
         elif sel == "RET":
             self._stack_have(2)
+            t = (self.data[self.SP] << 8) | self.data[self.SP + 1]
+            self._pc_target(t, pc0)
             hi = self._pop(); lo = self._pop(); self.PC = hi << 8 | lo; m = "RET"
         elif sel in ("JMP", "JZ", "JNZ", "JC", "JNC"):
             t = imm[1] << 8 | imm[0]
+            taken = {"JMP": 1, "JZ": self.Z, "JNZ": 1 - self.Z,
+                     "JC": self.C, "JNC": 1 - self.C}[sel]
+            if taken:
+                self._pc_target(t, pc0)
             if sel == "JMP": self.PC = t; m = "JMP"
             elif sel == "JZ":   m = "JZ";   self.PC = t if self.Z else self.PC
             elif sel == "JNZ":  m = "JNZ";  self.PC = t if not self.Z else self.PC
@@ -412,6 +439,7 @@ class NCP8:
         elif sel == "CALL":
             t = imm[1] << 8 | imm[0]; ret = self.PC
             self._stack_room(2)
+            self._pc_target(t, pc0)
             self._push(ret & 0xFF); self._push(ret >> 8); self.PC = t; m = "CALL"
         elif sel == "LDI_HL":
             self.HL = imm[1] << 8 | imm[0]; m = f"LDI HL, {self.HL}"
@@ -428,9 +456,13 @@ class NCP8:
             d = (imm[0] ^ 0x80) - 0x80
             test = {"JS": self.S, "JNS": 1 - self.S, "VS": self.V,
                     "VC": 1 - self.V}[sel]
-            self.PC = (self.PC + d) & 0xFFFF if test else self.PC
+            if test:
+                t = (self.PC + d) & 0xFFFF
+                self._pc_target(t, pc0)
+                self.PC = t
             m = f"{sel} {d:+d}"
         elif sel == "JPHL":
+            self._pc_target(self.HL, pc0)
             self.PC = self.HL; m = "JPHL"
         elif sel == "GETPC":
             self.r[s0] = pc0 & 255; m = f"GETPC r{s0}"
@@ -643,9 +675,61 @@ class NCP8:
                             f"its trap entry points in load-time configuration and "
                             f"CODE holds none, so declaring one at load is the only "
                             f"way to install a handler @ {pc0:#04x}")
+            if self.TDEPTH == self.tdlim:
+
+                self._fault(CAUSE["TRAP_DEPTH"],
+                            f"EXT {k} at trap depth {self.TDEPTH} of TDLIM "
+                            f"{self.tdlim}: the depth counter is machine state and "
+                            f"the limit is configuration, so a handler that never "
+                            f"returns cannot spend the stack past what the load "
+                            f"declared @ {pc0:#04x}")
+            self._stack_room(4)
+            self._pc_target(tgt, pc0)
+            ret = self.PC
+            fb = ISA.flags_byte({"Z": self.Z, "C": self.C, "S": self.S, "V": self.V})
+
+            self._push(ISA.TRAP_TAG)
+            self._push(fb)
+            self._push(ret & 0xFF)
+            self._push(ret >> 8)
+            self.PC = tgt
+            self.TDEPTH += 1
+            m = f"EXT {k}"
+        elif sel == "TRAPRET":
+            if self.TDEPTH == 0:
+
+                self._fault(CAUSE["TRAP_UNBALANCED"],
+                            f"TRAPRET at trap depth 0: no EXT k is in flight, so "
+                            f"there is no frame to return through @ {pc0:#04x}")
+            self._stack_have(4)
+
+            hi = self.data[self.SP]
+            lo = self.data[self.SP + 1]
+            fb = self.data[self.SP + 2]
+            tag = self.data[self.SP + 3]
+            if tag != ISA.TRAP_TAG:
+
+                self._fault(CAUSE["TRAP_FRAME"],
+                            f"TRAPRET read frame tag {tag:#04x}, not the {ISA.TRAP_TAG:#04x} "
+                            f"EXT stores, so the four bytes at SP are not a trap frame "
+                            f"@ {pc0:#04x}")
+            t = (hi << 8) | lo
+            self._pc_target(t, pc0)
+            self.SP += 4
+            self.PC = t
+
+            self.Z = fb & 1
+            self.C = (fb >> 1) & 1
+            self.S = (fb >> 2) & 1
+            self.V = (fb >> 3) & 1
+            self.TDEPTH -= 1
+            m = "TRAPRET"
+        elif sel == "CALL_HL":
+            ret = self.PC
             self._stack_room(2)
-            self._push(self.PC & 0xFF); self._push((self.PC >> 8) & 0xFF)
-            self.PC = tgt; m = f"EXT {k}"
+            self._pc_target(self.HL, pc0)
+            self._push(ret & 0xFF); self._push(ret >> 8)
+            self.PC = self.HL; m = "CALL HL"
         elif sel in ("LDI", "ADDI", "SUBI", "ADCI"):
             i = imm[0]
             if sel == "LDI":
@@ -680,8 +764,11 @@ class NCP8:
             self.Z = int(self.r[s0] == 0); m = f"TST r{s0}"
         elif sel == "DJNZ":
             t = imm[1] << 8 | imm[0]
+            taken = ((self.r[s0] - 1) & 0xFF) != 0
+            if taken:
+                self._pc_target(t, pc0)
             self.r[s0] = (self.r[s0] - 1) & 0xFF
-            if self.r[s0] != 0: self.PC = t
+            if taken: self.PC = t
             m = f"DJNZ r{s0}"
         elif sel == "MOV_R_HL":
             self._mem(self.HL); self.r[s0] = self.data[self.HL]; m = f"MOV r{s0}, [HL]"
@@ -721,6 +808,7 @@ class NCP8:
         return dict(r=list(self.r), HL=self.HL, DE=self.DE, MB=self.MB, SP=self.SP,
                     PC=self.PC,
                     C=self.C, Z=self.Z, S=self.S, V=self.V,
+                    TDEPTH=self.TDEPTH,
                     ipos=self.ipos, tick=self.tick,
                     status=self.status, fault_reason=self.fault_reason,
                     fault_addr=self.fault_addr)
@@ -852,6 +940,8 @@ ENC = {
     ("ADDI", ("r", "i8")): (b"\xd4", [_code(0, 0), ("byte",)]),
     ("AND", ("r", "r")): (b"\x20", [_code(0, 2), _code(0, 0)]),
     ("CALL", ("a16",)): (b"\x0e", [("word",)]),
+    ("CALL", ("HL",)): (b"\x70\xa9", [None]),
+    ("TRAPRET", ()): (b"\x70\xa8", []),
     ("CLC", ()): (b"\x05", []),
     ("CMP", ("r", "r")): (b"\x70\x20", [_code(1, 2), _code(1, 0)]),
     ("DEC", ("HL",)): (b"\x03", [None]),

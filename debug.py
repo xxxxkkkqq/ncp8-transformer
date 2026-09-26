@@ -284,7 +284,8 @@ class Debug:
     def record(self, *, max_steps=100_000):
 
         return record(self.image, data=bytes(self.m.data), inputs=self.m.inputs,
-                      tick_budget=self.m.tb, PC=self.m.PC, max_steps=max_steps)
+                      tick_budget=self.m.tb, PC=self.m.PC, max_steps=max_steps,
+                      config=self.config)
 
 def _frame_equal(a, b):
 

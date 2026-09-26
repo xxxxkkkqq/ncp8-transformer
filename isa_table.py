@@ -69,6 +69,7 @@ ALU_NAMES = (
     "LDM", "STM", "LDMW_DE_HL", "LDMW_HL_DE", "STMW_HL_DE", "STMW_DE_HL",
     "MOV_MB_HL", "MOV_HL_MB",
     "JS", "JNS", "VS", "VC",
+    "TRAPRET", "CALL_HL",
 )
 ALU_ID = {name: i for i, name in enumerate(ALU_NAMES)}
 K = len(ALU_NAMES)
@@ -84,6 +85,7 @@ ESC_EOP_NAMES = (
     "LDM", "STM", "LDMW_DE_HL", "LDMW_HL_DE", "STMW_HL_DE", "STMW_DE_HL",
     "MOV_MB_HL", "MOV_HL_MB",
     "JS", "JNS", "VS", "VC",
+    "TRAPRET", "CALL_HL",
 )
 ESC_EOP_ID = {name: ESC_EOP_BASE + i for i, name in enumerate(ESC_EOP_NAMES)}
 
@@ -182,6 +184,9 @@ for _k in range(4):
 
 for _sub, _alu in zip(range(0x64, 0x68), ("JS", "JNS", "VS", "VC")):
     _escape(_sub, _alu, f"{_alu} {{soff}}", l=1, kind="off")
+
+_escape(0xA8, "TRAPRET", "TRAPRET")
+_escape(0xA9, "CALL_HL", "CALL HL")
 for _sub, (_alu, _mn) in ((0xB8, ("LDMW_DE_HL", "LDMW DE, [HL]")),
                           (0xB9, ("LDMW_HL_DE", "LDMW HL, [DE]")),
                           (0xBA, ("STMW_HL_DE", "STMW [HL], DE")),
@@ -219,9 +224,6 @@ CAUSE_DESC = {name: desc for name, desc in FAULT_CAUSES}
 FAULT_CODES = tuple(range(len(FAULT_CAUSES)))
 
 CAUSES_AWAITING_FEATURE = {
-    "TRAP_DEPTH": "this machine has no trap-depth counter, so EXT cannot overflow one",
-    "TRAP_FRAME": "subcode 0xA8 is unassigned, so no instruction returns from a trap",
-    "TRAP_UNBALANCED": "subcode 0xA8 is unassigned, so no instruction returns from a trap",
     "BANK_BUSY": "the ownership rule is answered on all four paths, but the three "
                  "circuit paths hold one page each -- their own DATA, at index 0 -- so a "
                  "selector that passes the declared bound names the page it owns and a "
@@ -229,10 +231,10 @@ CAUSES_AWAITING_FEATURE = {
                  "reference's group driver hands a machine a foreign page, and no group "
                  "driver exists on a circuit path, so no bank access there can name this "
                  "cause",
-    "PC_ILLEGAL": "a branch committing an out-of-image target faults on the tick that writes it",
 }
 
 FAULT_SITE_ORDER = (
+    ("PC_ILLEGAL", "PC_ILLEGAL"),
     ("FETCH_CODE", "FETCH_OOB"),
     ("BAD_OPCODE", "BAD_OPCODE"),
     ("BAD_SUBCODE", "BAD_SUBCODE"),
@@ -240,9 +242,12 @@ FAULT_SITE_ORDER = (
     ("BANK_OOB", "BANK_OOB"),
     ("BANK_BUSY", "BANK_BUSY"),
     ("TRAP_UNREG", "TRAP_UNREG"),
+    ("TRAP_DEPTH", "TRAP_DEPTH"),
+    ("TRAP_UNBALANCED", "TRAP_UNBALANCED"),
     ("DATA_OOB", "DATA_OOB"),
     ("STACK_PUSH", "STACK_OVERFLOW"),
     ("STACK_POP", "STACK_UNDERFLOW"),
+    ("TRAP_FRAME", "TRAP_FRAME"),
     ("DIV_ZERO", "DIV_ZERO"),
     ("CODE_OOB", "CODE_OOB"),
     ("WINDOW", "WINDOW"),
@@ -279,12 +284,17 @@ VEC_COUNT = 16
 
 DEFAULT_WINDOW = (0, 0)
 DEFAULT_VECTORS = (0,) * VEC_COUNT
+DEFAULT_ENTRY = 0
+DEFAULT_TDLIM = 64
 
-CONFIG_NAMES = ("CODELEN", "WINLO", "WINHI", "VEC", "NBANKS", "TDLIM",
-                "TICKBUDGET", "OUTCAP")
+TRAP_TAG = 0xA5
 
-CONFIG_WIDTHS = {"CODELEN": 16, "WINLO": 16, "WINHI": 16, "VEC": 16, "NBANKS": 16,
-                 "TDLIM": 8, "TICKBUDGET": None, "OUTCAP": 16}
+CONFIG_NAMES = ("CODELEN", "ENTRY", "WINLO", "WINHI", "VEC", "NBANKS", "TDLIM",
+                "SPLIM", "TICKBUDGET", "OUTCAP")
+
+CONFIG_WIDTHS = {"CODELEN": 16, "ENTRY": 16, "WINLO": 16, "WINHI": 16, "VEC": 16,
+                 "NBANKS": 16, "TDLIM": 8, "SPLIM": 16, "TICKBUDGET": None,
+                 "OUTCAP": 16}
 
 OUT_CAP_LIMIT = 1 << 16
 
@@ -300,6 +310,10 @@ def _cfg_int(name, value, lo, hi):
     if not lo <= value <= hi:
         raise ConfigError(f"configuration {name} is {value}, outside {lo}..{hi}")
     return value
+
+def check_splim(value, where=""):
+
+    return _cfg_int(f"{where}SPLIM", value, 0, DATA_SIZE)
 
 def check_capacity(value, width, field="out_cap"):
 
@@ -339,15 +353,30 @@ def window_error(winlo, winhi, codelen, where=""):
                 f"cells no program occupies")
     return None
 
+def entry_error(entry, codelen, where=""):
+
+    if codelen > 0 and entry >= codelen:
+        return (f"{where}ENTRY={entry} (0x{entry:04X}) does not fit inside a program "
+                f"of {codelen} bytes (0x{codelen:04X}): the boot address is at or past "
+                f"the end of the program the machine was loaded with, so the first "
+                f"fetch would fault")
+    return None
+
 class MachineConfig:
 
-    __slots__ = ("codelen", "winlo", "winhi", "vec", "nbanks", "tdlim",
-                 "tickbudget", "outcap")
+    __slots__ = ("codelen", "entry", "winlo", "winhi", "vec", "nbanks", "tdlim",
+                 "splim", "tickbudget", "outcap")
 
-    def __init__(self, *, codelen=None, winlo=None, winhi=None, vec=None,
-                 nbanks=None, tdlim=None, tickbudget=None, outcap=None):
+    def __init__(self, *, codelen=None, entry=None, winlo=None, winhi=None, vec=None,
+                 nbanks=None, tdlim=None, splim=None, tickbudget=None, outcap=None):
         self.codelen = (None if codelen is None
                         else _cfg_int("CODELEN", codelen, 0, (1 << 16) - 1))
+        self.entry = (None if entry is None
+                      else _cfg_int("ENTRY", entry, 0, (1 << 16) - 1))
+        if self.entry is not None and self.codelen is not None:
+            bad = entry_error(self.entry, self.codelen)
+            if bad is not None:
+                raise ConfigError(bad)
         if (winlo is None) != (winhi is None):
             raise ConfigError("WINLO and WINHI are one declaration: got "
                               f"WINLO={winlo!r} without WINHI, or WINHI={winhi!r} "
@@ -374,6 +403,7 @@ class MachineConfig:
                        else _cfg_int("NBANKS", nbanks, 1, (1 << 16) - 1))
         self.tdlim = (None if tdlim is None
                       else _cfg_int("TDLIM", tdlim, 0, (1 << 8) - 1))
+        self.splim = None if splim is None else check_splim(splim)
         if tickbudget is not None:
             tickbudget = _cfg_int("TICKBUDGET", tickbudget, 0, 1 << 62)
         self.tickbudget = tickbudget
@@ -457,6 +487,20 @@ class MachineConfig:
         if unknown:
             raise ConfigError(f"configuration names constraints outside the field set: "
                               f"{unknown}")
+        fields = dict(fields)
+        vec = fields.get("vec")
+        if isinstance(vec, dict):
+
+            normalized = {}
+            for k, v in vec.items():
+                if isinstance(k, str):
+                    if not k.isdigit():
+                        raise ConfigError(f"the vector index {k!r} arriving as "
+                                          f"carried data is not a non-negative "
+                                          f"integer")
+                    k = int(k)
+                normalized[k] = v
+            fields["vec"] = normalized
         return cls(**fields)
 
     def __eq__(self, other):
@@ -526,6 +570,8 @@ STATE_FIELDS = (
     StateField("status", 0, 3, None),
     StateField("fault_reason", 0, (1 << FAULT_BITS) - 1, None),
     StateField("fault_addr", 0, (1 << FAULT_ADDR_BITS) - 1, None),
+
+    StateField("TDEPTH", 0, (1 << 8) - 1, None),
 )
 
 STATE_FIELD_NAMES = tuple(f.name for f in STATE_FIELDS)
@@ -1028,6 +1074,54 @@ def check_config_table():
                                "for the machine that resolves it to the loaded length")
     if MachineConfig().check_for_program(0) is not None:
         raise DecodeTableError("an undeclared window is refused against some program")
+    if MachineConfig().splim is not None:
+        raise DecodeTableError("an absent stack floor reads as a declared one, so the "
+                               "machine's own default would never resolve")
+    if MachineConfig(splim=DATA_SIZE).splim != DATA_SIZE:
+        raise DecodeTableError("the declared stack floor does not survive validation")
+    for bad_floor in (-1, DATA_SIZE + 1, DATA_SIZE * 2):
+        try:
+            MachineConfig(splim=bad_floor)
+        except ConfigError:
+            continue
+        raise DecodeTableError(f"a stack floor of {bad_floor} is accepted, though it is "
+                               f"outside the DATA span the floor is bounded by")
+    if MachineConfig().entry is not None:
+        raise DecodeTableError("an absent boot address reads as a declared one, so the "
+                               "machine's own default would never resolve")
+    if MachineConfig(entry=0x0100).entry != 0x0100 or DEFAULT_ENTRY != 0:
+        raise DecodeTableError("the declared boot address does not survive validation, "
+                               "or the default is not the address the machine boots")
+    for bad_entry in (-1, 1 << 16):
+        try:
+            MachineConfig(entry=bad_entry)
+        except ConfigError:
+            continue
+        raise DecodeTableError(f"a boot address of {bad_entry} is accepted, though it "
+                               f"is outside the 16 bits the field declares")
+    if MachineConfig().tdlim is not None:
+        raise DecodeTableError("an absent trap-depth limit reads as a declared one, so "
+                               "the machine's own default would never resolve")
+    if MachineConfig(tdlim=9).tdlim != 9 or DEFAULT_TDLIM != 64:
+        raise DecodeTableError("the declared trap-depth limit does not survive "
+                               "validation, or the default is not the 64 traps an "
+                               "absent block declares")
+    for bad in (-1, 1 << 8):
+        try:
+            MachineConfig(tdlim=bad)
+        except ConfigError:
+            continue
+        raise DecodeTableError(f"a trap-depth limit of {bad} is accepted, though it is "
+                               f"outside the 8 bits the field declares")
+    try:
+        MachineConfig(codelen=4, entry=4)
+    except ConfigError as e:
+        if "ENTRY=4" not in str(e) or "4 bytes" not in str(e):
+            raise DecodeTableError("a boot address at the program end is refused without "
+                                   f"naming the address and the program: {e}")
+    else:
+        raise DecodeTableError("a boot address at the program end is accepted, so a "
+                               "machine whose first fetch would fault has no gate")
     for bad in (0, 3, 6, OUT_CAP_LIMIT):
         try:
             check_capacity(bad, OUT_CAP_LIMIT - 1)
@@ -1080,6 +1174,21 @@ def check_fault_table():
         raise DecodeTableError(f"the bank sites are not stacked directly after "
                                f"{BANK_SITE_ANCHOR!r}: "
                                f"{[s for s, _c in FAULT_SITE_ORDER[keep:keep + 2]]}")
+
+    if not SITE_RANK["TRAP_UNREG"] < SITE_RANK["TRAP_DEPTH"] < SITE_RANK["STACK_PUSH"]:
+        raise DecodeTableError("the EXT chain tests the vector, then the depth counter, "
+                               "then the four-slot push room, so the precedence list "
+                               "must rank TRAP_UNREG < TRAP_DEPTH < STACK_PUSH: "
+                               f"{[s for s in FAULT_SITE_NAMES if s in (
+                                   'TRAP_UNREG', 'TRAP_DEPTH', 'STACK_PUSH')]}")
+    if not SITE_RANK["TRAP_UNBALANCED"] < SITE_RANK["STACK_POP"] \
+            < SITE_RANK["TRAP_FRAME"]:
+        raise DecodeTableError("the TRAPRET chain tests the depth counter, then the "
+                               "four-slot pop room, then the frame tag, so the "
+                               "precedence list must rank TRAP_UNBALANCED < STACK_POP "
+                               "< TRAP_FRAME: "
+                               f"{[s for s in FAULT_SITE_NAMES if s in (
+                                   'TRAP_UNBALANCED', 'STACK_POP', 'TRAP_FRAME')]}")
     order = full_fault_cause_order()
     if order.index(CAUSE["BANK_OOB"]) > order.index(CAUSE["BANK_BUSY"]) \
             or order.index(CAUSE["BANK_BUSY"]) > order.index(CAUSE["DATA_OOB"]):

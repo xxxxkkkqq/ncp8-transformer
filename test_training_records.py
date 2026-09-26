@@ -163,6 +163,53 @@ def main():
           stream["expected"]["out"] == "01020304" and stream["kind"] == "sft",
           str(stream["expected"]))
 
+    trap_prog = ("  JMP start\n  HALT\nhandler:\n  LDI r0, 7\n  OUT r0\n"
+                 "  TRAPRET\nstart:\n  EXT 0\n  LDI r0, 9\n  OUT r0\n  HALT\n")
+    ident5b = {"ncl_version": "asm-test", "emitter_digest": LIVE, "flags": []}
+
+    def trap_label(vec_target):
+        try:
+            return R.label({"kind": "sft", "text": trap_prog, "input": "",
+                            "initial_data": "", "budget": 48,
+                            "config": {"vec": {0: vec_target}},
+                            "compiler_identity": ident5b})
+        except R.RecordError as exc:
+            return {"expected": {}, "refusal": str(exc)}
+
+    served = trap_label(4)
+    check("the declared vector table reaches the machines a label is computed on",
+          served["expected"].get("out") == "0709"
+          and served["expected"].get("status") == 1,
+          served.get("refusal", str(served["expected"])))
+    unreg = trap_label(0)
+    check("the same program under an unregistered vector labels the trap fault",
+          unreg["expected"].get("status") == 3
+          and unreg["expected"].get("fault_reason") == "TRAP_UNREG",
+          unreg.get("refusal", str(unreg["expected"])))
+
+    check("a configured record reproduces in a fresh process",
+          not R.reexecute([served], name_of=lambda r: "served")
+          and not R.reexecute([unreg], name_of=lambda r: "unreg"),
+          str(R.reexecute([served], name_of=lambda r: "served")))
+
+    add_prog = ("  IN r2\nloop:\n  IN r0\n  IN r1\n  ADC r0, r1\n  OUT r0\n"
+                "  DJNZ r2, loop\n  HALT\n")
+    add_ident = {"ncl_version": "asm-test", "emitter_digest": LIVE, "flags": []}
+
+    def add_record(stream):
+        return R.label({"kind": "sft", "text": add_prog, "input": stream.hex(),
+                        "initial_data": "", "budget": 48,
+                        "config": {"outcap": G.OUT_CAP},
+                        "compiler_identity": add_ident})
+
+    first = add_record(bytes([2, 10, 22, 0, 0]))
+    second = add_record(bytes([2, 200, 100, 0, 0]))
+    check("two records sharing one text label their own streams",
+          first["expected"]["out"] == "2000" and second["expected"]["out"] == "2c01",
+          f"{first['expected'].get('out')} / {second['expected'].get('out')}")
+    both = R.reexecute([first, second])
+    check("same-text records reproduce under the default naming", not both, str(both))
+
     check("provenance recorded", good["machine_commit"] == R.machine_commit()
           and bool(R.provenance()["machine_commit"]))
     with tempfile.TemporaryDirectory() as d:
@@ -256,7 +303,9 @@ def main():
           set(stamp) == set(R.IDENTITY_KEYS) and stamp["emitter_digest"] == LIVE,
           str(sorted(stamp)))
     stale = json.loads(json.dumps(good))
-    stale["compiler_identity"]["emitter_digest"] = "0" + LIVE[1:]
+
+    stale["compiler_identity"]["emitter_digest"] = \
+        ("0" if LIVE[0] != "0" else "1") + LIVE[1:]
     got = R.emitter_problems(stale, name="stale")
     check("refusal a record whose producer digest is not this tree's",
           any("digest" in x for x in got), str(got))
@@ -321,8 +370,9 @@ def main():
                                                             name_of=lambda r: "n").values()
               for x in group), str(R.reexecute([no_tick], name_of=lambda r: "n")))
     clean = R.reexecute([good], name_of=lambda r: "g")
+
     check("the unaltered record reproduces its tick count",
-          clean == {"g": []}, str(clean))
+          clean == {}, str(clean))
 
     with tempfile.TemporaryDirectory() as td:
         cpath = Path(td) / "cpt.jsonl"

@@ -502,7 +502,8 @@ class LoadResult:
             winlo, winhi = self.window
         vec = dict(self.vectors) if self.vectors else None
 
-        return ISA.MachineConfig(codelen=self.content_extent, winlo=winlo, winhi=winhi,
+        return ISA.MachineConfig(codelen=self.content_extent, entry=self.entry,
+                                 winlo=winlo, winhi=winhi,
                                  vec=vec)
 
 def _next_pow2(v):
@@ -770,10 +771,10 @@ def _finish(symbols, placer, vectors, window, image, entry):
     else:
         entry_explicit = True
         entry = _resolve(entry, symbols, "entry", 0, 0xFFFF)
-        if entry >= content_extent:
-            raise LoaderError(f"entry 0x{entry:04X} is past the end of the "
-                              f"{content_extent}-byte content: padding past the content is "
-                              f"a buffer, not a place to start", None)
+    bad = ISA.entry_error(entry, content_extent)
+    if bad is not None:
+        raise LoaderError(bad + "; padding past the content is a buffer, not a place "
+                                "to start", None)
 
     rep = [f"image: {length} bytes "
            + ("(length requested exactly)" if image is not None
@@ -794,9 +795,7 @@ def _finish(symbols, placer, vectors, window, image, entry):
                + ("(given)" if entry_explicit else
                   ("(symbol main)" if "main" in symbols else
                    "(no entry given and no symbol main: the load address 0)"))
-               + (" - where this load's `main` is, not where the machine starts: every "
-                  "path boots at CODE[0] until a start address is configuration"
-                  if entry else ""))
+               + " - the address the machine boots at")
     rep.append(f"symbols: {len(symbols.flat())}")
     for name in sorted(symbols.flat()):
         rep.append(f"        {name:16s} 0x{symbols.value(name):04X} ({symbols.kind_of(name)})")

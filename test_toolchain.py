@@ -667,7 +667,7 @@ def test_loader_boundaries_both_sides():
             vectors={0: 0x0F02})
     refused(["vector 0", "not registered"], vectors={0: 0})
     accepted(src=edge, entry=0x0F01)
-    refused(["entry", "past the end", "0x0F02"], src=edge, entry=0x0F02)
+    refused(["ENTRY", "does not fit", "0x0F02", "3842 bytes"], src=edge, entry=0x0F02)
 
     accepted(src="  .org 0x0008\n  HALT\n", window=(0x08, 0x08))
     accepted(src="  .org 0x0FFF\n  .byte 7\n", window=(0x0000, CODE_SIZE))
@@ -718,11 +718,11 @@ def hand_image(placements, length):
         b[addr:addr + len(chunk)] = chunk
     return bytes(b)
 
-def hand_config(placements, vec=None, window=None):
+def hand_config(placements, vec=None, window=None, entry=ISA.DEFAULT_ENTRY):
 
     lo, hi = (None, None) if window is None else window
     return ISA.MachineConfig(codelen=max([a + len(c) for a, c in placements] or [1]),
-                             winlo=lo, winhi=hi, vec=vec)
+                             entry=entry, winlo=lo, winhi=hi, vec=vec)
 
 def first_difference(want, got):
     for i in range(max(len(want), len(got))):
@@ -732,11 +732,13 @@ def first_difference(want, got):
             return i, a, b
     return None
 
-def declared(name, segments, length, src, kw, vec=None, window=None, expect=None):
+def declared(name, segments, length, src, kw, vec=None, window=None, expect=None,
+             entry=None):
 
     placements = [(addr, asm(text)) for addr, text in segments]
     return dict(name=name, image=hand_image(placements, length),
-                config=hand_config(placements, vec=vec, window=window),
+                config=hand_config(placements, vec=vec, window=window,
+                                   entry=ISA.DEFAULT_ENTRY if entry is None else entry),
                 src=src, kw=kw, expect=expect or {})
 
 SELFMOD = """    JMP main
@@ -754,25 +756,28 @@ main:
 
 DECLARED_CASES = (
     declared("trap to a handler at 0x10, in a padded buffer",
-             [(0, "  EXT 0\n  HALT\n"), (0x10, "  ADDI r0, 1\n  RET\n")], 0x0F02,
-             "  EXT 0\n  HALT\n  .org 0x10\nhandler:\n  ADDI r0, 1\n  RET\n",
+             [(0, "  EXT 0\n  HALT\n"), (0x10, "  ADDI r0, 1\n  TRAPRET\n")], 0x0F02,
+             "  EXT 0\n  HALT\n  .org 0x10\nhandler:\n  ADDI r0, 1\n  TRAPRET\n",
              dict(vectors={0: "handler"}, image=0x0F02), vec={0: 0x10},
              expect=dict(status="HALT", r0=1)),
     declared("a handler that takes a second trap",
              [(0, "  EXT 0\n  LDI r3, 0x7E\n  HALT\n"),
-              (0x20, "  EXT 1\n  ADDI r0, 1\n  RET\n"), (0x26, "  ADDI r0, 5\n  RET\n")],
-             0x29,
+              (0x20, "  EXT 1\n  ADDI r0, 1\n  TRAPRET\n"),
+              (0x27, "  ADDI r0, 5\n  TRAPRET\n")],
+             0x2B,
              "  EXT 0\n  LDI r3, 0x7E\n  HALT\n  .org 0x20\nh0:\n  EXT 1\n  ADDI r0, 1\n"
-             "  RET\nh1:\n  ADDI r0, 5\n  RET\n",
-             dict(vectors={0: "h0", 1: "h1"}, image=0x29), vec={0: 0x20, 1: 0x26},
+             "  TRAPRET\nh1:\n  ADDI r0, 5\n  TRAPRET\n",
+             dict(vectors={0: "h0", 1: "h1"}, image=0x2B), vec={0: 0x20, 1: 0x27},
              expect=dict(status="HALT", r0=6, r3=0x7E, SP=4096)),
     declared("self-modification inside the declared span",
              [(0, SELFMOD)], 0x100, SELFMOD, dict(window=(0x00, 0x08), image=0x100),
-             window=(0x00, 0x08), expect=dict(status="HALT", out=b"\x2a")),
+             window=(0x00, 0x08), expect=dict(status="HALT", out=b"\x2a"),
+             entry=0x0006),
 
     declared("the same write outside the declared span",
              [(0, SELFMOD)], 0x100, SELFMOD, dict(window=(0x08, 0x10), image=0x100),
-             window=(0x08, 0x10), expect=dict(status="ERROR", cause="WINDOW")),
+             window=(0x08, 0x10), expect=dict(status="ERROR", cause="WINDOW"),
+             entry=0x0006),
     declared("program bytes where configuration used to live",
              [(0, "  JMP 0x0F00\n"), (0x0F00, "  LDI r0, 3\n  HALT\n")], 0x0F03,
              "  JMP code\n  .org 0x0F00\ncode:\n  LDI r0, 3\n  HALT\n",
@@ -799,7 +804,7 @@ def test_a_declared_load_and_a_hand_configured_machine_are_one_machine():
                     f"{case['name']}: bytes differ from 0x{d[0]:04X} (hand {d[1]}, "
                     f"loader {d[2]}, {len(want)}B against {len(got.image)}B)")
         block, hand = got.config(), case["config"]
-        for field in ("codelen", "winlo", "winhi"):
+        for field in ("codelen", "entry", "winlo", "winhi"):
             require(getattr(block, field) == getattr(hand, field),
                     f"{case['name']}: {field} is {getattr(block, field)}, the hand "
                     f"block says {getattr(hand, field)}")
@@ -1104,9 +1109,11 @@ def test_profile_totals_match_the_machine():
                                           f"{p.by_codepoint}")
     require(p.total_ticks == 8192 * 2, f"ticks around the overflow: {p.total_ticks}")
     p = profiler.run(f, tick_budget=1000)
-    require(p.stopped == "fault" and p.by_codepoint == {0x09: 1}, f"off-image jump: "
-                                                                  f"{p.by_codepoint} "
-                                                                  f"{p.faults}")
+
+    require(p.stopped == "fault" and p.by_codepoint == {} and p.total_ticks == 0,
+            f"off-image jump: {p.by_codepoint} {p.faults}")
+    require(len(p.faults) == 1 and "PC_ILLEGAL" in p.faults[0][2],
+            f"off-image jump fault: {p.faults}")
     print(f"  all {len(cases)} programs: histograms sum exactly to the machine's tick "
           f"count, with faults and the overrun accounted separately")
 
@@ -1172,10 +1179,13 @@ def test_profile_reports_every_number_it_carries():
     require(msg and "DATA_SIZE" in msg, f"an oversized DATA image was accepted: {msg}")
     msg = refuses(profiler.run, r.image, tick_budget=True)
     require(msg and "tick_budget" in msg, f"a bool tick_budget was accepted: {msg}")
-    msg = refuses(profiler.run_result, loader.assemble("  HALT\nmain:\n  HALT\n"),
-                  tick_budget=10)
-    require(msg and "entry 0x0001" in msg and "PC 0" in msg,
-            f"run_result profiled an image whose declared entry is not the boot PC: {msg}")
+    entered = profiler.run_result(loader.assemble(
+        "  LDI r0, 7\n  OUT r0\n  HALT\nmain:\n  LDI r0, 9\n  OUT r0\n  HALT\n"))
+    require(entered.out == bytes([9]) and entered.total_ticks == 3
+            and entered.hot_pcs(1)[0][0] == 4,
+            f"run_result did not profile the image from its declared entry: "
+            f"out={entered.out!r} ticks={entered.total_ticks} "
+            f"first pc={entered.hot_pcs(1)}")
     require(profiler.compare(p, capped)[0] == profiler.compare(p)[0]
             and profiler.compare(p)[0] == (11, 7, 7, "HALT", 0, 0),
             f"compare says {profiler.compare(p, capped)}")
@@ -1473,14 +1483,14 @@ sub:
     off = loader.assemble("  JMP 0x0030\n", image=0x30).image
     d = debug.Debug(off)
     fr = d.run()
-    require(d.stopped == "fault" and [f.committed() for f in fr] == [True, False],
-            f"a PC past the end of the image ran {[f.committed() for f in fr]} "
-            f"({d.stopped})")
-    require(fr[1].codepoint == debug.PC_OUTSIDE_IMAGE and fr[1].code == b""
-            and fr[1].post is None and fr[1].raised is not None and not fr[1].assigned,
-            f"the off-image frame is {fr[1]!r}")
-    require(fr[1].text == "<PC outside the image>", f"off-image text {fr[1].text!r}")
-    require(fr[1].state_view() == fr[1].pre, "a frame with no post-state must show its pre")
+
+    require(d.stopped == "fault" and [f.committed() for f in fr] == [False],
+            f"an off-image jump ran {[f.committed() for f in fr]} ({d.stopped})")
+    require(fr[0].codepoint == 0x09 and fr[0].assigned and fr[0].post is None
+            and fr[0].raised is not None,
+            f"the off-image jump frame is {fr[0]!r}")
+    require(d.m.fault_reason == ISA.CAUSE["PC_ILLEGAL"] and d.m.PC == 0,
+            f"the off-image jump stopped with cause {d.m.fault_reason}, PC {d.m.PC}")
     require(debug.PC_OUTSIDE_IMAGE < 0, "the sentinel code point must not be an encoding")
     debug.record(off).replay()
 

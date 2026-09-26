@@ -30,7 +30,11 @@ DATA_SIZE = 4096
 VEC = 0x0F00
 WLO, WHI = 0x0F20, 0x0F21
 VEC_TGT = 0x0040
-CALL_TGT = 0x1F00
+
+CALL_TGT = 0x0F01
+
+RET_DATA = bytes(0x0D if i in (0, 1, 2, 3, 4, 4094, 4095)
+                 else (i * 7 + 13) & 0xFF for i in range(DATA_SIZE))
 
 PC_SITES = (0, 256)
 
@@ -56,9 +60,9 @@ def config_for(vec0):
 
     return None if vec0 is None else ISA.MachineConfig(vec={0: vec0})
 
-def run_reference(code, sp, hl, de, pc=0, vec0=None):
+def run_reference(code, sp, hl, de, pc=0, vec0=None, data_img=DATA_IMAGE):
 
-    g = NCP8(code, data=DATA_IMAGE, inputs=INPUTS, config=config_for(vec0))
+    g = NCP8(code, data=data_img, inputs=INPUTS, config=config_for(vec0))
     g.load_state(INIT_R, hl, de, sp, INIT_C, INIT_Z, TICK0, PC=pc)
     try:
         g.step()
@@ -67,9 +71,9 @@ def run_reference(code, sp, hl, de, pc=0, vec0=None):
         raised = True
     return raised, ref_view(g), list(g.data), bytes(g.code)[:len(code)], bytes(g.out)
 
-def run_circuit(Machine, code, sp, hl, de, pc=0, vec0=None):
+def run_circuit(Machine, code, sp, hl, de, pc=0, vec0=None, data_img=DATA_IMAGE):
 
-    c = Machine(code, data=DATA_IMAGE, inputs=INPUTS, config=config_for(vec0))
+    c = Machine(code, data=data_img, inputs=INPUTS, config=config_for(vec0))
     c.load_state(INIT_R, hl, de, sp, INIT_C, INIT_Z, TICK0, PC=pc)
     try:
         c.step()
@@ -84,13 +88,13 @@ def run_circuit(Machine, code, sp, hl, de, pc=0, vec0=None):
     return raised, snap, data, code_img, c.out()
 
 def check_case(name, code, sp, hl, de, expect_err, expect_commit=None, pc=0,
-            vec0=None):
+            vec0=None, data_img=DATA_IMAGE):
 
-    runs = [("reference", run_reference(code, sp, hl, de, pc, vec0)),
-            ("torch", run_circuit(TorchCircuit, code, sp, hl, de, pc, vec0)),
-            ("triton", run_circuit(TritonCircuit, code, sp, hl, de, pc, vec0))]
+    runs = [("reference", run_reference(code, sp, hl, de, pc, vec0, data_img)),
+            ("torch", run_circuit(TorchCircuit, code, sp, hl, de, pc, vec0, data_img)),
+            ("triton", run_circuit(TritonCircuit, code, sp, hl, de, pc, vec0, data_img))]
     ref_pre = dict(r=list(INIT_R), HL=hl, DE=de, MB=0, SP=sp, PC=pc, C=INIT_C, Z=INIT_Z,
-                   S=INIT_S, V=INIT_V,
+                   S=INIT_S, V=INIT_V, TDEPTH=0,
                    ipos=0, oplen=0, tick=TICK0, status=0, fault_reason=0, fault_addr=0)
     assert set(ref_pre) == set(VIEW_FIELDS), (
         "this suite's field list and the comparison set have drifted apart")
@@ -108,7 +112,7 @@ def check_case(name, code, sp, hl, de, expect_err, expect_commit=None, pc=0,
             assert post["fault_addr"] == pc, (
                 name, label, "fault_addr must be the faulting instruction's address",
                 pc, post)
-            assert data == list(DATA_IMAGE), (name, label, "error tick changed DATA")
+            assert data == list(data_img), (name, label, "error tick changed DATA")
             assert code_img == code, (name, label, "error tick changed CODE")
             assert out == b"", (name, label, "error tick changed the output stream", out)
         else:
@@ -127,13 +131,13 @@ def check_case(name, code, sp, hl, de, expect_err, expect_commit=None, pc=0,
             (name, label, "memory or output differs from the reference")
     return "err" if expect_err else "ok"
 
-def legal_expect(kind, sp, hl, de, imm=None, pc=0):
+def legal_expect(kind, sp, hl, de, imm=None, pc=0, data_img=DATA_IMAGE):
 
     r = list(INIT_R)
-    d = bytearray(DATA_IMAGE)
+    d = bytearray(data_img)
     out = b""
     st = dict(r=r, HL=hl, DE=de, MB=0, SP=sp, PC=pc + 1, C=INIT_C, Z=INIT_Z,
-              S=INIT_S, V=INIT_V, ipos=0,
+              S=INIT_S, V=INIT_V, TDEPTH=0, ipos=0,
               oplen=0, tick=TICK0 + 1, status=0, fault_reason=0, fault_addr=0)
     ret_lo, ret_hi = (pc + 3) & 0xFF, (pc + 3) >> 8
     if kind in ("PUSHW HL", "PUSHW DE", "POPW HL", "POPW DE", "STW [HL], DE",
@@ -157,9 +161,14 @@ def legal_expect(kind, sp, hl, de, imm=None, pc=0):
         st["PC"] = (d[sp] << 8) | d[sp + 1]
         st["SP"] = sp + 2
     elif kind == "EXT 0":
-        st["SP"] = sp - 2
-        d[sp - 1], d[sp - 2] = ret_lo, ret_hi
+
+        st["SP"] = sp - 4
+        d[sp - 1] = ISA.TRAP_TAG
+        d[sp - 2] = (INIT_Z | (INIT_C << 1) | (INIT_S << 2) | (INIT_V << 3))
+        d[sp - 3] = ret_lo
+        d[sp - 4] = ret_hi
         st["PC"] = VEC_TGT
+        st["TDEPTH"] = 1
     elif kind == "MOV r0, [HL]":
         st["r"] = [d[hl], r[1], r[2], r[3]]
     elif kind == "MOV [HL], r0":
@@ -231,7 +240,7 @@ STACK_ERR = {
     "POP r0": lambda sp: sp >= DATA_SIZE,
     "CALL a16": lambda sp: sp < 2,
     "RET": lambda sp: sp + 2 > DATA_SIZE,
-    "EXT 0": lambda sp: sp < 2,
+    "EXT 0": lambda sp: sp < 4,
     "PUSHW HL": lambda sp: sp < 2,
     "PUSHW DE": lambda sp: sp < 2,
     "POPW HL": lambda sp: sp + 2 > DATA_SIZE,
@@ -289,13 +298,16 @@ def test_stack_boundaries():
             vec0 = VEC_TGT if kind.startswith("EXT") else None
             for sp in STACK_SP:
                 expect_err = STACK_ERR[kind](sp)
-                commit = None if expect_err else legal_expect(kind, sp, 0, 0, pc=pc)
+                img = RET_DATA if kind == "RET" else DATA_IMAGE
+                commit = (None if expect_err
+                          else legal_expect(kind, sp, 0, 0, pc=pc, data_img=img))
                 tot[check_case(f"{kind} @ SP={sp} PC={pc}", code, sp, 0, 0,
-                               expect_err, commit, pc, vec0)] += 1
+                               expect_err, commit, pc, vec0, data_img=img)] += 1
         print(f"  {kind:9s}: SP {STACK_SP} at PC {PC_SITES} -> "
               f"{sum(1 for sp in STACK_SP if STACK_ERR[kind](sp)) * len(PC_SITES)} error / "
               f"{sum(1 for sp in STACK_SP if not STACK_ERR[kind](sp)) * len(PC_SITES)} legal")
-    assert tot == {"ok": 94, "err": 32}, tot
+
+    assert tot == {"ok": 90, "err": 36}, tot
     print(f"  stack instructions x SP boundary x {len(PC_SITES)} addresses: "
           f"{sum(tot.values())} cases (error {tot['err']} + legal {tot['ok']})")
     return tot

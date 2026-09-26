@@ -57,14 +57,14 @@ _ALU, _S0, _S1, _LEN = _rom(ISA.single_rom())
 _ALU2, _S02, _S12, _LX2 = _rom(ISA.escape_rom())
 
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
-                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, where=""):
+                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, td=0, where=""):
 
     if not 0 <= oplen <= OUT_CAP:
         raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
     bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "MB": mb, "PC": PC,
                            "SP": SP, "C": C, "Z": Z, "S": s, "V": v, "ipos": ipos, "tick": tick,
                            "status": status, "fault_reason": fault_reason,
-                           "fault_addr": fault_addr},
+                           "fault_addr": fault_addr, "TDEPTH": td},
                           where)
     if bad is not None:
         raise ValueError(bad)
@@ -101,12 +101,20 @@ class TorchCircuit:
         bad = cfg.check_for_program(self.codelen, "TorchCircuit: ")
         if bad is not None:
             raise ISA.ConfigError(bad)
+
+        self.entry = ISA.DEFAULT_ENTRY if cfg.entry is None else cfg.entry
+        bad = ISA.entry_error(self.entry, self.codelen, "TorchCircuit: ")
+        if bad is not None:
+            raise ISA.ConfigError(bad)
         self.out_cap = ISA.resolve_constraint("OUTCAP", "out_cap", out_cap, OUT_CAP,
                                               cfg.outcap)
         ISA.check_capacity(self.out_cap, OUT_CAP)
 
         self.nbanks = 1 if cfg.nbanks is None else cfg.nbanks
-        self.tdlim = 0 if cfg.tdlim is None else cfg.tdlim
+        self.tdlim = ISA.DEFAULT_TDLIM if cfg.tdlim is None else cfg.tdlim
+
+        self.splim = 0 if cfg.splim is None else cfg.splim
+        self.SPLIM = torch.tensor([self.splim], dtype=i32, device=dev)
         self.CODE = torch.zeros(CODE_SIZE, dtype=i32, device=dev)
         self.CODE[: len(code)] = torch.tensor(list(code), dtype=i32, device=dev)
         self.DATA = torch.zeros(DATA_SIZE, dtype=i32, device=dev)
@@ -117,10 +125,11 @@ class TorchCircuit:
         self.set_inputs(inputs)
         self.OUTBUF = torch.zeros(self.out_cap, dtype=i32, device=dev)
         self.R = torch.zeros(4, dtype=i32, device=dev)
-        for n in ("HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "ipos", "oplen",
-                  "tick"):
+        for n in ("HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "TDEPTH", "ipos",
+                  "oplen", "tick"):
             setattr(self, n, torch.zeros(1, dtype=i32, device=dev))
         self.SP += DATA_SIZE
+        self.PC += self.entry
         self.status = torch.zeros(1, dtype=i32, device=dev)
 
         self.fault_reason = torch.zeros(1, dtype=i32, device=dev)
@@ -220,6 +229,9 @@ class TorchCircuit:
         der = self._g(self.DATA, self.DE)
         dsp = self._g(self.DATA, self.SP)
         dsp1 = self._g(self.DATA, self.SP + 1)
+
+        dsp2 = self._g(self.DATA, self.SP + 2)
+        dsp3 = self._g(self.DATA, self.SP + 3)
         inb = self._g(self.INPUTS, self.ipos)
         eof = (self.ipos >= self.inlen).to(i32)
 
@@ -270,6 +282,11 @@ class TorchCircuit:
         vec = self._g(self.cfg_vec, imm0)
         ext_ok = (imm0 < ISA.VEC_COUNT).to(i32) * (vec != 0).to(i32)
 
+        fpack = (self.Z * ISA.FLAG_BITS_PACKED["Z"] + self.C * ISA.FLAG_BITS_PACKED["C"]
+                 + self.S * ISA.FLAG_BITS_PACKED["S"] + self.V * ISA.FLAG_BITS_PACKED["V"])
+        depth_full = (self.TDEPTH == self.tdlim).to(i32)
+        trap_tag = (dsp3 == ISA.TRAP_TAG).to(i32)
+
         wlo, whi = self.cfg_win[0], self.cfg_win[1]
         code_ok = (self.HL < self.codelen).to(i32)
 
@@ -298,10 +315,7 @@ class TorchCircuit:
             + oh(POP) * dsp + oh(IN) * (1 - eof) * inb
             + oh(MOV_R_HL) * dl + oh(MOV_R_DE) * der
             + oh(GETPC) * self.PC + oh(GETSP) * (self.SP & 255)
-            + oh(GETF) * (self.Z * ISA.FLAG_BITS_PACKED["Z"]
-                          + self.C * ISA.FLAG_BITS_PACKED["C"]
-                          + self.S * ISA.FLAG_BITS_PACKED["S"]
-                          + self.V * ISA.FLAG_BITS_PACKED["V"])
+            + oh(GETF) * fpack
             + oh(AND) * v_and + oh(OR) * v_or + oh(XOR) * v_xor + oh(MUL) * v_mul
             + oh(DIV) * v_div + oh(MOD) * v_mod
             + oh(NOT) * v_not + oh(NEG) * v_neg + oh(ROL) * v_rol + oh(ROR) * v_ror
@@ -349,8 +363,10 @@ class TorchCircuit:
         rows_SP = w(oh(PUSH), self.SP - 1,
                    w(oh(POP), self.SP + 1,
                      w(oh(CALL), self.SP - 2,
-                       w(oh(EXT), self.SP - 2,
-                         w(oh(RET), self.SP + 2, self.SP)))))
+                       w(oh(CALL_HL), self.SP - 2,
+                         w(oh(EXT), self.SP - 4,
+                           w(oh(RET), self.SP + 2,
+                             w(oh(TRAPRET), self.SP + 4, self.SP)))))))
         rows_SP = w(oh(PUSHW_HL) + oh(PUSHW_DE), self.SP - 2, rows_SP)
         rows_SP = w(oh(POPW_HL) + oh(POPW_DE), self.SP + 2, rows_SP)
         rows_SP = w(oh(MOVW_SP_HL), self.HL, rows_SP)
@@ -366,7 +382,8 @@ class TorchCircuit:
             + oh(MUL) * (c_mul - self.C) + oh(NEG) * (c_neg - self.C) \
             + oh(ROL) * (c_rol - self.C) + oh(ROR) * (c_ror - self.C) \
             + oh(CMP) * (cmp_c - self.C) \
-            + oh(ADD_HLDE) * (c_hladd - self.C) + oh(SUB_HLDE) * (c_hlsub - self.C)
+            + oh(ADD_HLDE) * (c_hladd - self.C) + oh(SUB_HLDE) * (c_hlsub - self.C) \
+            + oh(TRAPRET) * (((dsp2 >> 1) & 1) - self.C)
 
         rows_Z = self.Z + oh(ADD) * ((v_add == 0).to(i32) - self.Z) \
             + oh(SUB) * ((v_sub == 0).to(i32) - self.Z) \
@@ -384,7 +401,8 @@ class TorchCircuit:
             + oh(NOT) * ((v_not == 0).to(i32) - self.Z) + oh(NEG) * ((v_neg == 0).to(i32) - self.Z) \
             + oh(ROL) * ((v_rol == 0).to(i32) - self.Z) + oh(ROR) * ((v_ror == 0).to(i32) - self.Z) \
             + oh(CMP) * ((a == b).to(i32) - self.Z) \
-            + oh(MULH) * ((v_mulh == 0).to(i32) - self.Z)
+            + oh(MULH) * ((v_mulh == 0).to(i32) - self.Z) \
+            + oh(TRAPRET) * ((dsp2 & 1) - self.Z)
 
         rows_S = self.S + oh(ADD) * (s_add - self.S) \
             + oh(ADC) * (s_adc - self.S) \
@@ -394,7 +412,8 @@ class TorchCircuit:
             + oh(SUBI) * (s_subi - self.S) \
             + oh(ADCI) * (s_adci - self.S) \
             + oh(CMP) * (cmp_s - self.S) \
-            + oh(NEG) * (s_neg - self.S)
+            + oh(NEG) * (s_neg - self.S) \
+            + oh(TRAPRET) * (((dsp2 >> 2) & 1) - self.S)
 
         rows_V = self.V + oh(ADD) * (v_ovf_add - self.V) \
             + oh(ADC) * (v_ovf_adc - self.V) \
@@ -403,7 +422,8 @@ class TorchCircuit:
             + oh(ADDI) * (v_ovf_addi - self.V) \
             + oh(SUBI) * (v_ovf_subi - self.V) \
             + oh(ADCI) * (v_ovf_adci - self.V) \
-            + oh(CMP) * (cmp_v - self.V)
+            + oh(CMP) * (cmp_v - self.V) \
+            + oh(TRAPRET) * (((dsp2 >> 3) & 1) - self.V)
 
         fall = self.PC + ln_e
         retv = (dsp << 8) | dsp1
@@ -429,22 +449,34 @@ class TorchCircuit:
         rows_PC = w(oh(VS), vs_t, rows_PC)
         rows_PC = w(oh(VC), vc_t, rows_PC)
         rows_PC = w(oh(JPHL), self.HL, rows_PC)
+
+        rows_PC = w(oh(TRAPRET), retv, rows_PC)
+        rows_PC = w(oh(CALL_HL), self.HL, rows_PC)
         rows_PC = w(oh(EXT), vec, rows_PC)
 
         rows_ipos = w(oh(IN) * (1 - eof), self.ipos + 1, self.ipos)
+
+        rows_TDEPTH = w(oh(EXT), self.TDEPTH + 1,
+                        w(oh(TRAPRET), self.TDEPTH - 1, self.TDEPTH))
 
         rows_out_val = oh(OUT) * rr + oh(OUTM) * dl + oh(OUTDE) * der
         rows_out_en = oh(OUT) + oh(OUTM) + oh(OUTDE)
 
         fetch_ok_rows = (self.PC + ln_e <= self.codelen).to(i32)
         hl_ok = (self.HL < DATA_SIZE).to(i32); de_ok = (self.DE < DATA_SIZE).to(i32)
-        sp_lo = (self.SP > 0).to(i32); sp_lo2 = (self.SP >= 2).to(i32); sp_hi = (self.SP < DATA_SIZE).to(i32)
+
+        sp_lo = (((self.SP - self.SPLIM) > 0) & (self.SP <= DATA_SIZE)).to(i32)
+        sp_lo2 = (((self.SP - self.SPLIM) >= 2) & (self.SP <= DATA_SIZE)).to(i32)
+        sp_hi = (self.SP < DATA_SIZE).to(i32)
         sp_hi1 = ((self.SP + 1) < DATA_SIZE).to(i32)
 
         hl_ok2 = ((self.HL + 1) < DATA_SIZE).to(i32)
         de_ok2 = ((self.DE + 1) < DATA_SIZE).to(i32)
         fr_ok = (fr < DATA_SIZE).to(i32)
         sp_hi2 = ((self.SP + 2) <= DATA_SIZE).to(i32)
+
+        sp_lo4 = (((self.SP - self.SPLIM) >= 4) & (self.SP <= DATA_SIZE)).to(i32)
+        sp_hi4 = ((self.SP + 4) <= DATA_SIZE).to(i32)
         hl_sp_ok = (self.HL <= DATA_SIZE).to(i32)
         de_sp_ok = (self.DE <= DATA_SIZE).to(i32)
         sp_add_ok = (v_sp_add <= DATA_SIZE).to(i32)
@@ -460,20 +492,41 @@ class TorchCircuit:
             + (oh(LDMW_HL_DE) + oh(STMW_DE_HL)) * (1 - de_ok2)
 
         push_rows = (oh(PUSH) * (1 - sp_lo) + oh(CALL) * (1 - sp_lo2)
-                     + oh(EXT) * (1 - sp_lo2)
+                     + oh(CALL_HL) * (1 - sp_lo2)
+                     + oh(EXT) * (1 - sp_lo4)
                      + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (1 - sp_lo2))
         pop_rows = (oh(POP) * (1 - sp_hi) + oh(RET) * (1 - sp_hi1)
+                    + oh(TRAPRET) * (1 - sp_hi4)
                     + (oh(POPW_HL) + oh(POPW_DE)) * (1 - sp_hi2))
         v3_err = (oh(MOVW_SP_HL) * (1 - hl_sp_ok) + oh(MOVW_SP_DE) * (1 - de_sp_ok)
                   + oh(ADD_SP) * (1 - sp_add_ok))
 
         out_ovf = (ind * rows_out_en * (self.oplen >= self.out_cap).to(i32)).sum()
 
+        cl = self.codelen
+
+        trapret_live = (self.TDEPTH > 0).to(i32) * sp_hi4 * trap_tag
+        pc_hit = (oh(JMP) + oh(CALL)) * (t16 >= cl).to(i32) \
+            + oh(RET) * (retv >= cl).to(i32) \
+            + oh(TRAPRET) * trapret_live * (retv >= cl).to(i32) \
+            + oh(JZ) * self.Z * (t16 >= cl).to(i32) \
+            + oh(JNZ) * (1 - self.Z) * (t16 >= cl).to(i32) \
+            + oh(JC) * self.C * (t16 >= cl).to(i32) \
+            + oh(JNC) * (1 - self.C) * (t16 >= cl).to(i32) \
+            + oh(DJNZ) * (v_dj != 0).to(i32) * (t16 >= cl).to(i32) \
+            + (oh(JS) * self.S + oh(JNS) * (1 - self.S)
+               + oh(VS) * self.V + oh(VC) * (1 - self.V)) * (rel >= cl).to(i32) \
+            + oh(JPHL) * (self.HL >= cl).to(i32) \
+            + oh(CALL_HL) * (self.HL >= cl).to(i32) \
+            + oh(EXT) * ext_ok * (1 - depth_full) * (vec >= cl).to(i32)
+        pcw_clean = fetch_ok_rows * (1 - push_rows) * (1 - pop_rows)
+
         bad_rows = (ind * oh(BAD)).sum()
         fetch_code = (((1 - fetch_ok)
                        + esc * (self.PC + ISA.PREFIX_BYTES > self.codelen).to(i32)).sum())
 
         fired = torch.stack(tuple(v.reshape(()) for v in (
+            (ind * pc_hit * pcw_clean).sum(),
             fetch_code,
             bad_rows * (1 - esc),
             bad_rows * esc,
@@ -482,9 +535,13 @@ class TorchCircuit:
             (ind * bank_oob).sum(),
             (ind * bank_busy).sum(),
             (ind * oh(EXT) * (1 - ext_ok)).sum(),
+            (ind * oh(EXT) * ext_ok * depth_full).sum(),
+            (ind * oh(TRAPRET) * (self.TDEPTH == 0).to(i32)).sum(),
             (ind * rd_rows).sum(),
             (ind * push_rows).sum(),
             (ind * pop_rows).sum(),
+            (ind * oh(TRAPRET) * (self.TDEPTH > 0).to(i32) * sp_hi4
+             * (1 - trap_tag)).sum(),
             (ind * (oh(DIV) + oh(MOD)) * (b == 0).to(i32)).sum(),
             (ind * (oh(LDC) + oh(STC)) * (1 - code_ok)).sum(),
             (ind * oh(STC) * code_ok * (1 - win_ok)).sum(),
@@ -506,6 +563,7 @@ class TorchCircuit:
 
         a1 = sel(oh(MOV_HL_R) * self.HL + oh(MOV_DE_R) * self.DE
                  + oh(PUSH) * (self.SP - 1) + oh(CALL) * (self.SP - 1)
+                 + oh(CALL_HL) * (self.SP - 1)
                  + oh(EXT) * (self.SP - 1)
                  + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (self.SP - 1)
                  + oh(STW_HLDE) * self.HL + oh(STW_DEHL) * self.DE
@@ -513,34 +571,49 @@ class TorchCircuit:
                  + oh(STM) * self.HL + oh(STMW_HL_DE) * self.HL
                  + oh(STMW_DE_HL) * self.DE)
         v1 = sel(oh(MOV_HL_R) * rr + oh(MOV_DE_R) * rr + oh(PUSH) * rr
-                 + oh(CALL) * ((self.PC + 3) & 255) + oh(EXT) * ((self.PC + 3) & 255)
+                 + oh(CALL) * ((self.PC + 3) & 255) + oh(CALL_HL) * ((self.PC + 2) & 255)
+                 + oh(EXT) * ISA.TRAP_TAG
                  + oh(PUSHW_HL) * ((self.HL >> 8) & 255) + oh(PUSHW_DE) * ((self.DE >> 8) & 255)
                  + oh(STW_HLDE) * (self.DE & 255) + oh(STW_DEHL) * (self.HL & 255)
                  + oh(STX) * rr
                  + oh(STM) * a_s0 + oh(STMW_HL_DE) * (self.DE & 255)
                  + oh(STMW_DE_HL) * (self.HL & 255))
-        e1 = sel(oh(MOV_HL_R) + oh(MOV_DE_R) + oh(PUSH) + oh(CALL) + oh(EXT)
+        e1 = sel(oh(MOV_HL_R) + oh(MOV_DE_R) + oh(PUSH) + oh(CALL) + oh(CALL_HL)
+                 + oh(EXT)
                  + oh(PUSHW_HL) + oh(PUSHW_DE) + oh(STW_HLDE) + oh(STW_DEHL) + oh(STX)
                  + oh(STM) + oh(STMW_HL_DE) + oh(STMW_DE_HL)) * m
         oh1 = ((self.RD == a1).to(i32)) * e1
         self.DATA = oh1 * v1 + (1 - oh1) * self.DATA
-        a2 = sel(oh(CALL) * (self.SP - 2) + oh(EXT) * (self.SP - 2)
+        a2 = sel(oh(CALL) * (self.SP - 2) + oh(CALL_HL) * (self.SP - 2)
+                 + oh(EXT) * (self.SP - 2)
                  + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (self.SP - 2)
                  + oh(STW_HLDE) * (self.HL + 1) + oh(STW_DEHL) * (self.DE + 1)
                  + oh(STMW_HL_DE) * (self.HL + 1) + oh(STMW_DE_HL) * (self.DE + 1))
-        v2 = sel(oh(CALL) * ((self.PC + 3) >> 8) + oh(EXT) * ((self.PC + 3) >> 8)
+        v2 = sel(oh(CALL) * ((self.PC + 3) >> 8) + oh(CALL_HL) * ((self.PC + 2) >> 8)
+                 + oh(EXT) * fpack
                  + oh(PUSHW_HL) * (self.HL & 255) + oh(PUSHW_DE) * (self.DE & 255)
                  + oh(STW_HLDE) * ((self.DE >> 8) & 255) + oh(STW_DEHL) * ((self.HL >> 8) & 255)
                  + oh(STMW_HL_DE) * ((self.DE >> 8) & 255)
                  + oh(STMW_DE_HL) * ((self.HL >> 8) & 255))
-        e2 = sel(oh(CALL) + oh(EXT) + oh(PUSHW_HL) + oh(PUSHW_DE)
+        e2 = sel(oh(CALL) + oh(CALL_HL) + oh(EXT) + oh(PUSHW_HL) + oh(PUSHW_DE)
                  + oh(STW_HLDE) + oh(STW_DEHL) + oh(STMW_HL_DE) + oh(STMW_DE_HL)) * m
         oh2 = ((self.RD == a2).to(i32)) * e2
         self.DATA = oh2 * v2 + (1 - oh2) * self.DATA
 
-        a3 = sel(oh(STC) * self.HL); v3 = sel(oh(STC) * rr); e3 = sel(oh(STC)) * m
-        oh3 = ((self.RC == a3).to(i32)) * e3
-        self.CODE = oh3 * v3 + (1 - oh3) * self.CODE
+        a3 = sel(oh(EXT) * (self.SP - 3))
+        v3 = sel(oh(EXT) * ((self.PC + 3) & 255))
+        e3 = sel(oh(EXT)) * m
+        oh3 = ((self.RD == a3).to(i32)) * e3
+        self.DATA = oh3 * v3 + (1 - oh3) * self.DATA
+        a4 = sel(oh(EXT) * (self.SP - 4))
+        v4 = sel(oh(EXT) * ((self.PC + 3) >> 8))
+        e4 = sel(oh(EXT)) * m
+        oh4 = ((self.RD == a4).to(i32)) * e4
+        self.DATA = oh4 * v4 + (1 - oh4) * self.DATA
+
+        a5 = sel(oh(STC) * self.HL); v5 = sel(oh(STC) * rr); e5 = sel(oh(STC)) * m
+        oh5 = ((self.RC == a5).to(i32)) * e5
+        self.CODE = oh5 * v5 + (1 - oh5) * self.CODE
 
         ov = sel(rows_out_val) * m
         oe = sel(rows_out_en) * m
@@ -569,6 +642,7 @@ class TorchCircuit:
         self.Z = m * sel(rows_Z) + (1 - m) * self.Z
         self.S = m * (sel(rows_S) & 1) + (1 - m) * self.S
         self.V = m * (sel(rows_V) & 1) + (1 - m) * self.V
+        self.TDEPTH = m * sel(rows_TDEPTH) + (1 - m) * self.TDEPTH
         self.ipos = m * sel(rows_ipos) + (1 - m) * self.ipos
         self.tick = self.tick + m
 
@@ -584,7 +658,8 @@ class TorchCircuit:
         vv = int(self.V.item()) if V is None else V
         check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=int(self.ipos.item()),
                     oplen=int(self.oplen.item()), status=int(self.status.item()),
-                    fault_reason=fr, fault_addr=fa, mb=int(self.MB.item()), s=sv, v=vv)
+                    fault_reason=fr, fault_addr=fa, mb=int(self.MB.item()), s=sv, v=vv,
+                    td=int(self.TDEPTH.item()))
         t = torch.tensor
         self.fault_reason = t([fr], dtype=torch.int32, device=self.dev)
         self.fault_addr = t([fa], dtype=torch.int32, device=self.dev)
@@ -606,13 +681,14 @@ class TorchCircuit:
     def _record_block(self):
 
         lo, hi = self.config.window()
-        return ISA.MachineConfig(codelen=self.codelen, winlo=lo, winhi=hi,
+        return ISA.MachineConfig(codelen=self.codelen, entry=self.entry,
+                                 winlo=lo, winhi=hi,
                                  vec=self.config.vectors(), nbanks=self.nbanks,
-                                 tdlim=self.tdlim, tickbudget=self.tb,
-                                 outcap=self.out_cap)
+                                 tdlim=self.tdlim, splim=self.splim,
+                                 tickbudget=self.tb, outcap=self.out_cap)
 
-    _RECORD_SCALARS = ("HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "ipos", "tick",
-                       "status", "fault_reason", "fault_addr")
+    _RECORD_SCALARS = ("HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "TDEPTH",
+                       "ipos", "tick", "status", "fault_reason", "fault_addr")
     _RECORD_READERS = {
         **{n: (lambda m, n=n: int(getattr(m, n).item())) for n in _RECORD_SCALARS},
         "r": lambda m: [int(v) for v in m.R.tolist()],
@@ -643,7 +719,8 @@ class TorchCircuit:
                     tick=st["tick"], PC=st["PC"], ipos=st["ipos"],
                     oplen=len(got.out), status=st["status"],
                     fault_reason=st["fault_reason"], fault_addr=st["fault_addr"],
-                    mb=st["MB"], s=st["S"], v=st["V"], where="TorchCircuit: ")
+                    mb=st["MB"], s=st["S"], v=st["V"], td=st["TDEPTH"],
+                    where="TorchCircuit: ")
         t = torch.tensor
         i32 = torch.int32
         self.R = t(st["r"], dtype=i32, device=self.dev)
@@ -662,6 +739,7 @@ class TorchCircuit:
                     MB=self.MB.item(),
                     SP=self.SP.item(), PC=self.PC.item(), C=self.C.item(), Z=self.Z.item(),
                     S=self.S.item(), V=self.V.item(),
+                    TDEPTH=int(self.TDEPTH.item()),
                     ipos=self.ipos.item(), oplen=self.oplen.item(), tick=self.tick.item(),
                     status=int(self.status.item()),
                     fault_reason=int(self.fault_reason.item()),
