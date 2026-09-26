@@ -42,6 +42,8 @@ S_MB = int(circuit_triton.S_MB)
 S_SIGN = int(circuit_triton.S_SIGN)
 S_OVFL = int(circuit_triton.S_OVFL)
 S_TDEPTH = int(circuit_triton.S_TDEPTH)
+S_STC_COUNT = int(circuit_triton.S_STC_COUNT)
+S_STC_FIRST = int(circuit_triton.S_STC_FIRST)
 assert circuit_triton.STATE_ROW_OF["MB"] == S_MB, (
     "the batch row and the state layout disagree about where the selector lives")
 assert circuit_triton.STATE_ROW_OF["S"] == S_SIGN \
@@ -126,10 +128,11 @@ def padded(code):
     return bytes(code).ljust(CODE_SIZE, b"\x00")
 
 def row_of(r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos=0, oplen=0, tick=0, status=0,
-           fault_reason=0, fault_addr=0, mb=0, s=0, v=0, splim=0, tdepth=0):
+           fault_reason=0, fault_addr=0, mb=0, s=0, v=0, splim=0, tdepth=0,
+           stc_count=0, stc_first=0):
 
     return [r0, r1, r2, r3, HL, DE, PC, SP, C, Z, ipos, oplen, tick, status,
-            fault_reason, fault_addr, mb, s, v, splim, tdepth]
+            fault_reason, fault_addr, mb, s, v, splim, tdepth, stc_count, stc_first]
 
 def push_row(batch, i, row):
 
@@ -137,7 +140,8 @@ def push_row(batch, i, row):
     batch.set_state(i, r=row[0:4], HL=row[4], DE=row[5], PC=row[6], SP=row[7],
                     C=row[8], Z=row[9], S=row[S_SIGN], V=row[S_OVFL], ipos=row[10],
                     oplen=row[11], tick=row[12], status=row[13], fault_reason=row[14],
-                    fault_addr=row[15], MB=row[S_MB], TDEPTH=row[S_TDEPTH])
+                    fault_addr=row[15], MB=row[S_MB], TDEPTH=row[S_TDEPTH],
+                    STC_COUNT=row[S_STC_COUNT], STC_FIRST=row[S_STC_FIRST])
 
 def op_case(op, seed):
 

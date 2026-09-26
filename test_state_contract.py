@@ -53,11 +53,15 @@ WIDTHS = {
     "fault_addr": (0, 1 << 16),
 
     "TDEPTH": (0, 256),
+
+    "STC_COUNT": (0, 1 << 32),
+    "STC_FIRST": (0, 1 << 16),
 }
 
 FAULT_WRITES = ("status", "fault_reason", "fault_addr")
 
 VIEW_FIELDS = ("r", "HL", "DE", "MB", "SP", "PC", "C", "Z", "S", "V", "TDEPTH",
+               "STC_COUNT", "STC_FIRST",
                "ipos", "oplen", "tick", "status", "fault_reason", "fault_addr")
 
 _left_out = [n for n in ISA.STATE_FIELD_NAMES if n not in VIEW_FIELDS]
@@ -66,7 +70,9 @@ assert not _left_out, ("the compared view leaves out state rows", _left_out)
 def ref_view(g):
 
     view = dict(r=list(g.r), HL=g.HL, DE=g.DE, MB=g.MB, SP=g.SP, PC=g.PC, C=g.C, Z=g.Z,
-                S=g.S, V=g.V, TDEPTH=g.TDEPTH, ipos=g.ipos, oplen=len(g.out), tick=g.tick,
+                S=g.S, V=g.V, TDEPTH=g.TDEPTH,
+                STC_COUNT=g.stc_count, STC_FIRST=g.stc_first,
+                ipos=g.ipos, oplen=len(g.out), tick=g.tick,
                 status=golden_sim.STATUS_CODE[g.status],
                 fault_reason=g.fault_reason, fault_addr=g.fault_addr)
     _check_view_fields(view, "reference")
@@ -129,6 +135,63 @@ def getpc_at(pc0):
     b[0], b[1], b[2] = 0x09, pc0 & 0xFF, pc0 >> 8
     b[pc0], b[pc0 + 1], b[pc0 + 2] = 0x14, 0x81, 0x00
     return bytes(b)
+
+def test_s1_stc_log_counts_committed_writes_and_pins_the_first():
+
+    cfg = ISA.MachineConfig(winlo=2, winhi=4)
+    code = asm("LDI r0, 165\nLDI HL, 2\nSTC [HL], r0\nLDI HL, 3\nSTC [HL], r0\nHALT")
+    g = NCP8(code, config=cfg)
+    for _ in range(6):
+        g.step()
+    assert g.status == "HALT", (g.status, g.fault_reason)
+    gv = ref_view(g)
+    assert gv["STC_COUNT"] == 2 and gv["STC_FIRST"] == 2, gv
+    assert gv["PC"] == len(code), (gv, len(code))
+    for Mach in (TorchCircuit, TritonCircuit):
+        c = Mach(code, config=cfg)
+        for _ in range(6):
+            c.step()
+        cv = circuit_view(c)
+        assert cv == gv, (Mach.__name__, "the self-modification log diverges", gv, cv)
+    b = TritonBatch(1, config=cfg)
+    b.set_program(0, code)
+    b.run()
+    bv = b.snapshot(0)
+    assert bv == gv, ("TritonBatch", "the self-modification log diverges", gv, bv)
+    assert bv["STC_COUNT"] == 2 and bv["STC_FIRST"] == 2, bv
+
+    bad = asm("LDI r0, 165\nLDI HL, 5\nSTC [HL], r0\nHALT")
+    g2 = NCP8(bad, config=cfg)
+    for _ in range(3):
+        try:
+            g2.step()
+        except MachineError:
+            pass
+    assert g2.status == "ERROR" and g2.fault_reason == ISA.CAUSE["WINDOW"], (g2.status, g2.fault_reason)
+    gv2 = ref_view(g2)
+    assert gv2["STC_COUNT"] == 0 and gv2["STC_FIRST"] == 0, gv2
+    for Mach in (TorchCircuit, TritonCircuit):
+        c2 = Mach(bad, config=cfg)
+        for _ in range(3):
+            c2.step()
+        assert circuit_view(c2) == gv2, (Mach.__name__, "a faulted STC moved the log")
+    b2 = TritonBatch(1, config=cfg)
+    b2.set_program(0, bad)
+    b2.run()
+    assert b2.snapshot(0) == gv2, ("TritonBatch", "a faulted STC moved the log")
+
+    rec = g.record_state()
+    c3 = TritonCircuit(code, config=cfg)
+    c3.install_state(rec)
+    assert circuit_view(c3) == gv, ("install on triton", gv, circuit_view(c3))
+    t3 = TorchCircuit(code, config=cfg)
+    t3.install_state(rec)
+    assert circuit_view(t3) == gv, ("install on torch", gv, circuit_view(t3))
+    g3 = NCP8(code, config=cfg)
+    g3.install_state(rec)
+    assert ref_view(g3) == gv, ("install on reference", gv, ref_view(g3))
+    print("  S1 the self-modification log counts committed STC writes, pins the first"
+          " address, is immune to a faulted STC and rides the record, on all four paths")
 
 def test_d1_register_write_port_masks():
     for Mach in (TorchCircuit, TritonCircuit):
@@ -858,6 +921,7 @@ CHECKS = (
     test_d8_fault_pairing_is_refused_in_both_directions,
     test_d8_the_only_cause_of_a_tick_is_the_one_named_in_the_table,
     test_d9_declared_flags_are_the_flags_each_path_moves,
+    test_s1_stc_log_counts_committed_writes_and_pins_the_first,
 )
 
 def run_all():

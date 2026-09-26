@@ -572,6 +572,9 @@ STATE_FIELDS = (
     StateField("fault_addr", 0, (1 << FAULT_ADDR_BITS) - 1, None),
 
     StateField("TDEPTH", 0, (1 << 8) - 1, None),
+
+    StateField("STC_COUNT", 0, (1 << 32) - 1, None),
+    StateField("STC_FIRST", 0, 65535, None),
 )
 
 STATE_FIELD_NAMES = tuple(f.name for f in STATE_FIELDS)

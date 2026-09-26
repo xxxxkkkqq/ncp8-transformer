@@ -57,14 +57,16 @@ _ALU, _S0, _S1, _LEN = _rom(ISA.single_rom())
 _ALU2, _S02, _S12, _LX2 = _rom(ISA.escape_rom())
 
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
-                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, td=0, where=""):
+                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, td=0,
+                stc_count=0, stc_first=0, where=""):
 
     if not 0 <= oplen <= OUT_CAP:
         raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
     bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "MB": mb, "PC": PC,
                            "SP": SP, "C": C, "Z": Z, "S": s, "V": v, "ipos": ipos, "tick": tick,
                            "status": status, "fault_reason": fault_reason,
-                           "fault_addr": fault_addr, "TDEPTH": td},
+                           "fault_addr": fault_addr, "TDEPTH": td,
+                           "STC_COUNT": stc_count, "STC_FIRST": stc_first},
                           where)
     if bad is not None:
         raise ValueError(bad)
@@ -126,7 +128,7 @@ class TorchCircuit:
         self.OUTBUF = torch.zeros(self.out_cap, dtype=i32, device=dev)
         self.R = torch.zeros(4, dtype=i32, device=dev)
         for n in ("HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "TDEPTH", "ipos",
-                  "oplen", "tick"):
+                  "oplen", "tick", "STC_COUNT", "STC_FIRST"):
             setattr(self, n, torch.zeros(1, dtype=i32, device=dev))
         self.SP += DATA_SIZE
         self.PC += self.entry
@@ -615,6 +617,11 @@ class TorchCircuit:
         oh5 = ((self.RC == a5).to(i32)) * e5
         self.CODE = oh5 * v5 + (1 - oh5) * self.CODE
 
+        stc_wrote = oh5.sum()
+        self.STC_FIRST = torch.where((stc_wrote > 0) & (self.STC_COUNT == 0),
+                                     self.HL, self.STC_FIRST)
+        self.STC_COUNT = self.STC_COUNT + stc_wrote
+
         ov = sel(rows_out_val) * m
         oe = sel(rows_out_en) * m
         oh_out = (self.RO == self.oplen).to(i32) * oe
@@ -650,16 +657,18 @@ class TorchCircuit:
         return buf.index_select(0, idx.clamp(0, buf.numel() - 1).reshape(1)).reshape(()).to(torch.int32)
 
     def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0, fault_reason=None,
-                   fault_addr=None, S=None, V=None):
+                   fault_addr=None, S=None, V=None, stc_count=None, stc_first=None):
 
         fr = int(self.fault_reason.item()) if fault_reason is None else fault_reason
         fa = int(self.fault_addr.item()) if fault_addr is None else fault_addr
         sv = int(self.S.item()) if S is None else S
         vv = int(self.V.item()) if V is None else V
+        sc = int(self.STC_COUNT.item()) if stc_count is None else stc_count
+        sf = int(self.STC_FIRST.item()) if stc_first is None else stc_first
         check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=int(self.ipos.item()),
                     oplen=int(self.oplen.item()), status=int(self.status.item()),
                     fault_reason=fr, fault_addr=fa, mb=int(self.MB.item()), s=sv, v=vv,
-                    td=int(self.TDEPTH.item()))
+                    td=int(self.TDEPTH.item()), stc_count=sc, stc_first=sf)
         t = torch.tensor
         self.fault_reason = t([fr], dtype=torch.int32, device=self.dev)
         self.fault_addr = t([fa], dtype=torch.int32, device=self.dev)
@@ -673,6 +682,8 @@ class TorchCircuit:
         self.Z = t([Z], dtype=torch.int32, device=self.dev)
         self.tick = t([tick], dtype=torch.int32, device=self.dev)
         self.PC = t([PC], dtype=torch.int32, device=self.dev)
+        self.STC_COUNT = t([sc], dtype=torch.int32, device=self.dev)
+        self.STC_FIRST = t([sf], dtype=torch.int32, device=self.dev)
 
     def _record_inputs(self):
 
@@ -688,6 +699,7 @@ class TorchCircuit:
                                  tickbudget=self.tb, outcap=self.out_cap)
 
     _RECORD_SCALARS = ("HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "TDEPTH",
+                       "STC_COUNT", "STC_FIRST",
                        "ipos", "tick", "status", "fault_reason", "fault_addr")
     _RECORD_READERS = {
         **{n: (lambda m, n=n: int(getattr(m, n).item())) for n in _RECORD_SCALARS},
@@ -720,6 +732,7 @@ class TorchCircuit:
                     oplen=len(got.out), status=st["status"],
                     fault_reason=st["fault_reason"], fault_addr=st["fault_addr"],
                     mb=st["MB"], s=st["S"], v=st["V"], td=st["TDEPTH"],
+                    stc_count=st["STC_COUNT"], stc_first=st["STC_FIRST"],
                     where="TorchCircuit: ")
         t = torch.tensor
         i32 = torch.int32
@@ -740,6 +753,8 @@ class TorchCircuit:
                     SP=self.SP.item(), PC=self.PC.item(), C=self.C.item(), Z=self.Z.item(),
                     S=self.S.item(), V=self.V.item(),
                     TDEPTH=int(self.TDEPTH.item()),
+                    STC_COUNT=int(self.STC_COUNT.item()),
+                    STC_FIRST=int(self.STC_FIRST.item()),
                     ipos=self.ipos.item(), oplen=self.oplen.item(), tick=self.tick.item(),
                     status=int(self.status.item()),
                     fault_reason=int(self.fault_reason.item()),

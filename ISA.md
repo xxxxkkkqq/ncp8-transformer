@@ -12,6 +12,8 @@
 | `C`, `Z` | 1 bit each | carry and zero flags |
 | `S`, `V` | 1 bit each | signed result and signed overflow flags |
 | `TDEPTH` | 8 bit | trap nesting depth: `EXT k` increments it after the frame push, `TRAPRET` decrements it; reset 0, bounded by `tdlim` |
+| `STC_COUNT` | 32 bit | self-modification log: how many code bytes committed `STC` writes have rewritten; reset 0, and an error tick commits nothing |
+| `STC_FIRST` | 16 bit | the address of the first committed `STC` write; meaningful only while `STC_COUNT` is non-zero, reset 0 |
 | `CODE` | 4096 bytes | program memory. The first `CODELEN` bytes are the program: instruction fetch, `LDC` and `STC` are all bounded by that length, not by the 4096, and `STC` is bounded further by the declared window (see 5) |
 | `DATA` | 4096 bytes | data memory and stack |
 | input | byte stream | `IN`, cursor `ipos` |

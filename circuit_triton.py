@@ -69,7 +69,10 @@ S_OVFL = tl.constexpr(18)
 S_SPLIM = tl.constexpr(19)
 
 S_TDEPTH = tl.constexpr(20)
-STATE_ROWS = 21
+
+S_STC_COUNT = tl.constexpr(21)
+S_STC_FIRST = tl.constexpr(22)
+STATE_ROWS = 23
 STATE_ROWS_C = tl.constexpr(STATE_ROWS)
 
 BANK_PAGES = 1
@@ -177,14 +180,16 @@ for _name, _size in (("CODE_SIZE", CODE_SIZE), ("DATA_SIZE", DATA_SIZE),
 CODE_MASK = tl.constexpr(CODE_SIZE - 1)
 
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
-                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, td=0, where=""):
+                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, td=0,
+                stc_count=0, stc_first=0, where=""):
 
     if not 0 <= oplen <= OUT_CAP:
         raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
     bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "MB": mb, "PC": PC,
                            "SP": SP, "C": C, "Z": Z, "S": s, "V": v, "ipos": ipos, "tick": tick,
                            "status": status, "fault_reason": fault_reason,
-                           "fault_addr": fault_addr, "TDEPTH": td},
+                           "fault_addr": fault_addr, "TDEPTH": td,
+                           "STC_COUNT": stc_count, "STC_FIRST": stc_first},
                           where)
     if bad is not None:
         raise ValueError(bad)
@@ -192,7 +197,8 @@ def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
 STATE_ROW_OF = {"r": (0, 1, 2, 3), "HL": 4, "DE": 5, "PC": 6, "SP": 7, "C": 8, "Z": 9,
                 "S": int(S_SIGN), "V": int(S_OVFL),
                 "ipos": 10, "tick": 12, "status": 13, "fault_reason": 14,
-                "fault_addr": 15, "MB": int(S_MB), "TDEPTH": int(S_TDEPTH)}
+                "fault_addr": 15, "MB": int(S_MB), "TDEPTH": int(S_TDEPTH),
+                "STC_COUNT": int(S_STC_COUNT), "STC_FIRST": int(S_STC_FIRST)}
 STATE_ROW_OPLEN = 11
 if set(STATE_ROW_OF) != set(ISA.STATE_FIELD_NAMES):
     raise ISA.DecodeTableError(
@@ -393,6 +399,9 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
 
     TD = tl.load(S + S_TDEPTH)
 
+    SC = tl.load(S + S_STC_COUNT)
+    SF = tl.load(S + S_STC_FIRST)
+
     OWN = PID % NB
     BDELTA = 0
 
@@ -400,7 +409,9 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
     nHL, nDE, nSP = HL, DE, SP
     nMB = MB
     nTD = TD
-    nC, nZ, nIPO = C, Z, IPO
+    nSC, nSF = SC, SF
+
+    nZ, nIPO = Z, IPO
     nSGN, nOVF = SGN, OVF
     nOL = OL
     nPC = PC + 1
@@ -414,6 +425,9 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
     err = 0
 
     PCW = 0
+
+    C_WR = 0
+    C_NEW = 0
 
     errc = 0
 
@@ -452,7 +466,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
             elif eop == 0x04:
                 nDE = (DE + 1) & 0xFFFF
             elif eop == 0x05:
-                nC = 0
+                C_WR = 1; C_NEW = 0
             elif eop == 0x06:
                 if HL >= DS:
                     err = 1
@@ -563,7 +577,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                 v = a ^ b; nZ = (v == 0).to(tl.int32)
             elif k == 5:
                 t = a * b; v = t & 255
-                nC = (t > 255).to(tl.int32); nZ = (v == 0).to(tl.int32)
+                C_WR = 1; C_NEW = (t > 255).to(tl.int32); nZ = (v == 0).to(tl.int32)
             else:
                 err = 1
                 errc = _name_cause(errc, _decode_refusal(eop))
@@ -576,16 +590,16 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
             k = eop >> 4
             v = a
             if k == 8:
-                t = a + b; v = t & 255; nC = t >> 8; nZ = (v == 0).to(tl.int32)
+                t = a + b; v = t & 255; C_WR = 1; C_NEW = t >> 8; nZ = (v == 0).to(tl.int32)
                 nSGN = (v >> 7) & 1; nOVF = ((a ^ v) & (b ^ v)) >> 7
             elif k == 9:
-                v = (a - b) & 255; nC = (a < b).to(tl.int32); nZ = (v == 0).to(tl.int32)
+                v = (a - b) & 255; C_WR = 1; C_NEW = (a < b).to(tl.int32); nZ = (v == 0).to(tl.int32)
                 nSGN = (v >> 7) & 1; nOVF = ((a ^ b) & (v ^ a)) >> 7
             elif k == 10:
-                t = a + b + C; v = t & 255; nC = t >> 8; nZ = (v == 0).to(tl.int32)
+                t = a + b + C; v = t & 255; C_WR = 1; C_NEW = t >> 8; nZ = (v == 0).to(tl.int32)
                 nSGN = (v >> 7) & 1; nOVF = ((a ^ v) & (b ^ v)) >> 7
             elif k == 11:
-                t = a - b - C; v = t & 255; nC = (t < 0).to(tl.int32); nZ = (v == 0).to(tl.int32)
+                t = a - b - C; v = t & 255; C_WR = 1; C_NEW = (t < 0).to(tl.int32); nZ = (v == 0).to(tl.int32)
                 nSGN = (v >> 7) & 1; nOVF = ((a ^ b) & (v ^ a)) >> 7
             elif k == 12:
                 v = b
@@ -606,13 +620,13 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                     v = i8
                     nSGN = SGN & 1; nOVF = OVF & 1
                 elif eop <= 0xD7:
-                    t = rr + i8; v = t & 255; nC = t >> 8; nZ = (v == 0).to(tl.int32)
+                    t = rr + i8; v = t & 255; C_WR = 1; C_NEW = t >> 8; nZ = (v == 0).to(tl.int32)
                     nSGN = (v >> 7) & 1; nOVF = ((rr ^ v) & (i8 ^ v)) >> 7
                 elif eop <= 0xDB:
-                    v = (rr - i8) & 255; nC = (rr < i8).to(tl.int32); nZ = (v == 0).to(tl.int32)
+                    v = (rr - i8) & 255; C_WR = 1; C_NEW = (rr < i8).to(tl.int32); nZ = (v == 0).to(tl.int32)
                     nSGN = (v >> 7) & 1; nOVF = ((rr ^ i8) & (v ^ rr)) >> 7
                 else:
-                    t = rr + i8 + C; v = t & 255; nC = t >> 8; nZ = (v == 0).to(tl.int32)
+                    t = rr + i8 + C; v = t & 255; C_WR = 1; C_NEW = t >> 8; nZ = (v == 0).to(tl.int32)
                     nSGN = (v >> 7) & 1; nOVF = ((rr ^ v) & (i8 ^ v)) >> 7
                 nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, eop & 3, v)
         elif eop >= 0x60 and eop <= 0x6F:
@@ -620,9 +634,9 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
             rr = _get4(r0, r1, r2, r3, d)
             v = rr
             if eop < 0x64:
-                nC = rr >> 7; v = (rr << 1) & 255; nZ = (v == 0).to(tl.int32)
+                C_WR = 1; C_NEW = rr >> 7; v = (rr << 1) & 255; nZ = (v == 0).to(tl.int32)
             elif eop < 0x68:
-                nC = rr & 1; v = rr >> 1; nZ = (v == 0).to(tl.int32)
+                C_WR = 1; C_NEW = rr & 1; v = rr >> 1; nZ = (v == 0).to(tl.int32)
             elif eop < 0x6C:
                 nZ = (rr == 0).to(tl.int32)
                 v = rr
@@ -685,7 +699,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                 if IPO < INLEN:
                     v = tl.load(INPUTS + IPO); nIPO = IPO + 1
                 else:
-                    v = 0; nC = 1
+                    v = 0; C_WR = 1; C_NEW = 1
             nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, d, v)
         elif eop >= _ESC_EOP_BASE:
 
@@ -701,7 +715,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                     else:
                         v = a % b
                     nZ = (v == 0).to(tl.int32)
-                    nC = C & 1
                     nSGN = SGN & 1; nOVF = OVF & 1
                     nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
             elif eop == ESC_CMP:
@@ -709,7 +722,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                 a = _get4(r0, r1, r2, r3, ed)
                 b = _get4(r0, r1, r2, r3, es)
                 nZ = (a == b).to(tl.int32)
-                nC = (a < b).to(tl.int32)
+                C_WR = 1; C_NEW = (a < b).to(tl.int32)
                 cv = (a - b) & 255
                 nSGN = (cv >> 7) & 1; nOVF = ((a ^ b) & (cv ^ a)) >> 7
             elif eop == ESC_NOT:
@@ -717,12 +730,11 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                 v = (~rr) & 255
                 nZ = (v == 0).to(tl.int32)
                 nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
-                nC = C & 1
                 nSGN = SGN & 1; nOVF = OVF & 1
             elif eop == ESC_NEG:
                 rr = _get4(r0, r1, r2, r3, ed)
                 v = (-rr) & 255
-                nC = (rr != 0).to(tl.int32)
+                C_WR = 1; C_NEW = (rr != 0).to(tl.int32)
                 nZ = (v == 0).to(tl.int32)
                 nSGN = (v >> 7) & 1
                 nOVF = OVF & 1
@@ -730,22 +742,22 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
             elif eop == ESC_ROL:
 
                 rr = _get4(r0, r1, r2, r3, ed)
-                nC = rr >> 7
+                C_WR = 1; C_NEW = rr >> 7
                 v = ((rr << 1) | C) & 255
                 nZ = (v == 0).to(tl.int32)
                 nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
             elif eop == ESC_ROR:
                 rr = _get4(r0, r1, r2, r3, ed)
-                nC = rr & 1
+                C_WR = 1; C_NEW = rr & 1
                 v = (rr >> 1) | (C << 7)
                 nZ = (v == 0).to(tl.int32)
                 nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
             elif eop == ESC_ADD_HLDE:
                 t = HL + DE
-                nC = t >> 16
+                C_WR = 1; C_NEW = t >> 16
                 nHL = t & 0xFFFF
             elif eop == ESC_SUB_HLDE:
-                nC = (HL < DE).to(tl.int32)
+                C_WR = 1; C_NEW = (HL < DE).to(tl.int32)
                 nHL = (HL - DE) & 0xFFFF
             elif eop == ESC_XCHG:
                 nHL = DE
@@ -768,12 +780,10 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                     BDELTA = (MB - OWN) * DS
                     v = tl.load(DATA + BDELTA + HL)
                     nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
-                    nC = C & 1
                     nSGN = SGN & 1; nOVF = OVF & 1
                 else:
                     BDELTA = (MB - OWN) * DS
                     A1 = HL; V1 = _get4(r0, r1, r2, r3, ed); E1 = 1
-                    nC = C & 1
                     nSGN = SGN & 1; nOVF = OVF & 1
             elif eop == ESC_LDMW_DE_HL or eop == ESC_LDMW_HL_DE:
 
@@ -798,7 +808,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                             nDE = v
                         else:
                             nHL = v
-                        nC = C & 1
                         nSGN = SGN & 1; nOVF = OVF & 1
             elif eop == ESC_STMW_HL_DE or eop == ESC_STMW_DE_HL:
 
@@ -822,7 +831,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                         BDELTA = (MB - OWN) * DS
                         A1 = adr; V1 = v & 0xFF; E1 = 1
                         A2 = adr + 1; V2 = (v >> 8) & 0xFF; E2 = 1
-                        nC = C & 1
                         nSGN = SGN & 1; nOVF = OVF & 1
             elif (eop == ESC_JS or eop == ESC_JNS or eop == ESC_VS or eop == ESC_VC):
 
@@ -903,7 +911,7 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                         nPC = (hi << 8) | lo
                         nSP = SP + 4
                         nZ = fb & 1
-                        nC = (fb >> 1) & 1
+                        C_WR = 1; C_NEW = (fb >> 1) & 1
                         nSGN = (fb >> 2) & 1
                         nOVF = (fb >> 3) & 1
                         nTD = TD - 1
@@ -935,6 +943,9 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
                         errc = _name_cause(errc, F_WINDOW)
                     else:
                         A3 = HL; V3 = _get4(r0, r1, r2, r3, ed); E3 = 1
+
+                        nSC = SC + 1
+                        nSF = tl.where(SC == 0, HL, SF)
             elif eop == ESC_LDC:
 
                 if HL >= CODELEN:
@@ -1044,7 +1055,6 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
 
                 v = ((_get4(r0, r1, r2, r3, ed) * _get4(r0, r1, r2, r3, es)) >> 8) & 255
                 nZ = (v == 0).to(tl.int32)
-                nC = C & 1
                 nSGN = SGN & 1; nOVF = OVF & 1
                 nR0, nR1, nR2, nR3 = _wr(r0, r1, r2, r3, ed, v)
             else:
@@ -1056,6 +1066,8 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
     else:
         err = 1
         errc = _name_cause(errc, F_FETCH_OOB)
+
+    nC = tl.where(C_WR != 0, C_NEW & 1, C & 1)
 
     OT = tl.load(S + 12)
     ST = tl.load(S + 13)
@@ -1094,6 +1106,8 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
         tl.store(S + 13, NST)
         tl.store(S + S_MB, nMB)
         tl.store(S + S_TDEPTH, nTD)
+        tl.store(S + S_STC_COUNT, nSC)
+        tl.store(S + S_STC_FIRST, nSF)
 
         if OEN == 1:
             tl.store(OUTBUF + (OL & (OC - 1)), OVAL)
@@ -1291,12 +1305,13 @@ class TritonBatch:
 
     def set_state(self, i, r=(0, 0, 0, 0), HL=0, DE=0, PC=0, SP=DATA_SIZE,
                   C=0, Z=0, S=0, V=0, ipos=0, oplen=0, tick=0, status=0, fault_reason=0,
-                  fault_addr=0, MB=0, TDEPTH=0):
+                  fault_addr=0, MB=0, TDEPTH=0, STC_COUNT=0, STC_FIRST=0):
 
         self._row(i)
         check_state(r, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=ipos, oplen=oplen,
                     status=status, fault_reason=fault_reason, fault_addr=fault_addr,
-                    mb=MB, s=S, v=V, td=TDEPTH, where=f"machine {i}: ")
+                    mb=MB, s=S, v=V, td=TDEPTH, stc_count=STC_COUNT,
+                    stc_first=STC_FIRST, where=f"machine {i}: ")
         self.STATE[i, 0:4] = torch.tensor(list(r), dtype=torch.int32, device=self.dev)
         self.STATE[i, 4] = HL
         self.STATE[i, 5] = DE
@@ -1314,6 +1329,8 @@ class TritonBatch:
         self.STATE[i, 15] = fault_addr
         self.STATE[i, int(S_MB)] = MB
         self.STATE[i, int(S_TDEPTH)] = TDEPTH
+        self.STATE[i, int(S_STC_COUNT)] = STC_COUNT
+        self.STATE[i, int(S_STC_FIRST)] = STC_FIRST
 
     def set_budget(self, i, budget):
 
@@ -1426,7 +1443,8 @@ def run_batch(codes, datas=None, inputs=None, budgets=None, states=None,
                         C=row[8], Z=row[9], S=row[int(S_SIGN)], V=row[int(S_OVFL)],
                         ipos=row[10], oplen=row[11], tick=row[12], status=row[13],
                         fault_reason=row[14], fault_addr=row[15], MB=row[int(S_MB)],
-                        TDEPTH=row[int(S_TDEPTH)])
+                        TDEPTH=row[int(S_TDEPTH)], STC_COUNT=row[int(S_STC_COUNT)],
+                        STC_FIRST=row[int(S_STC_FIRST)])
     return b.run()
 
 class TritonCircuit:
@@ -1497,23 +1515,28 @@ class TritonCircuit:
         self.CFG = torch.tensor(_cfg_row(cfg), dtype=i32, device=dev)
 
     def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0, fault_reason=None,
-                   fault_addr=None, S=None, V=None):
+                   fault_addr=None, S=None, V=None, stc_count=None, stc_first=None):
 
         fr = int(self.S[14].item()) if fault_reason is None else fault_reason
         fa = int(self.S[15].item()) if fault_addr is None else fault_addr
         s0 = int(self.S[int(S_SIGN)].item()) if S is None else S
         v0 = int(self.S[int(S_OVFL)].item()) if V is None else V
+        sc = int(self.S[int(S_STC_COUNT)].item()) if stc_count is None else stc_count
+        sf = int(self.S[int(S_STC_FIRST)].item()) if stc_first is None else stc_first
         check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC,
                     ipos=int(self.S[10].item()), oplen=int(self.S[11].item()),
                     status=int(self.S[13].item()), fault_reason=fr, fault_addr=fa,
                     mb=int(self.S[int(S_MB)].item()), s=s0, v=v0,
-                    td=int(self.S[int(S_TDEPTH)].item()))
+                    td=int(self.S[int(S_TDEPTH)].item()),
+                    stc_count=sc, stc_first=sf)
         self.S[0:4] = torch.tensor(list(R), dtype=torch.int32, device=self.dev)
         self.S[4] = HL; self.S[5] = DE; self.S[6] = PC
         self.S[7] = SP; self.S[8] = C; self.S[9] = Z
         self.S[12] = tick
         self.S[14] = fr; self.S[15] = fa
         self.S[int(S_SIGN)] = s0; self.S[int(S_OVFL)] = v0
+        self.S[int(S_STC_COUNT)] = sc
+        self.S[int(S_STC_FIRST)] = sf
 
     def _record_state(self):
         return _row_state(self.S)
@@ -1559,7 +1582,8 @@ class TritonCircuit:
                     tick=st["tick"], PC=st["PC"], ipos=st["ipos"], oplen=len(got.out),
                     status=st["status"], fault_reason=st["fault_reason"],
                     fault_addr=st["fault_addr"], mb=st["MB"], s=st["S"], v=st["V"],
-                    td=st["TDEPTH"], where="TritonCircuit: ")
+                    td=st["TDEPTH"], stc_count=st["STC_COUNT"],
+                    stc_first=st["STC_FIRST"], where="TritonCircuit: ")
         _write_row_state(self.S, st)
         self.S[STATE_ROW_OPLEN] = len(got.out)
         self.CODE.copy_(_byte_image(got.code).to(self.dev))

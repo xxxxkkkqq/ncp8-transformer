@@ -94,7 +94,7 @@ def check_case(name, code, sp, hl, de, expect_err, expect_commit=None, pc=0,
             ("torch", run_circuit(TorchCircuit, code, sp, hl, de, pc, vec0, data_img)),
             ("triton", run_circuit(TritonCircuit, code, sp, hl, de, pc, vec0, data_img))]
     ref_pre = dict(r=list(INIT_R), HL=hl, DE=de, MB=0, SP=sp, PC=pc, C=INIT_C, Z=INIT_Z,
-                   S=INIT_S, V=INIT_V, TDEPTH=0,
+                   S=INIT_S, V=INIT_V, TDEPTH=0, STC_COUNT=0, STC_FIRST=0,
                    ipos=0, oplen=0, tick=TICK0, status=0, fault_reason=0, fault_addr=0)
     assert set(ref_pre) == set(VIEW_FIELDS), (
         "this suite's field list and the comparison set have drifted apart")
@@ -137,7 +137,7 @@ def legal_expect(kind, sp, hl, de, imm=None, pc=0, data_img=DATA_IMAGE):
     d = bytearray(data_img)
     out = b""
     st = dict(r=r, HL=hl, DE=de, MB=0, SP=sp, PC=pc + 1, C=INIT_C, Z=INIT_Z,
-              S=INIT_S, V=INIT_V, TDEPTH=0, ipos=0,
+              S=INIT_S, V=INIT_V, TDEPTH=0, STC_COUNT=0, STC_FIRST=0, ipos=0,
               oplen=0, tick=TICK0 + 1, status=0, fault_reason=0, fault_addr=0)
     ret_lo, ret_hi = (pc + 3) & 0xFF, (pc + 3) >> 8
     if kind in ("PUSHW HL", "PUSHW DE", "POPW HL", "POPW DE", "STW [HL], DE",
@@ -285,10 +285,6 @@ MOVW_SP_CASES = (
     ("MOVW SP, DE", bytes([0x70, 0x35]), "DE"),
 )
 SP_PAIR_VALUES = (0, 4095, 4096, 4097, 65535)
-
-def _seed_last_byte(addr):
-
-    return DATA_IMAGE[addr] | (DATA_IMAGE[addr + 1] << 8)
 
 def test_stack_boundaries():
     tot = {"ok": 0, "err": 0}

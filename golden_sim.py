@@ -70,14 +70,16 @@ class FaultCauseMissing(MachineError):
     pass
 
 def check_state(R, HL, DE, SP, C, Z, tick=0, PC=0, ipos=0, oplen=0, status=0,
-                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, td=0, where=""):
+                fault_reason=0, fault_addr=0, mb=0, s=0, v=0, td=0,
+                stc_count=0, stc_first=0, where=""):
 
     if not 0 <= oplen <= OUT_CAP:
         raise ValueError(f"{where}state field oplen is {oplen}, outside [0, {OUT_CAP}]")
     bad = ISA.state_error({"r": list(R), "HL": HL, "DE": DE, "MB": mb, "PC": PC,
                            "SP": SP, "C": C, "Z": Z, "S": s, "V": v, "ipos": ipos, "tick": tick,
                            "status": status, "fault_reason": fault_reason,
-                           "fault_addr": fault_addr, "TDEPTH": td},
+                           "fault_addr": fault_addr, "TDEPTH": td,
+                           "STC_COUNT": stc_count, "STC_FIRST": stc_first},
                           where)
     if bad is not None:
         raise ValueError(bad)
@@ -128,6 +130,9 @@ class NCP8:
         self.V = 0
 
         self.TDEPTH = 0
+
+        self.stc_count = 0
+        self.stc_first = 0
         self.inputs = bytes(inputs)
         self.ipos = 0
         self.out = bytearray()
@@ -156,20 +161,24 @@ class NCP8:
         self.trace: list[str] = []
 
     def load_state(self, R, HL, DE, SP, C, Z, tick, PC=0, fault_reason=None,
-                   fault_addr=None, S=None, V=None):
+                   fault_addr=None, S=None, V=None, stc_count=None, stc_first=None):
 
         fr = self.fault_reason if fault_reason is None else fault_reason
         fa = self.fault_addr if fault_addr is None else fault_addr
         sv = self.S if S is None else S
         vv = self.V if V is None else V
+        sc = self.stc_count if stc_count is None else stc_count
+        sf = self.stc_first if stc_first is None else stc_first
         check_state(R, HL, DE, SP, C, Z, tick=tick, PC=PC, ipos=self.ipos,
                     status=STATUS_CODE[self.status], fault_reason=fr, fault_addr=fa,
-                    mb=self.MB, s=sv, v=vv, td=self.TDEPTH)
+                    mb=self.MB, s=sv, v=vv, td=self.TDEPTH,
+                    stc_count=sc, stc_first=sf)
         self.r = list(R)
         self.HL, self.DE, self.SP, self.C, self.Z = HL, DE, SP, C, Z
         self.S, self.V = sv, vv
         self.tick, self.PC = tick, PC
         self.fault_reason, self.fault_addr = fr, fa
+        self.stc_count, self.stc_first = sc, sf
 
     def _record_inputs(self):
 
@@ -200,6 +209,8 @@ class NCP8:
         "S": lambda m: m.S,
         "V": lambda m: m.V,
         "TDEPTH": lambda m: m.TDEPTH,
+        "STC_COUNT": lambda m: m.stc_count,
+        "STC_FIRST": lambda m: m.stc_first,
         "ipos": lambda m: m.ipos,
         "tick": lambda m: m.tick,
         "status": lambda m: m.status_code(),
@@ -231,13 +242,15 @@ class NCP8:
                     tick=st["tick"], PC=st["PC"], ipos=st["ipos"],
                     status=st["status"], fault_reason=st["fault_reason"],
                     fault_addr=st["fault_addr"], mb=st["MB"], s=st["S"], v=st["V"],
-                    td=st["TDEPTH"], where="NCP8: ")
+                    td=st["TDEPTH"], stc_count=st["STC_COUNT"],
+                    stc_first=st["STC_FIRST"], where="NCP8: ")
         self.r = list(st["r"])
         self.HL, self.DE, self.PC, self.SP = st["HL"], st["DE"], st["PC"], st["SP"]
         self.MB = st["MB"]
         self.C, self.Z = st["C"], st["Z"]
         self.S, self.V = st["S"], st["V"]
         self.TDEPTH = st["TDEPTH"]
+        self.stc_count, self.stc_first = st["STC_COUNT"], st["STC_FIRST"]
         self.ipos, self.tick = st["ipos"], st["tick"]
         self.status = STATUS_NAME[st["status"]]
         self.fault_reason, self.fault_addr = st["fault_reason"], st["fault_addr"]
@@ -628,6 +641,8 @@ class NCP8:
                     f"bounds are load-time configuration and no cell of CODE holds "
                     f"either @ {pc0:#04x}")
             b = bytearray(self.code); b[self.HL] = self.r[s0]; self.code = bytes(b)
+            self.stc_first = self.HL if self.stc_count == 0 else self.stc_first
+            self.stc_count += 1
             m = f"STC [HL], r{s0}"
         elif sel == "MULH":
             v = ((self.r[s0] * self.r[s1]) >> 8) & 0xFF
@@ -809,6 +824,7 @@ class NCP8:
                     PC=self.PC,
                     C=self.C, Z=self.Z, S=self.S, V=self.V,
                     TDEPTH=self.TDEPTH,
+                    STC_COUNT=self.stc_count, STC_FIRST=self.stc_first,
                     ipos=self.ipos, tick=self.tick,
                     status=self.status, fault_reason=self.fault_reason,
                     fault_addr=self.fault_addr)

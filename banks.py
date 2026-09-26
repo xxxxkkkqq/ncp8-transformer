@@ -160,6 +160,7 @@ def _per_machine(value, n, default):
     return [value] * n
 
 TICK_FIELDS = ("r", "HL", "DE", "MB", "PC", "SP", "C", "Z", "S", "V", "TDEPTH",
+               "STC_COUNT", "STC_FIRST",
                "ipos", "tick", "status", "fault_reason", "fault_addr",
                "DATA", "CODE", "out")
 

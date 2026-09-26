@@ -10,10 +10,25 @@ three implementations.
 """
 import random
 
+import pytest
+import torch
+
 from golden_sim import NCP8, MachineError
 from circuit_torch import TorchCircuit
 from circuit_triton import TritonCircuit
 from test_state_contract import FAULT_WRITES, assert_widths, circuit_view, ref_view
+
+NAMES = {TorchCircuit: "torch", TritonCircuit: "triton"}
+
+@pytest.fixture(params=(TorchCircuit, TritonCircuit), ids=("torch", "triton"))
+def Machine(request):
+    if not torch.cuda.is_available():
+        pytest.skip(f"{NAMES[request.param]} needs a GPU")
+    return request.param
+
+@pytest.fixture
+def name(Machine):
+    return NAMES[Machine]
 
 PC_SITES = (0, 256)
 

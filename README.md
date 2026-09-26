@@ -23,7 +23,7 @@ error paths. See `ISA.md` for the instruction set.
 ## Running
 
 ```
-pip install torch triton          # triton only needed for circuit_triton.py
+pip install torch triton pytest   # triton only needed for circuit_triton.py
 python3 isa_table.py                  # the decode table against the live ROMs and dispatch
 python3 test_isa_v2.py                # instruction semantics (reference only)
 python3 test_arithmetic_bounds.py     # bit-width / radix bounds, carry chains
@@ -37,6 +37,7 @@ python3 isa_forms.py                  # one accepted-form table, checked against
 python3 test_circuit_equivalence.py   # both circuits vs reference, all 256 opcodes
 python3 test_isa_v2_equivalence.py    # escape subcode space + program lockstep
 python3 test_error_atomicity.py       # every bound case, on the reference too
+python3 test_escape_truncation.py     # a truncated operand byte faults, on all paths
 python3 test_fault_registers.py       # why and where a tick stopped the machine
 python3 test_state_contract.py        # the state contract every path must honour
 python3 test_state_record.py          # capture a machine mid-run and put it back
