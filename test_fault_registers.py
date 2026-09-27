@@ -145,6 +145,27 @@ def _c_bank_addr_oob(pc):
 def _c_bank_pair_addr_oob(pc):
     return (img(asm("STMW [HL], DE"), pc), state(PC=pc, HL=DATA_SIZE - 1), pc, b"", b"")
 
+def _c_region_mov(pc):
+    return (img(asm("MOV [HL], r0"), pc), state(PC=pc, HL=0x0104), pc, b"", b"",
+            ISA.MachineConfig(regions=[(0x0100, 0x0110)]))
+
+def _c_region_stx(pc):
+    return (img(asm("STX [HL+1], r0"), pc), state(PC=pc, HL=0x00FF), pc, b"", b"",
+            ISA.MachineConfig(regions=[(0x0100, 0x0110)]))
+
+def _c_region_stw_pair(pc):
+
+    return (img(asm("STW [HL], DE"), pc), state(PC=pc, HL=0x00FF), pc, b"", b"",
+            ISA.MachineConfig(regions=[(0x0100, 0x0110)]))
+
+def _c_region_push(pc):
+    return (img(asm("PUSH r0"), pc), state(PC=pc, SP=0x0104), pc, b"", b"",
+            ISA.MachineConfig(regions=[(0x0100, 0x0110)]))
+
+def _c_region_stm(pc):
+    return (img(asm("STM [HL], r0"), pc), state(PC=pc, HL=0x0104), pc, b"", b"",
+            ISA.MachineConfig(regions=[(0x0100, 0x0110)]))
+
 def _c_pc_illegal_jmp(pc):
     return img(asm("JMP 0x0F00"), pc), state(PC=pc), pc, b"", b""
 
@@ -229,6 +250,26 @@ def _bank_selector_case(mb):
     def build(pc):
         return (img(asm("STM [HL], r0"), pc), state(PC=pc, MB=mb), pc, b"", b"")
     return build
+
+def _p_stack_before_region(pc):
+
+    return (img(asm("PUSH r0"), pc), state(PC=pc, SP=0x0104), pc, b"", b"",
+            ISA.MachineConfig(regions=[(0x0100, 0x0110)], splim=0x0104))
+
+def _p_pc_target_before_region(pc):
+
+    return (img(asm("CALL 0x0F00"), pc), state(PC=pc, SP=0x0104), pc, b"", b"",
+            ISA.MachineConfig(regions=[(0x0100, 0x0110)]))
+
+def _p_trap_unreg_before_region(pc):
+
+    return (img(asm("EXT 0"), pc), state(PC=pc, SP=0x0104), pc, b"", b"",
+            ISA.MachineConfig(regions=[(0x0100, 0x0110)]))
+
+def _p_bank_oob_before_region(pc):
+
+    return (img(asm("STM [HL], r0"), pc), state(PC=pc, MB=9, HL=0x0104), pc, b"", b"",
+            ISA.MachineConfig(regions=[(0x0100, 0x0110)]))
 
 def _p_bank_oob_before_data_oob(pc):
 
@@ -354,6 +395,12 @@ CASES = (
      _c_bank_oob_ldm),
     ("DATA_OOB", "STM [HL], r0 through the page this machine holds, past its last byte",
      _c_bank_addr_oob),
+    ("REGION_VIOL", "MOV [HL], r0 into a declared write-protected region", _c_region_mov),
+    ("REGION_VIOL", "STX whose effective address the region covers", _c_region_stx),
+    ("REGION_VIOL", "STW whose high byte lies inside the region", _c_region_stw_pair),
+    ("REGION_VIOL", "PUSH into a protected stack slot", _c_region_push),
+    ("REGION_VIOL", "STM [HL], r0 through the held page into a protected cell",
+     _c_region_stm),
     ("DATA_OOB", "STMW [HL], DE whose second byte leaves the page it holds",
      _c_bank_pair_addr_oob),
     ("PC_ILLEGAL", "JMP to the first address past the image", _c_pc_illegal_jmp),
@@ -412,11 +459,25 @@ PAIRS = (
      "STACK_UNDERFLOW", "TRAP_FRAME"),
     ("stale tag + target past the image", _p_frame_before_pc_target,
      "TRAP_FRAME", "PC_ILLEGAL"),
+    ("no room to push + a protected slot", _p_stack_before_region,
+     "STACK_OVERFLOW", "REGION_VIOL"),
+    ("target past the image + a protected frame", _p_pc_target_before_region,
+     "PC_ILLEGAL", "REGION_VIOL"),
+    ("no handler + a protected stack", _p_trap_unreg_before_region,
+     "TRAP_UNREG", "REGION_VIOL"),
+    ("selector out of bounds + a protected address", _p_bank_oob_before_region,
+     "BANK_OOB", "REGION_VIOL"),
 )
 
 UNPROVOKABLE_PAIRS = (
     ("FETCH_OOB (code byte) before BAD_SUBCODE",
      "the padded code byte always decodes, so only one of the two can fire"),
+    ("BANK_BUSY before REGION_VIOL",
+     "the busy refusal needs a foreign page, and only the reference's group driver "
+     "hands one out, so the four-path harness cannot assemble it; banks.py's grouped "
+     "cases provoke the pair end to end -- a store that fails quiescence and the "
+     "region at once names BANK_BUSY, and one that passes quiescence into a "
+     "protected page names REGION_VIOL on the writer"),
 )
 
 ABSENT_PROOFS = {

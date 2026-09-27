@@ -65,8 +65,10 @@ class BankGroup:
         self.machines = machines
         pages = tuple(m.data for m in machines)
         statuses = self.statuses()
+
+        regions = tuple(m.regions for m in machines)
         for i, m in enumerate(machines):
-            m.install_banks(pages, i, statuses)
+            m.install_banks(pages, i, statuses, regions)
         self.tick = 0
 
     @classmethod
@@ -226,6 +228,18 @@ CIRCUIT_ROWS = (
      "compared per tick on every compared component against the reference; plus the "
      "seed bytes read back from DATA, the unregister fault's cause, and the "
      "absent-VTAB machine's dispatch on the same paths"),
+    ("a declared region refuses the stores it covers",
+     "a machine whose block declares write-protected regions of DATA faults "
+     "REGION_VIOL, atomically and on the writer, when a store lands in a declared "
+     "span -- the pointer stores, STW and STX, PUSH and PUSHW, the CALL and EXT "
+     "frames and the STM/STMW family, on every path -- while its reads and every "
+     "store outside the spans stay today's machine byte for byte; a cross-bank store "
+     "answers the page it lands in, and a store that fails quiescence and the region "
+     "at once names BANK_BUSY, judged first (A139)",
+     "the region-hit, region-miss, boundary and frame programs on every path, stepped "
+     "one tick at a time and compared per tick on every compared component against "
+     "the reference; plus the grouped batch's neighbour-write cases against a "
+     "protected page"),
 )
 
 def _ascii(text):
@@ -414,13 +428,13 @@ class _BatchRow:
     def record_state(self):
         return self.batch.record_state(0)
 
-def _batch_group_case(codes, budget):
+def _batch_group_case(codes, budget, config=None):
 
     from circuit_triton import TritonBatch
     grp = BankGroup.from_programs([asm(c) for c in codes], data=_BANK_DATA,
-                                  tick_budget=budget)
+                                  tick_budget=budget, config=config)
     bat = TritonBatch.from_programs([asm(c) for c in codes], data=_BANK_DATA,
-                                    tick_budget=budget)
+                                    tick_budget=budget, config=config)
     n = len(codes)
     bad, named = [], []
     for t in range(budget + 8):
@@ -450,21 +464,34 @@ def _batch_group_case(codes, budget):
 _GROUP_WRITER = ("  LDI HL, {bank}\n  MOV MB, HL\n  LDI HL, 64\n  LDI r0, {val:#x}\n"
                  "  STM [HL], r0\n  HALT")
 
+_GROUP_ADDR = 64
+
 def batch_group_rows():
 
     cases = (
-        ("the write lands", (_GROUP_WRITER.format(bank=1, val=0x77), "  HALT")),
+        ("the write lands", (_GROUP_WRITER.format(bank=1, val=0x77), "  HALT"), None),
         ("the write is refused busy",
-         (_GROUP_WRITER.format(bank=1, val=0x77), "loop:\n  ADDI r0, 1\n  JMP loop")),
+         (_GROUP_WRITER.format(bank=1, val=0x77), "loop:\n  ADDI r0, 1\n  JMP loop"),
+         None),
         ("the selector is out of bounds",
-         (_GROUP_WRITER.format(bank=5, val=0x77), "  HALT")),
+         (_GROUP_WRITER.format(bank=5, val=0x77), "  HALT"), None),
         ("each row writes the page it owns",
          (_GROUP_WRITER.format(bank=0, val=0x11), _GROUP_WRITER.format(bank=1,
-                                                                       val=0x22))),
+                                                                       val=0x22)), None),
+        ("the write passes quiescence into a protected page",
+         (_GROUP_WRITER.format(bank=1, val=0x77), "  HALT"),
+         ISA.MachineConfig(nbanks=2, regions=[(_GROUP_ADDR, _GROUP_ADDR + 0x10)])),
+        ("a running owner outranks the page's region",
+         (_GROUP_WRITER.format(bank=1, val=0x77), "loop:\n  ADDI r0, 1\n  JMP loop"),
+         ISA.MachineConfig(nbanks=2, regions=[(_GROUP_ADDR, _GROUP_ADDR + 0x10)])),
+        ("both rows store into the protected cell through every selector",
+         (_GROUP_WRITER.format(bank=1, val=0x77), _GROUP_WRITER.format(bank=0,
+                                                                      val=0x77)),
+         ISA.MachineConfig(nbanks=2, regions=[(_GROUP_ADDR, _GROUP_ADDR + 0x10)])),
     )
     bad, causes = [], []
-    for label, codes in cases:
-        case_bad, named = _batch_group_case(codes, budget=32)
+    for label, codes, config in cases:
+        case_bad, named = _batch_group_case(codes, budget=32, config=config)
         bad += [f"{label}: {x}" for x in case_bad]
         causes.append(f"{label} -> {sorted(set(named))}")
     return bad, causes
@@ -578,6 +605,94 @@ def vtab_rows():
                    unreg.status == STATUS_ERROR
                    and unreg.fault_reason == ISA.CAUSE["TRAP_UNREG"]
                    and bytes(unreg.out) == b""))
+    return bad, claims, notes
+
+REGION_SPAN = (0x0300, 0x0310)
+
+_REGION_HIT = ("  LDI HL, 0x0304\n  LDI r0, 0x5A\n  MOV [HL], r0\n"
+               "  LDI HL, 0x0204\n  LDI r0, 0x33\n  MOV [HL], r0\n  HALT")
+_REGION_BOUNDS = ("  LDI HL, 0x02FF\n  LDI r0, 0x11\n  MOV [HL], r0\n"
+                  "  LDI HL, 0x0310\n  LDI r0, 0x22\n  MOV [HL], r0\n  HALT")
+
+_REGION_STRADDLE = ("  LDI HL, 0x02FF\n  LDI DE, 0x1234\n  STW [HL], DE\n  HALT")
+
+_REGION_PUSH = "  LDI HL, 0x0304\n  MOVW SP, HL\n  LDI r0, 7\n  PUSH r0\n  HALT"
+_REGION_CALL = ("  LDI HL, 0x0304\n  MOVW SP, HL\nCALL handler\nHALT\n"
+                "handler:\n  HALT\n")
+
+_REGION_READ = "  LDI HL, 0x0304\n  MOV r1, [HL]\n  HALT"
+
+def region_rows():
+
+    bad, claims = [], []
+    lo, hi = REGION_SPAN
+    cfg = ISA.MachineConfig(regions=[(lo, hi)])
+    data = bytearray(DATA_SIZE)
+    data[0x0304] = 0x5A
+    hit = NCP8(asm(_REGION_HIT), data=bytes(data), config=cfg)
+    try:
+        hit.run()
+    except MachineError:
+        pass
+    claims.append(("the store into the span faults REGION_VIOL and commits nothing",
+                   hit.status == STATUS_ERROR
+                   and hit.fault_reason == ISA.CAUSE["REGION_VIOL"]
+                   and hit.tick == 2
+                   and hit.data[0x0304] == 0x5A and hit.data[0x0204] == 0))
+    bounds = NCP8(asm(_REGION_BOUNDS), data=bytes(DATA_SIZE), config=cfg)
+    bounds.run()
+    claims.append(("the boundaries store: the span is half-open, [lo, hi)",
+                   bounds.status == STATUS_HALT and bounds.data[0x02FF] == 0x11
+                   and bounds.data[0x0310] == 0x22))
+    straddle = NCP8(asm(_REGION_STRADDLE), data=bytes(DATA_SIZE), config=cfg)
+    try:
+        straddle.run()
+    except MachineError:
+        pass
+    claims.append(("a word straddling the span's low edge faults whole, before either "
+                   "byte is written",
+                   straddle.status == STATUS_ERROR
+                   and straddle.fault_reason == ISA.CAUSE["REGION_VIOL"]
+                   and straddle.data[0x02FF] == 0 and straddle.data[0x0300] == 0))
+    push = NCP8(asm(_REGION_PUSH), data=bytes(DATA_SIZE), config=cfg)
+    try:
+        push.run()
+    except MachineError:
+        pass
+    claims.append(("a push whose slot the span covers refuses atomically",
+                   push.status == STATUS_ERROR
+                   and push.fault_reason == ISA.CAUSE["REGION_VIOL"]
+                   and push.SP == 0x0304 and push.tick == 3))
+    call = NCP8(asm(_REGION_CALL), data=bytes(DATA_SIZE), config=cfg)
+    try:
+        call.run()
+    except MachineError:
+        pass
+    claims.append(("a CALL whose frame the span covers writes no return address",
+                   call.status == STATUS_ERROR
+                   and call.fault_reason == ISA.CAUSE["REGION_VIOL"]
+                   and call.data[0x0302] == 0 and call.data[0x0303] == 0))
+    read = NCP8(asm(_REGION_READ), data=bytes(data), config=cfg)
+    read.run()
+    claims.append(("reads never consult the regions: the protected byte reads back",
+                   read.status == STATUS_HALT and read.r[1] == 0x5A))
+    absent = NCP8(asm(_REGION_HIT), data=bytes(data),
+                  config=ISA.MachineConfig())
+    absent.run()
+    claims.append(("an absent declaration is today's machine: both stores commit",
+                   absent.status == STATUS_HALT and absent.data[0x0204] == 0x33))
+    paths, notes = _vtab_paths()
+    for path_name, build in sorted(paths.items()):
+        for label, code, case_cfg in (
+                ("region hit", asm(_REGION_HIT), cfg),
+                ("boundaries", asm(_REGION_BOUNDS), cfg),
+                ("word straddle", asm(_REGION_STRADDLE), cfg),
+                ("push into the span", asm(_REGION_PUSH), cfg),
+                ("call frame into the span", asm(_REGION_CALL), cfg),
+                ("read through the span", asm(_REGION_READ), cfg),
+        ):
+            case_bad = _vtab_lockstep(code, build, path_name, case_cfg)
+            bad += [f"{label}/{path_name}: {x}" for x in case_bad]
     return bad, claims, notes
 
 def probe_rows(paths=None, notes=(), codes=None):
@@ -712,6 +827,33 @@ def probe_rows(paths=None, notes=(), codes=None):
             verdict = DIFFERS if (bad or failed) else (
                 NOT_RUN if probe_notes else PASS)
             evidence = (f"{len(claims)} claim(s) about the declared page, "
+                        f"{len(paths)} path(s) tick-for-tick"
+                        + (f" (uncompared: {'; '.join(probe_notes)})" if probe_notes
+                           else "")
+                        + f"; {detail}"
+                        + ("; failed: " + "; ".join(failed) if failed else ""))
+            out.append((name, verdict, _ascii(evidence), what, how))
+        elif name == "a declared region refuses the stores it covers":
+            if not paths:
+                out.append((name, NOT_RUN,
+                            "no path compared: " + ("; ".join(notes) if notes
+                                                    else "pass --with-paths"),
+                            what, how))
+                continue
+            try:
+                bad, claims, probe_notes = region_rows()
+            except Exception as e:
+                out.append((name, SKIPPED,
+                            f"the region probe could not be driven: {_ascii(e)}",
+                            what, how))
+                continue
+            detail = ("; ".join(bad[:3]) if bad
+                      else "every compared component of every tick agrees on all "
+                           f"{len(paths)} path(s), faults included")
+            failed = [label for label, ok in claims if not ok]
+            verdict = DIFFERS if (bad or failed) else (
+                NOT_RUN if probe_notes else PASS)
+            evidence = (f"{len(claims)} claim(s) about the declared spans, "
                         f"{len(paths)} path(s) tick-for-tick"
                         + (f" (uncompared: {'; '.join(probe_notes)})" if probe_notes
                            else "")

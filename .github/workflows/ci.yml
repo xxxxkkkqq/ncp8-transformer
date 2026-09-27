@@ -30,4 +30,4 @@ jobs:
         run: |
           python3 -m pytest -q test_arithmetic_bounds.py test_asm_strictness.py \
             test_debug_resume.py test_form_domain.py test_isa_v2.py test_linking.py \
-            test_vtab_runtime_vectors.py
+            test_vtab_runtime_vectors.py test_mpu_write_regions.py

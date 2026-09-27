@@ -38,8 +38,9 @@ covers undefined opcodes, reserved subcodes, instruction fetch past the end of
 `CODE`, data access outside `DATA`, stack underflow/overflow, division or modulo
 by zero, an unregistered trap vector, a self-modification write outside the
 declared window, a `SP` write that would leave `[0, 4096]`, `BANK_OOB` for a selector that
-names no page this machine was loaded with, and `BANK_BUSY` for a page whose owner is
-still running. The tick counter
+names no page this machine was loaded with, `BANK_BUSY` for a page whose owner is
+still running, and `REGION_VIOL` for a store whose target a declared write-protected
+region covers (see 5). The tick counter
 advances only on a successful tick.
 
 A 16-bit memory access checks both of its bytes before either one is read or
@@ -321,6 +322,7 @@ constraint.
 | `winlo`, `winhi` | 0..65535, supplied together or not at all, and `winhi <= codelen` | the self-modification window `[winlo, winhi)`: a span inside the program it may rewrite. A bound past the last program byte is refused at load, naming the span and the program length |
 | `vec` | at most 16 entries, each 0..65535 | trap entry points; `0` means unregistered |
 | `vtab` | 0..4064, even addresses only | the DATA base of a writable 16-entry x 2-byte copy of the vector table: the load seeds it once from `vec` (an absent `vec` seeds sixteen zeros, all unregistered), `DATA[vtab+2k]` low byte and `+1` high, and from the first tick the cells are ordinary DATA an `ST`/`STMW` may rewrite; an odd base and a base whose 32-byte table leaves DATA are refused at construction |
+| `regions` | at most 4 spans of `0..4096`, supplied ascending and non-overlapping, each `lo <= hi` | the write-protected spans of DATA: a store (`MOV [HL], r`, `MOV [DE], r`, `STW`, `STX`, `PUSH`, `PUSHW`, the `CALL`/`CALL HL`/`EXT` return frames, `STM`, `STMW`) whose target a span covers stops with `REGION_VIOL` before anything commits; reads are never restricted, and a span whose bounds are equal covers no cell. An absent declaration protects nothing |
 | `tickbudget` | 0..2^62 | ticks before `OVERRUN` |
 | `outcap` | a power of two, from 1 up to 32768 | output bytes before the capacity fault; a non-power-of-two is refused because the store masks the write index |
 | `nbanks` | 1..65535 | how many `DATA` pages a machine may reach through `MB`; a group must match the count (4.8) |
@@ -331,8 +333,9 @@ constraint.
 A field left as `None` is *absent*, and absence has one meaning per field: `codelen`
 is the length of the loaded image, `tickbudget` and `outcap` are the constructor
 arguments, the window is the empty span (no `STC` writes anything), the vector table
-is all-zero (no `EXT` dispatches anywhere) and no writable page exists - the block's
-`vec` is the only table there is. A reversed window (`winhi < winlo`) is
+is all-zero (no `EXT` dispatches anywhere), no writable page exists - the block's
+`vec` is the only table there is - and no region is protected, so every store the
+machine's own bounds allow commits exactly as it did before the field existed. A reversed window (`winhi < winlo`) is
 refused at construction and is never read as the empty window, because that would make
 a typo in one bound indistinguishable from switching self-modification off. Declaring a
 bound in the block and also moving the matching constructor argument off its default to
@@ -364,7 +367,13 @@ reach the tables - was not a design: the reachability of the machine's own limit
 consequence of an 8-bit field's width, and widening that width would have moved the
 limits inside the memory the machine writes.
 
-One declaration is a signed exception, and it is the only one: a block that declares
+Two declarations are signed exceptions, and they are the only ones. A block that
+declares `regions` gives up "every store my program runs is one my own bounds allow":
+the spans it names are DATA cells the machine may not store into, the store faults on
+the writer with `REGION_VIOL` after every pre-check of the same tick has passed (a
+cross-bank store answers the page it lands in, and the owner's quiescence is judged
+first - quiescence is a concurrency fact, the region is a permission), and a load that
+declares none keeps the older guarantee whole. A block that declares
 `vtab` gives up "the machine cannot rewrite its own handler table". The block itself
 stays as unreachable as ever - no instruction reads a field of it, so a tick still
 cannot move a bound or a declared vector - but the 32 DATA bytes the field names are

@@ -218,6 +218,8 @@ FAULT_CAUSES = (
     ("BANK_OOB", "MB >= NBANKS"),
     ("BANK_BUSY", "cross-bank access while the owner is running"),
     ("PC_ILLEGAL", "committed PC outside the image"),
+    ("REGION_VIOL", "writing a byte of DATA that a declared write-protected region "
+                    "covers"),
 )
 CAUSE = {name: code for code, (name, _d) in enumerate(FAULT_CAUSES)}
 CAUSE_NAME = {code: name for code, (name, _d) in enumerate(FAULT_CAUSES)}
@@ -254,6 +256,7 @@ FAULT_SITE_ORDER = (
     ("WINDOW", "WINDOW"),
     ("SP_RANGE", "DATA_OOB"),
     ("OUT_CAP", "OUT_CAP"),
+    ("REGION_VIOL", "REGION_VIOL"),
 )
 FAULT_SITE_NAMES = tuple(site for site, _cause in FAULT_SITE_ORDER)
 FAULT_SITE_CAUSE = {site: CAUSE[cause] for site, cause in FAULT_SITE_ORDER}
@@ -287,6 +290,8 @@ VTAB_CELLS = 2 * VEC_COUNT
 
 DEFAULT_VTAB_SENTINEL = 0
 
+REGIONS_MAX = 4
+
 DEFAULT_WINDOW = (0, 0)
 DEFAULT_VECTORS = (0,) * VEC_COUNT
 DEFAULT_ENTRY = 0
@@ -294,12 +299,12 @@ DEFAULT_TDLIM = 64
 
 TRAP_TAG = 0xA5
 
-CONFIG_NAMES = ("CODELEN", "ENTRY", "WINLO", "WINHI", "VEC", "VTAB", "NBANKS", "TDLIM",
-                "SPLIM", "TICKBUDGET", "OUTCAP")
+CONFIG_NAMES = ("CODELEN", "ENTRY", "WINLO", "WINHI", "VEC", "VTAB", "REGIONS",
+                "NBANKS", "TDLIM", "SPLIM", "TICKBUDGET", "OUTCAP")
 
 CONFIG_WIDTHS = {"CODELEN": 16, "ENTRY": 16, "WINLO": 16, "WINHI": 16, "VEC": 16,
-                 "VTAB": 16, "NBANKS": 16, "TDLIM": 8, "SPLIM": 16, "TICKBUDGET": None,
-                 "OUTCAP": 16}
+                 "VTAB": 16, "REGIONS": 16, "NBANKS": 16, "TDLIM": 8, "SPLIM": 16,
+                 "TICKBUDGET": None, "OUTCAP": 16}
 
 OUT_CAP_LIMIT = 1 << 16
 
@@ -390,14 +395,48 @@ def vtab_seed_bytes(vec):
         out[2 * k + 1] = (v >> 8) & 0xFF
     return bytes(out)
 
+def regions_error(regions, where=""):
+
+    if regions is None:
+        return None
+    if isinstance(regions, (str, bytes, bytearray)) \
+            or not isinstance(regions, (list, tuple)):
+        return (f"{where}REGIONS must be a sequence of at most {REGIONS_MAX} (lo, hi) "
+                f"pairs of DATA addresses, got {regions!r}")
+    if len(regions) > REGIONS_MAX:
+        return (f"{where}REGIONS declares {len(regions)} write-protected regions, "
+                f"above the {REGIONS_MAX} a machine declares: the fixed maximum is "
+                f"what keeps every implementation's region check the same shape")
+    prev_hi = None
+    for i, pair in enumerate(regions):
+        if isinstance(pair, (str, bytes, bytearray)) \
+                or not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            return (f"{where}REGIONS[{i}] is {pair!r}, which is not a (lo, hi) pair "
+                    f"of DATA addresses")
+        lo = _cfg_int(f"REGIONS[{i}] lo", pair[0], 0, DATA_SIZE)
+        hi = _cfg_int(f"REGIONS[{i}] hi", pair[1], 0, DATA_SIZE)
+        if hi < lo:
+            return (f"{where}REGIONS[{i}]: hi={hi} (0x{hi:04X}) is below lo={lo} "
+                    f"(0x{lo:04X}); a reversed region is refused at load rather than "
+                    f"run as the empty span, which is how a typo in one bound would "
+                    f"come out looking like no protection at all")
+        if prev_hi is not None and lo < prev_hi:
+            return (f"{where}REGIONS[{i}] [0x{lo:04X},0x{hi:04X}) starts before "
+                    f"REGIONS[{i - 1}] ends at 0x{prev_hi:04X}: the regions are "
+                    f"declared ascending and non-overlapping, so two spans naming one "
+                    f"cell is a contradiction between signed constraints and not a "
+                    f"union this machine resolves")
+        prev_hi = hi
+    return None
+
 class MachineConfig:
 
-    __slots__ = ("codelen", "entry", "winlo", "winhi", "vec", "vtab", "nbanks",
-                 "tdlim", "splim", "tickbudget", "outcap")
+    __slots__ = ("codelen", "entry", "winlo", "winhi", "vec", "vtab", "regions",
+                 "nbanks", "tdlim", "splim", "tickbudget", "outcap")
 
     def __init__(self, *, codelen=None, entry=None, winlo=None, winhi=None, vec=None,
-                 vtab=None, nbanks=None, tdlim=None, splim=None, tickbudget=None,
-                 outcap=None):
+                 vtab=None, regions=None, nbanks=None, tdlim=None, splim=None,
+                 tickbudget=None, outcap=None):
         self.codelen = (None if codelen is None
                         else _cfg_int("CODELEN", codelen, 0, (1 << 16) - 1))
         self.entry = (None if entry is None
@@ -434,6 +473,7 @@ class MachineConfig:
             bad = vtab_error(self.vtab)
             if bad is not None:
                 raise ConfigError(bad)
+        self.regions = None if regions is None else self._checked_regions(regions)
         self.nbanks = (None if nbanks is None
                        else _cfg_int("NBANKS", nbanks, 1, (1 << 16) - 1))
         self.tdlim = (None if tdlim is None
@@ -466,6 +506,14 @@ class MachineConfig:
             for k, v in enumerate(entries):
                 table[k] = _cfg_int(f"VEC[{k}]", v, 0, (1 << 16) - 1)
         return tuple(0 if v is None else v for v in table)
+
+    @staticmethod
+    def _checked_regions(regions):
+
+        bad = regions_error(regions)
+        if bad is not None:
+            raise ConfigError(bad)
+        return tuple((int(lo), int(hi)) for lo, hi in regions)
 
     @property
     def has_window(self):
@@ -507,7 +555,8 @@ class MachineConfig:
         for name in self.__slots__:
             value = getattr(self, name)
             if value is not None:
-                out[name] = list(value) if name == "vec" else value
+                out[name] = ([list(pair) for pair in value] if name == "regions"
+                             else list(value) if name == "vec" else value)
         return out
 
     @classmethod
@@ -1179,6 +1228,57 @@ def check_config_table():
     if MachineConfig(vtab=DATA_SIZE - VTAB_CELLS).vtab != DATA_SIZE - VTAB_CELLS:
         raise DecodeTableError("a table ending exactly at the last DATA byte is "
                                "refused, though its footprint fits the span")
+    if MachineConfig().regions is not None:
+        raise DecodeTableError("an absent region list reads as a declared one, so a "
+                               "machine without the field would count as one that "
+                               "gave up the stores its program would refuse")
+    if MachineConfig(regions=[(0x10, 0x20)]).regions != ((0x10, 0x20),):
+        raise DecodeTableError("a declared region does not survive validation as the "
+                               "pair of ints the machine compares against")
+    if MachineConfig(regions=[[8, 12]]).regions != ((8, 12),) or \
+            MachineConfig(regions=((8, 12), (0x10, 0x10))).regions != \
+            ((8, 12), (0x10, 0x10)):
+        raise DecodeTableError("a region list arriving as data (lists, an empty span) "
+                               "does not normalize to the tuple of pairs the block "
+                               "stores")
+    if MachineConfig(regions=[]).regions != ():
+        raise DecodeTableError("a declared-but-empty region list is refused, though "
+                               "the empty span protects exactly what the absent one "
+                               "does and the window keeps the same distinction")
+    for bad_regions in (0, "0x10", (8,), ((1, 2), 3), ((-1, 4),), ((0, DATA_SIZE + 1),),
+                        ((0x20, 0x10),), ((0x10, 0x20), (0x18, 0x30)),
+                        ((0x10, 0x20), (0x08, 0x0C)), True,
+                        ((0, 4), (8, 12), (16, 20), (24, 28), (32, 36))):
+        try:
+            MachineConfig(regions=bad_regions)
+        except ConfigError:
+            continue
+        raise DecodeTableError(f"a region declaration {bad_regions!r} is accepted, "
+                               f"though it is not up to {REGIONS_MAX} ordered, "
+                               f"non-overlapping, in-span pairs")
+    try:
+        MachineConfig(regions=((0x18, 0x10),))
+    except ConfigError as e:
+        if "REGIONS[0]" not in str(e) or "0x0018" not in str(e):
+            raise DecodeTableError("a reversed region is refused without naming the "
+                                   f"region and the rule: {e}")
+    else:
+        raise DecodeTableError("a reversed region is accepted, though a span whose "
+                               "bounds cross protects an interval nobody declared")
+    try:
+        MachineConfig(regions=((0x10, 0x20), (0x18, 0x30)))
+    except ConfigError as e:
+        if "overlaps" not in str(e) and "starts before" not in str(e):
+            raise DecodeTableError("overlapping regions are refused without naming both "
+                                   f"spans: {e}")
+    else:
+        raise DecodeTableError("overlapping regions are accepted, so two signed "
+                               "constraints can contradict each other")
+    try:
+        MachineConfig(regions=((8, 12), (16, 20)))
+    except ConfigError:
+        raise DecodeTableError("adjacent regions are refused, though the half-open "
+                               "spans name disjoint cells")
     try:
         MachineConfig(codelen=4, entry=4)
     except ConfigError as e:
@@ -1208,6 +1308,19 @@ def check_fault_table():
         raise DecodeTableError("cause 0 must be OK")
     if max(FAULT_CODES) > 255:
         raise DecodeTableError("the cause table exceeds the 8-bit fault_reason field")
+
+    if CAUSE["REGION_VIOL"] != len(FAULT_CAUSES) - 1:
+        raise DecodeTableError(f"REGION_VIOL entered the cause table last (A139) and "
+                               f"stays there: it is now code {CAUSE['REGION_VIOL']} of "
+                               f"{len(FAULT_CAUSES) - 1}, so something was inserted or "
+                               f"moved ahead of it and every fault_reason an older "
+                               f"record carries above it has been renumbered")
+    if SITE_RANK["REGION_VIOL"] != len(FAULT_SITE_ORDER) - 1:
+        raise DecodeTableError(f"the REGION_VIOL site is the last rank of the "
+                               f"precedence list -- the region check runs at the "
+                               f"store, after every pre-check of the same tick -- and "
+                               f"is now rank {SITE_RANK['REGION_VIOL']} of "
+                               f"{len(FAULT_SITE_ORDER) - 1}")
     if len(FAULT_SITE_NAMES) != len(set(FAULT_SITE_NAMES)):
         raise DecodeTableError("the fault precedence list names a site twice")
     for site, cause in FAULT_SITE_ORDER:

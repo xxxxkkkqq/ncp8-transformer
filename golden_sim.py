@@ -156,10 +156,14 @@ class NCP8:
 
         self.splim = 0 if cfg.splim is None else cfg.splim
 
+        self.regions = () if cfg.regions is None else tuple(cfg.regions)
+
         self.MB = 0
         self.bank_own = 0
         self.banks = (self.data,)
         self.bank_owner_status = None
+
+        self.bank_owner_regions = None
         self.status = STATUS_RUNNING
 
         self.fault_reason = CAUSE["OK"]
@@ -200,6 +204,7 @@ class NCP8:
         return ISA.MachineConfig(codelen=self.codelen, entry=self.entry,
                                  winlo=lo, winhi=hi,
                                  vec=self.config.vectors(), vtab=self.config.vtab,
+                                 regions=self.config.regions,
                                  nbanks=self.nbanks,
                                  tdlim=self.tdlim, splim=self.splim,
                                  tickbudget=self.tb, outcap=self.out_cap)
@@ -281,7 +286,7 @@ class NCP8:
             self._fault(CAUSE["DATA_OOB"], f"DATA out of range: {addr}")
         return addr
 
-    def install_banks(self, pages, own, owner_status):
+    def install_banks(self, pages, own, owner_status, owner_regions=None):
 
         pages = tuple(pages)
         if len(pages) != self.nbanks:
@@ -298,9 +303,19 @@ class NCP8:
             raise ISA.ConfigError(f"{len(owner_status)} owner statuses for "
                                   f"{len(pages)} banks: every page's owner has to be "
                                   f"named for the quiescence rule to be decidable")
+        if owner_regions is None:
+            owner_regions = ((),) * len(pages)
+        if len(owner_regions) != len(pages):
+            raise ISA.ConfigError(f"{len(owner_regions)} owner region lists for "
+                                  f"{len(pages)} banks: a cross-bank store passes "
+                                  f"through the page it lands in, so every page's "
+                                  f"protection has to be named")
         self.banks = pages
         self.bank_own = own
         self.bank_owner_status = tuple(owner_status)
+        self.bank_owner_regions = tuple(
+            () if regs is None else tuple(tuple(pair) for pair in regs)
+            for regs in owner_regions)
 
     def _bank_page(self, mb):
 
@@ -329,6 +344,57 @@ class NCP8:
                         f"address {addr} and {addr + 1} are not both inside the "
                         f"{len(page)}-byte bank page")
         return addr
+
+    def _page_regions(self, mb):
+
+        if mb == self.bank_own or self.banks[mb] is self.data:
+            return self.regions
+        if self.bank_owner_regions is None or mb >= len(self.bank_owner_regions):
+            return ()
+        return self.bank_owner_regions[mb]
+
+    def _region_hit(self, regions, addr):
+
+        for lo, hi in regions:
+            if lo <= addr < hi:
+                return (lo, hi)
+        return None
+
+    def _region(self, addr):
+
+        hit = self._region_hit(self.regions, addr)
+        if hit is not None:
+            lo, hi = hit
+            self._fault(CAUSE["REGION_VIOL"],
+                        f"REGION_VIOL: store to {addr:#06x} hits the declared "
+                        f"write-protected region [0x{lo:04X},0x{hi:04X}); the load "
+                        f"signed this span away and no instruction may write it")
+
+    def _region_pair(self, addr):
+
+        self._region(addr)
+        self._region(addr + 1)
+
+    def _stack_region(self, n):
+
+        for k in range(1, n + 1):
+            self._region(self.SP - k)
+
+    def _bank_region(self, mb, addr):
+
+        hit = self._region_hit(self._page_regions(mb), addr)
+        if hit is not None:
+            lo, hi = hit
+            self._fault(CAUSE["REGION_VIOL"],
+                        f"REGION_VIOL: bank store to {addr:#06x} of the page bank "
+                        f"{mb} hits the page's declared write-protected region "
+                        f"[0x{lo:04X},0x{hi:04X}); the writer faults and the owner's "
+                        f"byte is untouched")
+
+    def _bank_region_pair(self, mb, addr):
+
+        self._bank_region(mb, addr)
+        self._bank_region(mb, addr + 1)
 
     def _fetch(self, n):
         if self.PC + n > self.codelen:
@@ -375,6 +441,8 @@ class NCP8:
 
     def _push(self, byte):
         self._stack_room(1)
+
+        self._region(self.SP - 1)
         self.SP -= 1
         self.data[self.SP] = byte & 0xFF
 
@@ -463,6 +531,7 @@ class NCP8:
             t = imm[1] << 8 | imm[0]; ret = self.PC
             self._stack_room(2)
             self._pc_target(t, pc0)
+            self._stack_region(2)
             self._push(ret & 0xFF); self._push(ret >> 8); self.PC = t; m = "CALL"
         elif sel == "LDI_HL":
             self.HL = imm[1] << 8 | imm[0]; m = f"LDI HL, {self.HL}"
@@ -584,7 +653,9 @@ class NCP8:
             self.SP = self.DE; m = "MOVW SP, DE"
         elif sel == "PUSHW_HL" or sel == "PUSHW_DE":
             v = self.HL if sel == "PUSHW_HL" else self.DE
-            self._stack_room(2); self.SP -= 2
+            self._stack_room(2)
+            self._stack_region(2)
+            self.SP -= 2
             self.data[self.SP] = v & 0xFF
             self.data[self.SP + 1] = (v >> 8) & 0xFF
             m = "PUSHW HL" if sel == "PUSHW_HL" else "PUSHW DE"
@@ -598,11 +669,13 @@ class NCP8:
             self.SP += 2
         elif sel == "STW_HLDE":
             self._mem16(self.HL)
+            self._region_pair(self.HL)
             self.data[self.HL] = self.DE & 0xFF
             self.data[self.HL + 1] = (self.DE >> 8) & 0xFF
             m = "STW [HL], DE"
         elif sel == "STW_DEHL":
             self._mem16(self.DE)
+            self._region_pair(self.DE)
             self.data[self.DE] = self.HL & 0xFF
             self.data[self.DE + 1] = (self.HL >> 8) & 0xFF
             m = "STW [DE], HL"
@@ -623,6 +696,7 @@ class NCP8:
             sx = (imm[0] ^ 0x80) - 0x80
             addr = (self.HL + sx) & 0xFFFF
             self._mem(addr)
+            self._region(addr)
             self.data[addr] = self.r[s0]; m = f"STX [HL{sx:+d}], r{s0}"
         elif sel == "ADD_SP":
             sx = (imm[0] ^ 0x80) - 0x80
@@ -664,6 +738,7 @@ class NCP8:
         elif sel == "STM":
             page = self._bank_page(self.MB)
             self._bank_mem(page, self.HL)
+            self._bank_region(self.MB, self.HL)
             page[self.HL] = self.r[s0]; m = f"STM [HL], r{s0}"
         elif sel == "LDMW_DE_HL":
             page = self._bank_page(self.MB)
@@ -676,12 +751,14 @@ class NCP8:
         elif sel == "STMW_HL_DE":
             page = self._bank_page(self.MB)
             self._bank_mem16(page, self.HL)
+            self._bank_region_pair(self.MB, self.HL)
             page[self.HL] = self.DE & 0xFF
             page[self.HL + 1] = (self.DE >> 8) & 0xFF
             m = "STMW [HL], DE"
         elif sel == "STMW_DE_HL":
             page = self._bank_page(self.MB)
             self._bank_mem16(page, self.DE)
+            self._bank_region_pair(self.MB, self.DE)
             page[self.DE] = self.HL & 0xFF
             page[self.DE + 1] = (self.HL >> 8) & 0xFF
             m = "STMW [DE], HL"
@@ -713,6 +790,7 @@ class NCP8:
                             f"declared @ {pc0:#04x}")
             self._stack_room(4)
             self._pc_target(tgt, pc0)
+            self._stack_region(4)
             ret = self.PC
             fb = ISA.flags_byte({"Z": self.Z, "C": self.C, "S": self.S, "V": self.V})
 
@@ -756,6 +834,7 @@ class NCP8:
             ret = self.PC
             self._stack_room(2)
             self._pc_target(self.HL, pc0)
+            self._stack_region(2)
             self._push(ret & 0xFF); self._push(ret >> 8)
             self.PC = self.HL; m = "CALL HL"
         elif sel in ("LDI", "ADDI", "SUBI", "ADCI"):
@@ -801,11 +880,13 @@ class NCP8:
         elif sel == "MOV_R_HL":
             self._mem(self.HL); self.r[s0] = self.data[self.HL]; m = f"MOV r{s0}, [HL]"
         elif sel == "MOV_HL_R":
-            self._mem(self.HL); self.data[self.HL] = self.r[s0]; m = f"MOV [HL], r{s0}"
+            self._mem(self.HL); self._region(self.HL)
+            self.data[self.HL] = self.r[s0]; m = f"MOV [HL], r{s0}"
         elif sel == "MOV_R_DE":
             self._mem(self.DE); self.r[s0] = self.data[self.DE]; m = f"MOV r{s0}, [DE]"
         elif sel == "MOV_DE_R":
-            self._mem(self.DE); self.data[self.DE] = self.r[s0]; m = f"MOV [DE], r{s0}"
+            self._mem(self.DE); self._region(self.DE)
+            self.data[self.DE] = self.r[s0]; m = f"MOV [DE], r{s0}"
         elif sel == "PUSH": self._push(self.r[s0]); m = f"PUSH r{s0}"
         elif sel == "POP": self.r[s0] = self._pop(); m = f"POP r{s0}"
         elif sel == "OUT": self._emit(self.r[s0]); m = f"OUT r{s0}"

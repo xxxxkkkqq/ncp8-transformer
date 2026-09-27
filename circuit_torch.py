@@ -117,6 +117,10 @@ class TorchCircuit:
 
         self.splim = 0 if cfg.splim is None else cfg.splim
         self.SPLIM = torch.tensor([self.splim], dtype=i32, device=dev)
+
+        self.regions = () if cfg.regions is None else tuple(cfg.regions)
+        _pad = list(self.regions) + [(0, 0)] * (ISA.REGIONS_MAX - len(self.regions))
+        self.cfg_regions = torch.tensor(_pad, dtype=i32, device=dev)
         self.CODE = torch.zeros(CODE_SIZE, dtype=i32, device=dev)
         self.CODE[: len(code)] = torch.tensor(list(code), dtype=i32, device=dev)
         self.DATA = torch.zeros(DATA_SIZE, dtype=i32, device=dev)
@@ -515,7 +519,42 @@ class TorchCircuit:
         v3_err = (oh(MOVW_SP_HL) * (1 - hl_sp_ok) + oh(MOVW_SP_DE) * (1 - de_sp_ok)
                   + oh(ADD_SP) * (1 - sp_add_ok))
 
+        sel = lambda rows: (ind * rows).sum()
+
         out_ovf = (ind * rows_out_en * (self.oplen >= self.out_cap).to(i32)).sum()
+
+        a1 = sel(oh(MOV_HL_R) * self.HL + oh(MOV_DE_R) * self.DE
+                 + oh(PUSH) * (self.SP - 1) + oh(CALL) * (self.SP - 1)
+                 + oh(CALL_HL) * (self.SP - 1)
+                 + oh(EXT) * (self.SP - 1)
+                 + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (self.SP - 1)
+                 + oh(STW_HLDE) * self.HL + oh(STW_DEHL) * self.DE
+                 + oh(STX) * fr
+                 + oh(STM) * self.HL + oh(STMW_HL_DE) * self.HL
+                 + oh(STMW_DE_HL) * self.DE)
+        d1_en = sel(oh(MOV_HL_R) + oh(MOV_DE_R) + oh(PUSH) + oh(CALL) + oh(CALL_HL)
+                    + oh(EXT)
+                    + oh(PUSHW_HL) + oh(PUSHW_DE) + oh(STW_HLDE) + oh(STW_DEHL)
+                    + oh(STX)
+                    + oh(STM) + oh(STMW_HL_DE) + oh(STMW_DE_HL))
+        a2 = sel(oh(CALL) * (self.SP - 2) + oh(CALL_HL) * (self.SP - 2)
+                 + oh(EXT) * (self.SP - 2)
+                 + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (self.SP - 2)
+                 + oh(STW_HLDE) * (self.HL + 1) + oh(STW_DEHL) * (self.DE + 1)
+                 + oh(STMW_HL_DE) * (self.HL + 1) + oh(STMW_DE_HL) * (self.DE + 1))
+        d2_en = sel(oh(CALL) + oh(CALL_HL) + oh(EXT) + oh(PUSHW_HL) + oh(PUSHW_DE)
+                    + oh(STW_HLDE) + oh(STW_DEHL) + oh(STMW_HL_DE) + oh(STMW_DE_HL))
+
+        a3 = sel(oh(EXT) * (self.SP - 3))
+        d3_en = sel(oh(EXT))
+        a4 = sel(oh(EXT) * (self.SP - 4))
+        d4_en = sel(oh(EXT))
+
+        rg_lo = self.cfg_regions[:, 0]
+        rg_hi = self.cfg_regions[:, 1]
+        rg_hit = lambda a: ((a >= rg_lo) & (a < rg_hi)).any().to(i32)
+        region_viol = (d1_en * rg_hit(a1) + d2_en * rg_hit(a2)
+                       + d3_en * rg_hit(a3) + d4_en * rg_hit(a4))
 
         cl = self.codelen
 
@@ -561,12 +600,12 @@ class TorchCircuit:
             (ind * oh(STC) * code_ok * (1 - win_ok)).sum(),
             (ind * v3_err).sum(),
             out_ovf,
+            region_viol,
         )))
         cause = fault_cause(fired, self.fault_codes)
 
         err = (cause != 0).to(i32)
 
-        sel = lambda rows: (ind * rows).sum()
         R_w = (ind[:, None] * oh_s0 * rows_R_en[:, None]).sum(0)
         R_v = (ind[:, None] * oh_s0 * (rows_R_en * rows_R_val)[:, None]).sum(0)
         ok = (err == 0).to(i32)
@@ -575,15 +614,6 @@ class TorchCircuit:
         over = running * (self.tick >= self.TB).to(i32)
         m = ok * running * (1 - over)
 
-        a1 = sel(oh(MOV_HL_R) * self.HL + oh(MOV_DE_R) * self.DE
-                 + oh(PUSH) * (self.SP - 1) + oh(CALL) * (self.SP - 1)
-                 + oh(CALL_HL) * (self.SP - 1)
-                 + oh(EXT) * (self.SP - 1)
-                 + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (self.SP - 1)
-                 + oh(STW_HLDE) * self.HL + oh(STW_DEHL) * self.DE
-                 + oh(STX) * fr
-                 + oh(STM) * self.HL + oh(STMW_HL_DE) * self.HL
-                 + oh(STMW_DE_HL) * self.DE)
         v1 = sel(oh(MOV_HL_R) * rr + oh(MOV_DE_R) * rr + oh(PUSH) * rr
                  + oh(CALL) * ((self.PC + 3) & 255) + oh(CALL_HL) * ((self.PC + 2) & 255)
                  + oh(EXT) * ISA.TRAP_TAG
@@ -592,36 +622,25 @@ class TorchCircuit:
                  + oh(STX) * rr
                  + oh(STM) * a_s0 + oh(STMW_HL_DE) * (self.DE & 255)
                  + oh(STMW_DE_HL) * (self.HL & 255))
-        e1 = sel(oh(MOV_HL_R) + oh(MOV_DE_R) + oh(PUSH) + oh(CALL) + oh(CALL_HL)
-                 + oh(EXT)
-                 + oh(PUSHW_HL) + oh(PUSHW_DE) + oh(STW_HLDE) + oh(STW_DEHL) + oh(STX)
-                 + oh(STM) + oh(STMW_HL_DE) + oh(STMW_DE_HL)) * m
+        e1 = d1_en * m
         oh1 = ((self.RD == a1).to(i32)) * e1
         self.DATA = oh1 * v1 + (1 - oh1) * self.DATA
-        a2 = sel(oh(CALL) * (self.SP - 2) + oh(CALL_HL) * (self.SP - 2)
-                 + oh(EXT) * (self.SP - 2)
-                 + (oh(PUSHW_HL) + oh(PUSHW_DE)) * (self.SP - 2)
-                 + oh(STW_HLDE) * (self.HL + 1) + oh(STW_DEHL) * (self.DE + 1)
-                 + oh(STMW_HL_DE) * (self.HL + 1) + oh(STMW_DE_HL) * (self.DE + 1))
         v2 = sel(oh(CALL) * ((self.PC + 3) >> 8) + oh(CALL_HL) * ((self.PC + 2) >> 8)
                  + oh(EXT) * fpack
                  + oh(PUSHW_HL) * (self.HL & 255) + oh(PUSHW_DE) * (self.DE & 255)
                  + oh(STW_HLDE) * ((self.DE >> 8) & 255) + oh(STW_DEHL) * ((self.HL >> 8) & 255)
                  + oh(STMW_HL_DE) * ((self.DE >> 8) & 255)
                  + oh(STMW_DE_HL) * ((self.HL >> 8) & 255))
-        e2 = sel(oh(CALL) + oh(CALL_HL) + oh(EXT) + oh(PUSHW_HL) + oh(PUSHW_DE)
-                 + oh(STW_HLDE) + oh(STW_DEHL) + oh(STMW_HL_DE) + oh(STMW_DE_HL)) * m
+        e2 = d2_en * m
         oh2 = ((self.RD == a2).to(i32)) * e2
         self.DATA = oh2 * v2 + (1 - oh2) * self.DATA
 
-        a3 = sel(oh(EXT) * (self.SP - 3))
         v3 = sel(oh(EXT) * ((self.PC + 3) & 255))
-        e3 = sel(oh(EXT)) * m
+        e3 = d3_en * m
         oh3 = ((self.RD == a3).to(i32)) * e3
         self.DATA = oh3 * v3 + (1 - oh3) * self.DATA
-        a4 = sel(oh(EXT) * (self.SP - 4))
         v4 = sel(oh(EXT) * ((self.PC + 3) >> 8))
-        e4 = sel(oh(EXT)) * m
+        e4 = d4_en * m
         oh4 = ((self.RD == a4).to(i32)) * e4
         self.DATA = oh4 * v4 + (1 - oh4) * self.DATA
 
@@ -707,6 +726,7 @@ class TorchCircuit:
         return ISA.MachineConfig(codelen=self.codelen, entry=self.entry,
                                  winlo=lo, winhi=hi,
                                  vec=self.config.vectors(), vtab=self.config.vtab,
+                                 regions=self.config.regions,
                                  nbanks=self.nbanks,
                                  tdlim=self.tdlim, splim=self.splim,
                                  tickbudget=self.tb, outcap=self.out_cap)

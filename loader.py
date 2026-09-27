@@ -459,10 +459,10 @@ def _resolve(value, symbols, what, lo, hi, lineno=None):
 class LoadResult:
 
     __slots__ = ("image", "symbols", "entry", "report", "vectors", "window", "vtab",
-                 "origins", "entry_explicit", "content_extent", "needed")
+                 "regions", "origins", "entry_explicit", "content_extent", "needed")
 
-    def __init__(self, image, symbols, entry, report, vectors, window, vtab, origins,
-                 entry_explicit, content_extent, needed):
+    def __init__(self, image, symbols, entry, report, vectors, window, vtab, regions,
+                 origins, entry_explicit, content_extent, needed):
         self.image = bytes(image)
         self.symbols = symbols
         self.entry = entry
@@ -470,6 +470,7 @@ class LoadResult:
         self.vectors = dict(vectors)
         self.window = None if window is None else tuple(window)
         self.vtab = vtab
+        self.regions = None if regions is None else tuple(regions)
         self.origins = origins
         self.entry_explicit = entry_explicit
         self.content_extent = content_extent
@@ -505,7 +506,7 @@ class LoadResult:
 
         return ISA.MachineConfig(codelen=self.content_extent, entry=self.entry,
                                  winlo=winlo, winhi=winhi,
-                                 vec=vec, vtab=self.vtab)
+                                 vec=vec, vtab=self.vtab, regions=self.regions)
 
 def _next_pow2(v):
     if v <= 1:
@@ -596,7 +597,7 @@ class _Reader:
                                       f"{self.later[ref]}", lineno) from None
             raise
 
-def _declarations(vectors, window, vtab):
+def _declarations(vectors, window, vtab, regions):
 
     if vectors is not None and not isinstance(vectors, dict):
         raise LoaderError(f"vectors must be a dict of index -> label_or_int, got "
@@ -605,6 +606,15 @@ def _declarations(vectors, window, vtab):
         raise LoaderError(f"window must be a (lo, hi) pair, got {window!r}")
     if vtab is not None and isinstance(vtab, bool):
         raise LoaderError(f"vtab must be a DATA address or symbol, got {vtab!r}")
+    if regions is not None:
+        if isinstance(regions, (str, bytes)) or \
+                not isinstance(regions, (list, tuple)):
+            raise LoaderError(f"regions must be a sequence of (lo, hi) pairs, got "
+                              f"{regions!r}")
+        for i, pair in enumerate(regions):
+            if not (isinstance(pair, (tuple, list)) and len(pair) == 2):
+                raise LoaderError(f"regions[{i}] must be a (lo, hi) pair of DATA "
+                                  f"addresses or symbols, got {pair!r}")
     return {} if vectors is None else dict(vectors)
 
 def _place_pass(items, symbols, read):
@@ -705,7 +715,7 @@ def _emit_pass(sizes, symbols, read, placer, tag=None):
         placer.place("code", pc, data, it.lineno, text, tag)
         pc += size
 
-def _finish(symbols, placer, vectors, window, vtab, image, entry):
+def _finish(symbols, placer, vectors, window, vtab, regions, image, entry):
 
     content_extent = placer.hi_water
     out, blocks = placer.out, placer.blocks
@@ -780,6 +790,23 @@ def _finish(symbols, placer, vectors, window, vtab, image, entry):
         declarations.append(f"vtab 0x{base:04X} (writable vector table in DATA, "
                             f"{ISA.VTAB_CELLS} bytes)")
 
+    placed_regions = None
+    if regions is not None:
+        placed = []
+        for i, pair in enumerate(regions):
+            lo = _resolve(pair[0], symbols, f"regions[{i}] lo", 0, ISA.DATA_SIZE)
+            hi = _resolve(pair[1], symbols, f"regions[{i}] hi", 0, ISA.DATA_SIZE)
+            placed.append((lo, hi))
+        bad = ISA.regions_error(placed)
+        if bad is not None:
+            raise LoaderError(bad + "; the spans are a DATA declaration the load "
+                              "signs, so they are refused here where the "
+                              "declaration is made", None)
+        placed_regions = tuple(placed)
+        declarations.append(
+            "regions " + ", ".join(f"[0x{lo:04X},0x{hi:04X})" for lo, hi in placed)
+            + " (write-protected spans of DATA)")
+
     if entry is None:
         entry_explicit = False
         entry = symbols.value("main") if "main" in symbols else 0
@@ -815,14 +842,15 @@ def _finish(symbols, placer, vectors, window, vtab, image, entry):
     for name in sorted(symbols.flat()):
         rep.append(f"        {name:16s} 0x{symbols.value(name):04X} ({symbols.kind_of(name)})")
     return LoadResult(image_bytes, symbols.as_dict(), entry, rep, placed_vectors,
-                      placed_window, placed_vtab, origins, entry_explicit,
-                      content_extent, needed)
+                      placed_window, placed_vtab, placed_regions, origins,
+                      entry_explicit, content_extent, needed)
 
-def assemble(src, *, vectors=None, window=None, vtab=None, image=None, entry=None):
+def assemble(src, *, vectors=None, window=None, vtab=None, regions=None,
+             image=None, entry=None):
 
     if not isinstance(src, str):
         raise LoaderError(f"src must be a string, got a {type(src).__name__}")
-    vectors = _declarations(vectors, window, vtab)
+    vectors = _declarations(vectors, window, vtab, regions)
     items = _parse(src)
     symbols = Symbols()
     read = _Reader(symbols, (), {name: "later in the source"
@@ -830,9 +858,10 @@ def assemble(src, *, vectors=None, window=None, vtab=None, image=None, entry=Non
     sizes = _place_pass(items, symbols, read)
     placer = _Placer()
     _emit_pass(sizes, symbols, read, placer)
-    return _finish(symbols, placer, vectors, window, vtab, image, entry)
+    return _finish(symbols, placer, vectors, window, vtab, regions, image, entry)
 
-def link(units, *, vectors=None, window=None, vtab=None, image=None, entry=None):
+def link(units, *, vectors=None, window=None, vtab=None, regions=None,
+         image=None, entry=None):
 
     if isinstance(units, str) or not isinstance(units, (list, tuple)):
         raise LoaderError(f"units must be a list of source strings, got a "
@@ -844,7 +873,7 @@ def link(units, *, vectors=None, window=None, vtab=None, image=None, entry=None)
         if not isinstance(src, str):
             raise LoaderError(f"unit {i} must be a source string, got a "
                               f"{type(src).__name__}")
-    vectors = _declarations(vectors, window, vtab)
+    vectors = _declarations(vectors, window, vtab, regions)
     items = [_parse(src) for src in units]
     defined = [_defined_names(its) for its in items]
     one_unit = len(units) == 1
@@ -882,7 +911,7 @@ def link(units, *, vectors=None, window=None, vtab=None, image=None, entry=None)
     placer = _Placer()
     for sizes, read, tag in to_emit:
         _emit_pass(sizes, merged, read, placer, tag)
-    return _finish(merged, placer, vectors, window, vtab, image, entry)
+    return _finish(merged, placer, vectors, window, vtab, regions, image, entry)
 
 def _short_image_message(length, needed, content_extent):
 

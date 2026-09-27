@@ -90,16 +90,22 @@ CFG_VEC_COUNT = tl.constexpr(ISA.VEC_COUNT)
 
 CFG_VTAB = tl.constexpr(ISA.VEC_COUNT + 2)
 CFG_HASVTAB = tl.constexpr(ISA.VEC_COUNT + 3)
-CFG_LEN = ISA.VEC_COUNT + 4
+
+CFG_REGIONS = tl.constexpr(ISA.VEC_COUNT + 4)
+CFG_LEN = ISA.VEC_COUNT + 4 + 2 * ISA.REGIONS_MAX
 CFG_WINLO = tl.constexpr(ISA.VEC_COUNT)
 CFG_WINHI = tl.constexpr(ISA.VEC_COUNT + 1)
 CFG_LEN_C = tl.constexpr(CFG_LEN)
 
 def _cfg_row(cfg):
 
+    regions = list(cfg.regions or ())[: ISA.REGIONS_MAX]
+    regions += [(0, 0)] * (ISA.REGIONS_MAX - len(regions))
     row = list(cfg.vectors()) + [cfg.window()[0], cfg.window()[1],
                                  0 if cfg.vtab is None else cfg.vtab,
                                  0 if cfg.vtab is None else 1]
+    for lo, hi in regions:
+        row += [lo, hi]
     return row
 
 class DecodeTableMismatch(Exception):
@@ -294,7 +300,7 @@ class _Row:
         return ISA.MachineConfig(codelen=int(self.b.CODELENS[self.i].item()),
                                  entry=self.b.entry,
                                  winlo=lo, winhi=hi, vec=cfg.vectors(),
-                                 vtab=cfg.vtab,
+                                 vtab=cfg.vtab, regions=cfg.regions,
                                  nbanks=self.b.nbanks, tdlim=self.b.tdlim,
                                  splim=self.b.splim,
                                  tickbudget=int(self.b.BUDGETS[self.i].item()),
@@ -390,6 +396,21 @@ def _bank_refusal(MB, NB, HELD, OWN, OST):
     if (MB != OWN) & (OST == 0):
         return F_BANK_BUSY
     return 0
+
+@triton.jit
+def _region_viol(CF, a):
+
+    l0 = tl.load(CF + CFG_REGIONS + 0)
+    h0 = tl.load(CF + CFG_REGIONS + 1)
+    l1 = tl.load(CF + CFG_REGIONS + 2)
+    h1 = tl.load(CF + CFG_REGIONS + 3)
+    l2 = tl.load(CF + CFG_REGIONS + 4)
+    h2 = tl.load(CF + CFG_REGIONS + 5)
+    l3 = tl.load(CF + CFG_REGIONS + 6)
+    h3 = tl.load(CF + CFG_REGIONS + 7)
+    hit = ((a >= l0) & (a < h0)) | ((a >= l1) & (a < h1)) \
+        | ((a >= l2) & (a < h2)) | ((a >= l3) & (a < h3))
+    return hit.to(tl.int32)
 
 @triton.jit
 def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
@@ -1092,6 +1113,14 @@ def _tick(CODE, DATA, INPUTS, OUTBUF, S, CODELEN, INLEN, BD, DS, OC, CFG, NB,
 
         err = 1
         errc = _name_cause(errc, F_PC_ILLEGAL)
+    if err == 0 and ((E1 == 1) | (E2 == 1) | (E4 == 1) | (E5 == 1)):
+
+        OWNR = CFG + (BDELTA // DS) * CFG_LEN_C
+        hit = E1 * _region_viol(OWNR, A1) + E2 * _region_viol(OWNR, A2) \
+            + E4 * _region_viol(OWNR, A4) + E5 * _region_viol(OWNR, A5)
+        if hit != 0:
+            err = 1
+            errc = _name_cause(errc, F_REGION_VIOL)
     if ST != 0:
 
         RST = ST
@@ -1585,6 +1614,7 @@ class TritonCircuit:
         return ISA.MachineConfig(codelen=self.codelen, entry=self.entry,
                                  winlo=lo, winhi=hi,
                                  vec=self.config.vectors(), vtab=self.config.vtab,
+                                 regions=self.config.regions,
                                  nbanks=self.nbanks,
                                  tdlim=self.tdlim, splim=self.splim,
                                  tickbudget=self.tb, outcap=self.out_cap)

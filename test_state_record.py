@@ -729,6 +729,10 @@ def moved_block(block, field):
     elif field == "VTAB":
 
         moved["vtab"] = (block["vtab"] + 2) if "vtab" in block else 0x0100
+    elif field == "REGIONS":
+
+        moved["regions"] = ([[lo, hi + 2] for lo, hi in block["regions"]]
+                            if "regions" in block else [[0x0100, 0x0110]])
     elif field == "NBANKS":
         moved["nbanks"] = block["nbanks"] + 1
     elif field == "TDLIM":
