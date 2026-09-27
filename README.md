@@ -55,6 +55,7 @@ python3 loader.py                     # directives, symbols, entry, and what it 
 python3 disasm.py                     # disassembly, with non-canonical detection
 python3 debug.py                      # breakpoints, watchpoints, replay, checkpoint/resume
 python3 profiler.py                   # per-instruction profile of a run
+python3 symtab_export.py              # a load's symbol table as a byte-stable file
 python3 programs.py                   # the pinned programs, each re-assembled and checked
 ```
 
@@ -63,12 +64,13 @@ The reference-only suites run on CPU. The circuit suites need CUDA.
 ## Toolchain
 
 The machine is specified in integers, so reading it needs no emulation of anything
-except itself. Five modules, four of which stand on their own:
+except itself. Six modules, four of which stand on their own:
 
 | module | what it does |
 |---|---|
 | `disasm.py` | decodes one instruction from an image, and reports an encoding that is legal but not canonical rather than folding it |
 | `loader.py` | source text to a placed image: directives, expressions, symbols, and the load-time declarations the machine reads but cannot write |
+| `symtab_export.py` | the table a load resolved against as a byte-stable text file, and back into a live symbol table - names, values and the address/constant kinds |
 | `profiler.py` | committed ticks attributed by code point and by PC, with faults and budget overruns accounted separately |
 | `debug.py` | breakpoints, watchpoints, per-tick frames, and `replay()`, which re-runs a recording and demands an exact match |
 | `recordlib.py` | the record schema, and the two conditions a label has to meet before it may be written: every datapath agrees field by field on every tick, and a second execution in a fresh process reproduces the same outcome |

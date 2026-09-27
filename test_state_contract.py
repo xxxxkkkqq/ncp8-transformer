@@ -897,6 +897,47 @@ def test_d9_declared_flags_are_the_flags_each_path_moves():
           f"{len(paths)} paths, {ticks} single ticks, every declared flag reached on every "
           f"path to the reference's value and no undeclared flag moved")
 
+BRANCH_CASES = (("JS", "S", 1), ("JNS", "S", 0), ("VS", "V", 1), ("VC", "V", 0))
+
+def test_d10_branches_read_the_flags_they_name():
+
+    runs = 0
+    bad = []
+    for cond, flag, hit in BRANCH_CASES:
+        code = asm(f"{cond} 4\n  LDI r2, 11\n  OUT r2\n  HALT\n"
+                   f"  LDI r2, 22\n  OUT r2\n  HALT")
+        for taken in (True, False):
+            for other in (0, 1):
+                values = {"S": other, "V": other}
+                values[flag] = hit if taken else 1 - hit
+                want_out = bytes([22 if taken else 11])
+                want_pc = 11 if taken else 7
+                outs, pcs = {}, {}
+                g = NCP8(code)
+                g.S, g.V = values["S"], values["V"]
+                g.run()
+                outs["reference"], pcs["reference"] = bytes(g.out), int(g.PC)
+                for name, Mach in (("torch", TorchCircuit), ("triton", TritonCircuit)):
+                    c = Mach(code)
+                    c.load_state([0, 0, 0, 0], 0, 0, 2048, 0, 0, 0, S=values["S"],
+                                 V=values["V"])
+                    c.run()
+                    outs[name], pcs[name] = c.out(), int(c.snapshot()["PC"])
+                b = TritonBatch(1)
+                b.set_program(0, code)
+                b.set_state(0, r=(0, 0, 0, 0), SP=2048, S=values["S"], V=values["V"])
+                b.run()
+                outs["batch"], pcs["batch"] = b.out(0), int(b.snapshot(0)["PC"])
+                for name in outs:
+                    runs += 1
+                    if outs[name] != want_out or pcs[name] != want_pc:
+                        bad.append((cond, flag, values, taken, name, outs[name],
+                                    pcs[name], want_out, want_pc))
+    assert not bad, ("a branch took or fell differently from its flag", bad[:6])
+    print(f"  D10 branches: {len(BRANCH_CASES)} conditions x both arms x both values of "
+          f"the other flag x 4 paths = {runs} runs, each taken arm at the far target and "
+          f"each not-taken arm at the fall-through")
+
 CHECKS = (
     test_d1_register_write_port_masks,
     test_d1_width_conformance_on_the_bundled_programs,
@@ -923,6 +964,7 @@ CHECKS = (
     test_d8_fault_pairing_is_refused_in_both_directions,
     test_d8_the_only_cause_of_a_tick_is_the_one_named_in_the_table,
     test_d9_declared_flags_are_the_flags_each_path_moves,
+    test_d10_branches_read_the_flags_they_name,
     test_s1_stc_log_counts_committed_writes_and_pins_the_first,
 )
 

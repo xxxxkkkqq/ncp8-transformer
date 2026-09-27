@@ -33,6 +33,7 @@ import isa_forms
 import isa_table as ISA
 import loader
 import profiler
+import symtab_export
 from golden_sim import (AssemblyError, CODE_SIZE, DATA_SIZE, MachineError, NCP8,
                           STATUS_ERROR, STATUS_RUNNING, asm)
 
@@ -1639,6 +1640,117 @@ def test_loader_and_asm_agree_on_every_instruction():
                                  f"{want.hex()}")
     print(f"  {shapes} accepted shapes place asm's own bytes, operand for operand")
 
+def test_symbol_table_export():
+
+    A = ("main:\n"
+         "  LDI r0, 1\n"
+         "  HALT\n"
+         "handler:\n"
+         "  RET\n")
+    B = ("  .org 0x04\n"
+         "  JMP main\n"
+         "  .equ SCALE, 0x20\n"
+         "  LDI r0, SCALE\n")
+    C = ("  .org 0x09\n"
+         "  CALL handler\n"
+         "  LDI r1, SCALE\n"
+         "  JMP main\n"
+         "  HALT\n")
+    r = loader.link([A, B, C])
+    text = symtab_export.export(r)
+    require(symtab_export.export(r) == text,
+            "two exports of one link are not byte-identical:\n"
+            f"{text!r}\nvs\n{symtab_export.export(r)!r}")
+    require(text == ("ncp8-symtab 1\n"
+                     "SCALE constant 0x20\n"
+                     "handler address 0x3\n"
+                     "main address 0x0\n"),
+            f"the exported text is not the sorted name/kind/value records:\n{text}")
+
+    shuffled = loader.Symbols()
+    for name, value, const in (("main", 0x0, False), ("handler", 0x3, False),
+                               ("SCALE", 0x20, True)):
+        shuffled.add(name, value, 1, const)
+    require(symtab_export.export(shuffled) == text,
+            "insertion order changed the export, so the text is not the table's")
+
+    back = symtab_export.read(text)
+    require(back.names() == r.symtab.names(),
+            f"imported names {sorted(back.names())} vs the link's "
+            f"{sorted(r.symtab.names())}")
+    for name in sorted(r.symtab.names()):
+        require(back.value(name) == r.symtab.value(name)
+                and back.kind_of(name) == r.symtab.kind_of(name),
+                f"{name}: imported as ({back.value(name)}, {back.kind_of(name)}), "
+                f"the link resolved ({r.symtab.value(name)}, {r.symtab.kind_of(name)})")
+    require(back.flat() == r.symbols,
+            f"the imported flat view {back.flat()} vs the load's {r.symbols}")
+
+    require(back.is_address("handler") and not back.is_address("SCALE"),
+            "the imported table lost the address/constant distinction")
+    undefined = refuses(lambda: back.value("nope"))
+    require(undefined is not None and "undefined symbol 'nope'" in undefined,
+            f"an imported table answered for a name it does not hold: {undefined}")
+
+    def literal_text(scale):
+
+        return (f"  CALL 0x{back.value('handler'):x}\n"
+                f"  LDI r1, 0x{scale:x}\n"
+                f"  JMP 0x{back.value('main'):x}\n"
+                "  HALT\n")
+
+    from_image = loader.assemble(literal_text(back.value("SCALE")))
+
+    got = from_image.image[:from_image.content_extent]
+    where = 0x09
+    require(r.image[where:where + len(got)] == got,
+            f"C from the imported table is {got.hex()}, the link placed "
+            f"{r.image[where:where + len(got)].hex()}")
+    drifted = loader.assemble(literal_text(back.value("SCALE") ^ 1))
+    require(drifted.image[:drifted.content_extent] != got,
+            "substituting a different constant produced the same bytes, so the "
+            "relocation comparison cannot see the table's values")
+
+    swapped = text.replace("SCALE constant 0x20", "SCALE address 0x20")
+    back_swapped = symtab_export.read(swapped)
+    kind_bad = [n for n in back_swapped.names()
+                if back_swapped.kind_of(n) != r.symtab.kind_of(n)]
+    require(kind_bad == ["SCALE"],
+            f"a swapped kind was not caught by name: {kind_bad}")
+
+    d1 = debug.Debug(r.image, symbols=r.symbols)
+    d2 = debug.Debug(r.image, symbols=back.flat())
+    require(d1.symbols["handler"] == d2.symbols["handler"] == 0x3,
+            f"the imported table drives breakpoints to "
+            f"{d2.symbols['handler']}, the load's to {d1.symbols['handler']}")
+
+    bare = loader.assemble("  HALT\n")
+    empty_text = symtab_export.export(bare)
+    require(empty_text == "ncp8-symtab 1\n" and symtab_export.export(bare) == empty_text,
+            f"an empty table exported as {empty_text!r}")
+    require(symtab_export.read(empty_text).names() == set(),
+            "a header-only file did not read back as an empty table")
+
+    for label, body, *needle in (
+            ("a duplicate symbol", "x address 0x0\nx constant 0x1\n",
+             "defined twice", "lines 2 and 3"),
+            ("an unknown kind", "x addr 0x0\n", "unknown kind", "'addr'"),
+            ("a malformed line", "x address\n", "name kind value"),
+            ("a non-hex value", "x address 28\n", "hex integer"),
+            ("an invalid name", "0x address 0x0\n", "invalid symbol name"),
+            ("a missing header", "x address 0x0\n", "not an ncp8 symbol table")):
+        source = body if label == "a missing header" else "ncp8-symtab 1\n" + body
+        msg = refuses(symtab_export.read, source)
+        require(msg is not None and all(n in msg for n in needle),
+                f"{label} was not refused naming {needle}: {msg}")
+    flat = refuses(symtab_export.export, r.symbols)
+    require(flat is not None and "carries no kinds" in flat,
+            f"a flat dict exported without being refused: {flat}")
+
+    print(f"  {len(r.symtab.names())} linked symbols (both kinds) export byte-stable, "
+          "read back kind-faithful, drive the debugger and resolve a unit's operands "
+          "to the link's own bytes; 7 refusals named")
+
 def main():
     print("NCP-8 toolchain acceptance (CPU only, no GPU, no circuits):")
     tests = [
@@ -1660,6 +1772,7 @@ def main():
         test_loader_default_image_length,
         test_accepted_forms_agree_with_the_decoder,
         test_loader_and_asm_agree_on_every_instruction,
+        test_symbol_table_export,
         test_profile_totals_match_the_machine,
         test_profile_rejects_source_text,
         test_profile_reports_every_number_it_carries,

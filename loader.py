@@ -458,13 +458,16 @@ def _resolve(value, symbols, what, lo, hi, lineno=None):
 
 class LoadResult:
 
-    __slots__ = ("image", "symbols", "entry", "report", "vectors", "window", "vtab",
-                 "regions", "origins", "entry_explicit", "content_extent", "needed")
+    __slots__ = ("image", "symbols", "symtab", "entry", "report", "vectors", "window",
+                 "vtab", "regions", "origins", "entry_explicit", "content_extent",
+                 "needed")
 
-    def __init__(self, image, symbols, entry, report, vectors, window, vtab, regions,
-                 origins, entry_explicit, content_extent, needed):
+    def __init__(self, image, symbols, symtab, entry, report, vectors, window, vtab,
+                 regions, origins, entry_explicit, content_extent, needed):
         self.image = bytes(image)
         self.symbols = symbols
+
+        self.symtab = symtab
         self.entry = entry
         self.report = list(report)
         self.vectors = dict(vectors)
@@ -841,7 +844,7 @@ def _finish(symbols, placer, vectors, window, vtab, regions, image, entry):
     rep.append(f"symbols: {len(symbols.flat())}")
     for name in sorted(symbols.flat()):
         rep.append(f"        {name:16s} 0x{symbols.value(name):04X} ({symbols.kind_of(name)})")
-    return LoadResult(image_bytes, symbols.as_dict(), entry, rep, placed_vectors,
+    return LoadResult(image_bytes, symbols.as_dict(), symbols, entry, rep, placed_vectors,
                       placed_window, placed_vtab, placed_regions, origins,
                       entry_explicit, content_extent, needed)
 
